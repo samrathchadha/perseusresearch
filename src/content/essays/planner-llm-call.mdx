@@ -403,7 +403,7 @@ What the parser does **not** do, per ADR-004:
 
 The trade-off: when the parser fails, the runtime loses one node
 expansion. Compared to the V2 path that burned 2× the cost (original
-call + repair call) and was empirically <5% successful on real
+call + repair call) and was empirically &lt;5% successful on real
 malformed outputs (HISTORY/43 §planner-class bugs), eating one node is
 cheaper.
 

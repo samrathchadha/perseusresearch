@@ -654,29 +654,29 @@ categories.
 
 ```mermaid
 flowchart TD
-    A["2026-04-24<br/>WM α raised 0.3 → 0.9<br/>(on wm_v4_random_split val_r2=0.997)"] -->|"8 days production<br/>α blends leakage probe<br/>at 90% weight"| F["2026-05-18 reset"]
+    A["2026-04-24\nWM α raised 0.3 → 0.9\n(on wm_v4_random_split val_r2=0.997)"] -->|"8 days production\nα blends leakage probe\nat 90% weight"| F["2026-05-18 reset"]
 
-    B["2026-04-24 → 2026-05-11<br/>T2: pick_terminal_reward<br/>reads NULL column<br/>(17 days)"] -->|"6 WM ckpts trained<br/>against r̂_t ≡ 0"| F
+    B["2026-04-24 → 2026-05-11\nT2: pick_terminal_reward\nreads NULL column\n(17 days)"] -->|"6 WM ckpts trained\nagainst r̂_t ≡ 0"| F
 
-    C["2026-05-02 → 2026-05-11<br/>T6 / T6′: harness<br/>collision + exit-1<br/>(4,100 rows)"] -->|"33% of done rows<br/>silently scored<br/>as real verdicts"| F
+    C["2026-05-02 → 2026-05-11\nT6 / T6′: harness\ncollision + exit-1\n(4,100 rows)"] -->|"33% of done rows\nsilently scored\nas real verdicts"| F
 
-    D["2026-05-12 → 2026-05-13<br/>Perseus condition runs<br/>485/485 empty patches"] -->|"P_pers = 0/485<br/>vs P_base = 5669/5691"| F
+    D["2026-05-12 → 2026-05-13\nPerseus condition runs\n485/485 empty patches"] -->|"P_pers = 0/485\nvs P_base = 5669/5691"| F
 
-    E["Pre-2026-05-18<br/>Three env-vs-code drifts<br/>(TIMEOUT_MS, plan_temp,<br/>parquet schema)"] -->|"Doc != code<br/>for 4–6 weeks"| F
+    E["Pre-2026-05-18\nThree env-vs-code drifts\n(TIMEOUT_MS, plan_temp,\nparquet schema)"] -->|"Doc != code\nfor 4–6 weeks"| F
 
-    F -->|"Sam: 'see all the code<br/>is slop and monkey patched'"| G["Option (a):<br/>full nuke + rewrite"]
+    F -->|"Sam: 'see all the code\nis slop and monkey patched'"| G["Option (a):\nfull nuke + rewrite"]
 
-    G --> H["ADR-012:<br/>perseus IS MuZero"]
-    G --> I["Wipe V2 Rust + Python<br/>~72k LOC"]
-    G --> J["parking_lot/v2_archive_2026-05-18/<br/>preserves audit + data"]
+    G --> H["ADR-012:\nperseus IS MuZero"]
+    G --> I["Wipe V2 Rust + Python\n~72k LOC"]
+    G --> J["parking_lot/v2_archive_2026-05-18/\npreserves audit + data"]
 
-    H --> K["perseus/core/<br/>3,993 LOC<br/>Python 3.12 + FastAPI"]
+    H --> K["perseus/core/\n3,993 LOC\nPython 3.12 + FastAPI"]
     I --> K
-    J --> L["lab/<br/>autoresearch v2 winner<br/>multibench, judge harnesses"]
+    J --> L["lab/\nautoresearch v2 winner\nmultibench, judge harnesses"]
 
-    K --> M["Two-vote stop:<br/>WM heads vote +<br/>planner declares"]
-    K --> N["pgvector replaces qdrant<br/>schema.sql is one file"]
-    K --> O["17-tool registry<br/>survives (ADR-012)"]
+    K --> M["Two-vote stop:\nWM heads vote +\nplanner declares"]
+    K --> N["pgvector replaces qdrant\nschema.sql is one file"]
+    K --> O["17-tool registry\nsurvives (ADR-012)"]
 
     style A fill:#fdd
     style B fill:#fdd
