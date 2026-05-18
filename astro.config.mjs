@@ -4,6 +4,18 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeMermaid from "rehype-mermaid";
 
+const remarkPlugins = [remarkMath];
+const rehypePlugins = [
+  [rehypeKatex, { output: "mathml" }],
+  [
+    rehypeMermaid,
+    {
+      strategy: "img-svg",
+      mermaidConfig: { theme: "neutral" },
+    },
+  ],
+];
+
 // https://astro.build/config
 export default defineConfig({
   site: "https://perseus.starling.sh",
@@ -11,18 +23,14 @@ export default defineConfig({
   build: {
     format: "directory",
   },
-  integrations: [mdx()],
+  integrations: [
+    mdx({
+      remarkPlugins,
+      rehypePlugins,
+    }),
+  ],
   markdown: {
-    remarkPlugins: [remarkMath],
-    rehypePlugins: [
-      [rehypeKatex, { output: "mathml" }],
-      [
-        rehypeMermaid,
-        {
-          strategy: "img-svg",
-          mermaidConfig: { theme: "neutral" },
-        },
-      ],
-    ],
+    remarkPlugins,
+    rehypePlugins,
   },
 });
