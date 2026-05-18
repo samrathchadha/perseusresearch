@@ -4,14 +4,36 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeMermaid from "rehype-mermaid";
 
+const shikiConfig = {
+  theme: "github-light",
+  wrap: true,
+};
+
 const remarkPlugins = [remarkMath];
 const rehypePlugins = [
   [rehypeKatex, { output: "mathml" }],
   [
     rehypeMermaid,
     {
+      // inline-svg: rehype-mermaid renders each mermaid block to inline SVG
+      // at build time via Playwright/Chromium. No client-side mermaid JS;
+      // diagrams ship in the HTML, search-indexable, FOUC-free.
       strategy: "inline-svg",
-      mermaidConfig: { theme: "neutral" },
+      mermaidConfig: {
+        theme: "neutral",
+        themeVariables: {
+          fontFamily: "'Adobe Garamond Pro', 'EB Garamond', Times, serif",
+          fontSize: "14px",
+          primaryColor: "#fafaf7",
+          primaryTextColor: "#1a1815",
+          primaryBorderColor: "#6b6157",
+          lineColor: "#6b6157",
+          secondaryColor: "#f6f4ee",
+          tertiaryColor: "#ffffff",
+          background: "#ffffff",
+        },
+        flowchart: { curve: "basis", padding: 12 },
+      },
     },
   ],
 ];
@@ -27,10 +49,12 @@ export default defineConfig({
     mdx({
       remarkPlugins,
       rehypePlugins,
+      shikiConfig,
     }),
   ],
   markdown: {
     remarkPlugins,
     rehypePlugins,
+    shikiConfig,
   },
 });
