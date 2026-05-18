@@ -202,19 +202,23 @@ code {
   font-family: var(--mono);
 }
 
-pre {
-  background: var(--code-bg);
+pre,
+pre.astro-code,
+pre[class*="language-"] {
+  background: var(--bg) !important;
   padding: 0.85rem 1rem;
-  border: 0;
+  border: 1px solid var(--rule);
   border-radius: 2px;
   overflow-x: auto;
   font-size: 13px;
   line-height: 1.5;
   margin: 1.1rem 0;
+  color: var(--text);
 }
 
-pre code {
-  background: transparent;
+pre code,
+pre.astro-code code {
+  background: transparent !important;
   padding: 0;
   font-size: inherit;
 }

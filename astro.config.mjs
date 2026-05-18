@@ -16,6 +16,11 @@ const rehypePlugins = [
   ],
 ];
 
+const shikiConfig = {
+  theme: "github-light",
+  wrap: true,
+};
+
 // https://astro.build/config
 export default defineConfig({
   site: "https://perseus.starling.sh",
@@ -27,10 +32,12 @@ export default defineConfig({
     mdx({
       remarkPlugins,
       rehypePlugins,
+      shikiConfig,
     }),
   ],
   markdown: {
     remarkPlugins,
     rehypePlugins,
+    shikiConfig,
   },
 });
