@@ -335,20 +335,20 @@ wrong.
 graph TD
     Class[cohort contamination class]
     Class --> Silent[silent default substitution]
-    Silent --> A[Shape A: over-fanned key<br />3,314 rows in harness_collided]
-    Silent --> B[Shape B: NULL → 0.0<br />17 days of poisoned WM ckpts]
-    Silent --> C[Shape C: enum collapse<br />786 rows in harness_invocation_failed]
-    Silent --> D[Shape D: row-split leakage<br />8 days of α=0.9 trained on memorization]
+    Silent --> A[Shape A: over-fanned key\n3,314 rows in harness_collided]
+    Silent --> B[Shape B: NULL → 0.0\n17 days of poisoned WM ckpts]
+    Silent --> C[Shape C: enum collapse\n786 rows in harness_invocation_failed]
+    Silent --> D[Shape D: row-split leakage\n8 days of α=0.9 trained on memorization]
 
     A --> AFix[T6: refuse to label colliding rows]
     B --> BFix[T1+T2: plumb judge_label, raise on NULL]
     C --> CFix[T6: distinct enum, NULL not 0.0]
     D --> DFix[ADR-005: instance split, metadata.json]
 
-    AFix --> Structural[Structural fix: ADR-004<br />no-silent-fallback]
+    AFix --> Structural[Structural fix: ADR-004\nno-silent-fallback]
     BFix --> Structural
     CFix --> Structural
-    DFix --> Provenance[Structural fix: ADR-005<br />checkpoint provenance]
+    DFix --> Provenance[Structural fix: ADR-005\ncheckpoint provenance]
 ```
 
 ## 7 Why audit-as-class beats whack-a-mole

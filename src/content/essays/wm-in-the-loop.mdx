@@ -414,13 +414,13 @@ flowchart TD
   D -->|positive small (0.05-0.2)| F[α = 0.2-0.3; conservative blend]
   D -->|positive medium (0.2-0.5)| G[α = 0.4-0.6; balanced blend]
   D -->|positive large (>0.5)| H[α up to 0.8; WM-dominant blend]
-  C --> I[Calibration probe<br />NOT a deploy signal]
+  C --> I[Calibration probe\nNOT a deploy signal]
   E --> J[Fingerprint and deploy]
   F --> J
   G --> J
   H --> J
   J --> K[Monitor for one week]
-  K --> L{wm_call telemetry healthy?<br />visit distribution diverse?<br />downstream eval delta?}
+  K --> L{wm_call telemetry healthy?\nvisit distribution diverse?\ndownstream eval delta?}
   L -->|yes| M[Hold α]
   L -->|no| N[Drop α toward 0; investigate]
 ```
