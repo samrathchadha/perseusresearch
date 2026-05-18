@@ -541,7 +541,7 @@ This is the one place where the shim is strictly worse than vLLM mainline.
 
 ### 3.6 The outlines fallback (200 s per call cold start)
 
-Pre-XGrammar (vLLM <= 0.8.x), vLLM's structured-output went through the outlines library. Outlines JIT-compiles a Triton regex automaton per schema, on first use. Cold-start was 200 seconds.
+Pre-XGrammar (vLLM &lt;= 0.8.x), vLLM's structured-output went through the outlines library. Outlines JIT-compiles a Triton regex automaton per schema, on first use. Cold-start was 200 seconds.
 
 The planner emits a deeply-nested JSON schema (17 tool variants in a oneOf, each with its own arg shape). The first call after a vLLM restart would compile the automaton, returning the first response after a roughly 3.3-minute pause. Subsequent calls in the same vLLM process were fast. But burst traffic — a fresh sweep launching 48 workers each issuing a first planner call — would stall every worker for roughly 200 seconds in parallel, then complete in roughly 2 seconds thereafter.
 
@@ -685,7 +685,7 @@ The default flipped after we observed that every vLLM endpoint without the auto-
 
 ### 6.5 The maxItems silent-drop
 
-XGrammar's JSON-schema implementation drops the maxItems keyword silently. We can't enforce "options.length <= 5" structurally at decode time. Enforcement happens in two places: the planner SYSTEM prompt (E.4 "1 to 5 when evidence supports it") and at parse time in the runtime step. The schema mask gets us key names, enum values, and required fields; array bounds are post-parse.
+XGrammar's JSON-schema implementation drops the maxItems keyword silently. We can't enforce "options.length &lt;= 5" structurally at decode time. Enforcement happens in two places: the planner SYSTEM prompt (E.4 "1 to 5 when evidence supports it") and at parse time in the runtime step. The schema mask gets us key names, enum values, and required fields; array bounds are post-parse.
 
 ---
 
