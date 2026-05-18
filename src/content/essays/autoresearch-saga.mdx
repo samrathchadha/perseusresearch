@@ -650,13 +650,13 @@ neither got swapped into `PLAN_SYSTEM_BUILTIN`.
 
 ```mermaid
 flowchart LR
-    A[v1: untyped hill-climb<br/>6 scenarios, single judge<br/>~$3-5, never committed] --> B[v2: MCTS, typed mutations<br/>12 scenarios, panel + tournament<br/>$229.94, winner: 3c7f945f]
-    B --> C[v3: recall-grounded<br/>plan_system_override unlocks<br/>no-restart scoring, 5 instances]
-    C --> D[v4: composite scoring<br/>100-pool diversity, lift vs rg<br/>rejection rule, no winner committed]
+    A[v1: untyped hill-climb<br />6 scenarios, single judge<br />~$3-5, never committed] --> B[v2: MCTS, typed mutations<br />12 scenarios, panel + tournament<br />$229.94, winner: 3c7f945f]
+    B --> C[v3: recall-grounded<br />plan_system_override unlocks<br />no-restart scoring, 5 instances]
+    C --> D[v4: composite scoring<br />100-pool diversity, lift vs rg<br />rejection rule, no winner committed]
 
-    B --> E[Reused for: WM stop-weights sweep<br/>11 configs, 9 aborted<br/>2 winners that won by being closer<br/>to null behavior than the others]
-    E --> F[null result:<br/>weight-tuning cannot fix<br/>structurally reward-hackable stop]
-    F --> G[two-vote conjunction stop<br/>see muzero-pipeline]
+    B --> E[Reused for: WM stop-weights sweep<br />11 configs, 9 aborted<br />2 winners that won by being closer<br />to null behavior than the others]
+    E --> F[null result:<br />weight-tuning cannot fix<br />structurally reward-hackable stop]
+    F --> G[two-vote conjunction stop<br />see muzero-pipeline]
 ```
 
 ## 7. The stop-weights sweep (task #90, the parallel null result)

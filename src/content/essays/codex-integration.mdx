@@ -311,14 +311,14 @@ The whole trace-join thread in one picture:
 
 ```mermaid
 flowchart TD
-    A["Codex rollout<br/>~/.codex/sessions/.../rollout-...-uuid.jsonl"] --> B["perseus-multi-bench<br/>spawn_codex"]
-    B --> C["Codex child process<br/>env: PERSEUS_EXTERNAL_SESSION_ID=mb_run_id<br/>PATH: dirname(codex_bin)+scripts/+inherited"]
-    C --> D["Codex turn<br/>function_call: perseus-query bug-summary"]
-    D --> E["perseus-query shim<br/>curl POST /v1/query<br/>H: X-External-Session-Id: $PERSEUS_EXTERNAL_SESSION_ID"]
-    E --> F["perseus /v1/query handler<br/>req.external_session_id = body or header<br/>run MCTS, persist trace"]
-    F --> G["query_traces row<br/>run_id: qry-uuid<br/>external_session_id: mb_run_id"]
-    G --> H["GET /v1/query/by_external_session/mb_run_id<br/>returns list of qry-uuids"]
-    H --> I["codex_trace.py --run-id qry-uuid<br/>reverse-join: trace -> rollout -> window"]
+    A["Codex rollout<br />~/.codex/sessions/.../rollout-...-uuid.jsonl"] --> B["perseus-multi-bench<br />spawn_codex"]
+    B --> C["Codex child process<br />env: PERSEUS_EXTERNAL_SESSION_ID=mb_run_id<br />PATH: dirname(codex_bin)+scripts/+inherited"]
+    C --> D["Codex turn<br />function_call: perseus-query bug-summary"]
+    D --> E["perseus-query shim<br />curl POST /v1/query<br />H: X-External-Session-Id: $PERSEUS_EXTERNAL_SESSION_ID"]
+    E --> F["perseus /v1/query handler<br />req.external_session_id = body or header<br />run MCTS, persist trace"]
+    F --> G["query_traces row<br />run_id: qry-uuid<br />external_session_id: mb_run_id"]
+    G --> H["GET /v1/query/by_external_session/mb_run_id<br />returns list of qry-uuids"]
+    H --> I["codex_trace.py --run-id qry-uuid<br />reverse-join: trace -> rollout -> window"]
     I --> A
 ```
 
