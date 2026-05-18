@@ -152,7 +152,7 @@ The only mechanism that could have caught placeholder leaks at decode time is a 
 | V100 throughput | ~3,700 steps/hr | n/a (Tinker, H100-class) | n/a |
 | best val_loss | ~1.1 (plateau) | **0.932** | -0.17 |
 | single-shot JSON valid | yes | yes | tied |
-| multi-turn placeholder rate | ~10% | <1% at the time of pivot | 10x |
+| multi-turn placeholder rate | ~10% | &lt;1% at the time of pivot | 10x |
 | serve path | FastAPI + peft shim, :19200 | vLLM on merged FP16, :19320 | n/a |
 | production traffic | no (probe only) | yes | n/a |
 

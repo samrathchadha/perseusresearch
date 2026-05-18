@@ -139,7 +139,7 @@ WM head. The judge head still gets the 23ms latency at inference.
 
 gpt-5.4-nano-medium's **inter-call agreement** measured at ~0.95 on
 a held-out 500-row pair set; gpt-5.5-high measured ~0.99 on the same
-pairs. The label-noise reduction is <5%. The 16-dim head's val_r²
+pairs. The label-noise reduction is &lt;5%. The 16-dim head's val_r²
 ceiling is bottlenecked by the 256-d codet5p representation, not
 the label noise — so the downstream lift from 0.95 → 0.99 label
 agreement is sub-5% by construction. 90× cost lift for sub-5%
