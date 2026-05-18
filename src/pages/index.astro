@@ -32,13 +32,11 @@ for (const entry of all) {
   if (grouped[t]) grouped[t].push(entry);
 }
 
-// Sort each tier newest-first by date.
 for (const t of TIER_ORDER) {
   grouped[t].sort((a, b) => b.data.date.getTime() - a.data.date.getTime());
 }
 
 function readTimeOf(entry: (typeof all)[number]): number {
-  // 200 words/min over raw body. Strip code fences and HTML-ish tokens.
   const body = (entry.body ?? "").replace(/```[\s\S]*?```/g, " ").replace(/<[^>]+>/g, " ");
   const words = body.split(/\s+/).filter(Boolean).length;
   return Math.max(1, Math.round(words / 200));
@@ -52,15 +50,14 @@ function fmtDate(d: Date): string {
   title="perseus essays"
   description="Essays on a MuZero retrieval pipeline: world models, planners, reward, retrieval as ML, audits, infrastructure."
 >
+  <header class="masthead">
+    <a class="masthead-title" href="/">perseus essays</a>
+  </header>
+
   <main class="landing">
     <header class="hero">
       <h1>perseus</h1>
       <p class="subtitle">essays on a muzero retrieval pipeline</p>
-      <p class="intro">
-        A working notebook on building a planner-driven retrieval system trained with MuZero-style
-        learned world models. Each essay is a single decision, a single audit, or a single piece
-        of infrastructure made legible.
-      </p>
     </header>
 
     {TIER_ORDER.map((tier) => {
@@ -93,48 +90,67 @@ function fmtDate(d: Date): string {
 </Base>
 
 <style>
-  .landing {
-    max-width: 900px;
+  .masthead {
+    max-width: var(--grid-max);
     margin: 0 auto;
-    padding: 4rem 1.5rem 6rem;
+    padding: 1.5rem var(--page-pad) 1rem;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .masthead-title {
+    font-family: var(--display);
+    font-size: 20px;
+    text-decoration: none;
+    color: var(--text);
+    letter-spacing: 0.02em;
+  }
+
+  .landing {
+    max-width: var(--grid-max);
+    margin: 0 auto;
+    padding: 3rem var(--page-pad) 6rem;
   }
 
   .hero {
-    margin-bottom: 4rem;
+    margin-bottom: 3rem;
   }
 
   .hero h1 {
-    font-size: 52px;
+    font-size: 56px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin: 0;
   }
 
   .subtitle {
     color: var(--text-dim);
     font-style: italic;
-    font-size: 19px;
-    margin: 0.25rem 0 1.5rem;
-  }
-
-  .intro {
-    max-width: 640px;
-    color: var(--text);
-    font-size: 18px;
+    font-size: 16px;
+    margin: 0.4rem 0 0;
   }
 
   .tier {
-    margin-top: 3rem;
+    margin-top: 2.5rem;
+    max-width: 1000px;
+  }
+
+  .tier h2 {
+    font-size: 20px;
+    margin-bottom: 0.5rem;
+    color: var(--text);
   }
 
   .essay-list {
     list-style: none;
     padding: 0;
-    margin: 1.25rem 0 0;
+    margin: 0.75rem 0 0;
   }
 
   .essay-row {
     display: grid;
     grid-template-columns: 1fr auto;
     gap: 1.5rem;
-    padding: 0.9rem 0;
+    padding: 0.75rem 0;
     border-bottom: 1px solid var(--rule);
     align-items: baseline;
   }
@@ -144,10 +160,10 @@ function fmtDate(d: Date): string {
   }
 
   .essay-title {
-    font-size: 17px;
+    font-size: 15px;
     text-decoration: none;
     color: var(--link);
-    border-bottom: 1px solid rgba(138, 111, 58, 0.35);
+    border-bottom: 0.5px solid rgba(138, 111, 58, 0.35);
   }
 
   .essay-title:hover {
@@ -156,29 +172,30 @@ function fmtDate(d: Date): string {
   }
 
   .essay-summary {
-    margin: 0.35rem 0 0;
-    font-size: 15px;
+    margin: 0.25rem 0 0;
+    font-size: 13.5px;
     font-style: italic;
     color: var(--text-dim);
-    max-width: 60ch;
+    max-width: 78ch;
+    line-height: 1.5;
   }
 
   .essay-meta {
     text-align: right;
-    font-size: 12px;
+    font-size: 11.5px;
     letter-spacing: 0.05em;
     text-transform: uppercase;
     color: var(--text-dim);
     white-space: nowrap;
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: 0.2rem;
   }
 
   @media (max-width: 640px) {
     .essay-row {
       grid-template-columns: 1fr;
-      gap: 0.4rem;
+      gap: 0.35rem;
     }
     .essay-meta {
       text-align: left;

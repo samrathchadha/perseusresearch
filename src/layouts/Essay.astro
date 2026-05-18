@@ -43,6 +43,14 @@ const dateStr = date.toLocaleDateString("en-US", {
     <span class="masthead-tier">{tierName}</span>
   </header>
 
+  <header class="essay-head">
+    <h1>{title}</h1>
+    <div class="meta">
+      <time datetime={date.toISOString()}>{dateStr}</time>
+      {readTime ? <span> &middot; {readTime} min read</span> : null}
+    </div>
+  </header>
+
   <div class="essay-grid">
     <aside class="rail">
       {tocHeadings.length > 0 && (
@@ -70,15 +78,8 @@ const dateStr = date.toLocaleDateString("en-US", {
       )}
     </aside>
 
-    <article class="reading">
-      <h1>{title}</h1>
-      <div class="meta">
-        <time datetime={date.toISOString()}>{dateStr}</time>
-        {readTime ? <span> &middot; {readTime} min read</span> : null}
-      </div>
-      <div class="prose">
-        <slot />
-      </div>
+    <article class="reading prose">
+      <slot />
     </article>
   </div>
 
@@ -115,9 +116,9 @@ const dateStr = date.toLocaleDateString("en-US", {
 
 <style>
   .masthead {
-    max-width: 1100px;
+    max-width: var(--grid-max);
     margin: 0 auto;
-    padding: 2rem 1.5rem 1.5rem;
+    padding: 1.5rem var(--page-pad) 1rem;
     display: flex;
     align-items: baseline;
     justify-content: space-between;
@@ -127,7 +128,7 @@ const dateStr = date.toLocaleDateString("en-US", {
 
   .masthead-title {
     font-family: var(--display);
-    font-size: 22px;
+    font-size: 20px;
     text-decoration: none;
     color: var(--text);
     letter-spacing: 0.02em;
@@ -138,33 +139,47 @@ const dateStr = date.toLocaleDateString("en-US", {
   }
 
   .masthead-tier {
-    font-size: 13px;
+    font-size: 12px;
     letter-spacing: 0.05em;
     text-transform: uppercase;
     color: var(--text-dim);
   }
 
+  .essay-head {
+    max-width: var(--grid-max);
+    margin: 2.5rem auto 1.5rem;
+    padding: 0 var(--page-pad);
+  }
+
+  .essay-head h1 {
+    max-width: 1000px;
+  }
+
+  .essay-head .meta {
+    margin-top: 0.6rem;
+  }
+
   .essay-grid {
-    max-width: 1100px;
-    margin: 0 auto;
-    padding: 3rem 1.5rem 5rem;
+    max-width: var(--grid-max);
+    margin: 1.5rem auto 5rem;
+    padding: 0 var(--page-pad);
     display: grid;
-    grid-template-columns: 260px 1fr;
-    gap: 3rem;
+    grid-template-columns: 240px 1fr;
+    gap: 4rem;
     align-items: start;
   }
 
   .rail {
     position: sticky;
-    top: 6rem;
-    font-size: 13.5px;
-    line-height: 1.5;
+    top: 2.5rem;
+    font-size: 12.5px;
+    line-height: 1.45;
   }
 
   .toc-label {
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    font-size: 12px;
+    font-size: 11px;
     color: var(--text-faint);
     margin-bottom: 0.6rem;
   }
@@ -202,28 +217,20 @@ const dateStr = date.toLocaleDateString("en-US", {
   }
 
   .related {
-    margin-top: 2rem;
+    margin-top: 1.75rem;
     border-top: 1px solid var(--rule);
-    padding-top: 1.25rem;
+    padding-top: 1rem;
   }
 
   .reading {
     max-width: var(--reading-max);
+    min-width: 0;
   }
 
-  .reading .meta {
-    margin-bottom: 2.5rem;
-  }
-
-  .prose :global(p) {
-    margin: 0 0 1rem;
-  }
-
-  @media (max-width: 900px) {
+  @media (max-width: 1000px) {
     .essay-grid {
       grid-template-columns: 1fr;
       gap: 1.5rem;
-      padding: 2rem 1.25rem 4rem;
     }
     .rail {
       display: none;

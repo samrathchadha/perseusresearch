@@ -29,11 +29,13 @@
   --rule:        #e5e0d6;
   --code-bg:     #f6f4ee;
 
-  --serif: "Times New Roman", Times, "Liberation Serif", serif;
+  --serif: "Adobe Garamond Pro", "EB Garamond", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   --display: "Hakumo", "Times New Roman", serif;
-  --mono: "Iosevka", "IBM Plex Mono", Menlo, Consolas, monospace;
+  --mono: "Iosevka", "JetBrains Mono", "IBM Plex Mono", Menlo, Consolas, monospace;
 
-  --reading-max: 720px;
+  --reading-max: 900px;
+  --grid-max: 1280px;
+  --page-pad: 2.5rem;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -57,15 +59,15 @@ html {
 body {
   margin: 0;
   font-family: var(--serif);
-  font-size: 19px;
-  line-height: 1.6;
+  font-size: 16px;
+  line-height: 1.55;
   color: var(--text);
   background: var(--bg);
 }
 
 @media (max-width: 720px) {
   body {
-    font-size: 18px;
+    font-size: 15.5px;
   }
 }
 
@@ -81,9 +83,9 @@ body {
 a {
   color: var(--link);
   text-decoration: underline;
-  text-decoration-thickness: 1px;
+  text-decoration-thickness: 0.5px;
   text-underline-offset: 2px;
-  text-decoration-color: rgba(138, 111, 58, 0.5);
+  text-decoration-color: rgba(138, 111, 58, 0.45);
   transition: color 0.12s ease, text-decoration-color 0.12s ease;
 }
 
@@ -105,51 +107,41 @@ h5,
 h6 {
   color: var(--text);
   line-height: 1.2;
-  margin: 2rem 0 0.75rem;
+  margin: 2rem 0 0.6rem;
+  font-family: var(--serif);
 }
 
 h1 {
-  font-family: var(--display);
-  font-weight: 400;
-  font-size: 52px;
-  letter-spacing: 0.02em;
-  line-height: 1.1;
+  font-weight: 600;
+  font-size: 42px;
+  letter-spacing: -0.01em;
+  line-height: 1.08;
   margin: 0 0 0.5rem;
-  text-shadow:
-    0.5px 0  0 currentColor,
-   -0.5px 0  0 currentColor,
-    0  0.5px 0 currentColor,
-    0 -0.5px 0 currentColor;
 }
 
 @media (max-width: 720px) {
   h1 {
-    font-size: 32px;
+    font-size: 30px;
   }
 }
 
 h2 {
-  font-family: var(--serif);
   font-weight: 700;
-  font-size: 24px;
-  border-top: 1px solid var(--rule);
-  padding-top: 2rem;
-  margin-top: 3rem;
+  font-size: 22px;
+  margin-top: 2.5rem;
 }
 
 h3 {
-  font-family: var(--serif);
   font-weight: 700;
-  font-size: 19px;
-  margin-top: 2rem;
+  font-size: 17px;
+  margin-top: 1.75rem;
 }
 
 h4,
 h5,
 h6 {
-  font-family: var(--serif);
   font-weight: 700;
-  font-size: 17px;
+  font-size: 15.5px;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -157,7 +149,7 @@ h6 {
 /* -------------------------------------------------------------------------- */
 
 p {
-  margin: 0 0 1rem;
+  margin: 0 0 0.9rem;
 }
 
 strong {
@@ -180,13 +172,13 @@ hr {
 
 ul,
 ol {
-  padding-left: 1.5em;
+  padding-left: 1.4em;
   list-style-position: outside;
-  margin: 0 0 1rem;
+  margin: 0 0 0.9rem;
 }
 
 li {
-  margin-bottom: 0.35em;
+  margin-bottom: 0.25em;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -212,13 +204,13 @@ code {
 
 pre {
   background: var(--code-bg);
-  padding: 1rem 1.1rem;
+  padding: 0.85rem 1rem;
   border: 0;
   border-radius: 2px;
   overflow-x: auto;
-  font-size: 14.5px;
-  line-height: 1.55;
-  margin: 1.25rem 0;
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 1.1rem 0;
 }
 
 pre code {
@@ -228,24 +220,25 @@ pre code {
 }
 
 code {
-  font-size: 0.92em;
+  font-size: 0.88em;
   color: var(--link-hov);
 }
 
 p code,
-li code {
+li code,
+td code,
+th code {
   background: transparent;
   padding: 0 0.15em;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Figures                                                                     */
+/* Figures — full reading-column width                                         */
 /* -------------------------------------------------------------------------- */
 
 figure {
-  margin: 2rem auto;
-  max-width: 600px;
-  text-align: center;
+  margin: 1.75rem 0;
+  text-align: left;
 }
 
 figure img,
@@ -253,17 +246,19 @@ figure svg {
   max-width: 100%;
   height: auto;
   display: block;
-  margin: 0 auto;
 }
 
 figcaption {
   font-style: italic;
-  font-size: 14px;
+  font-size: 13.5px;
   color: var(--text-dim);
-  text-align: center;
-  max-width: 600px;
-  margin: 0.6rem auto 0;
-  line-height: 1.5;
+  margin-top: 0.5rem;
+  line-height: 1.45;
+}
+
+figcaption strong {
+  font-style: normal;
+  color: var(--text);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -272,12 +267,26 @@ figcaption {
 
 .mermaid,
 svg[id^="mermaid"],
-p > svg {
+.expressive-code {
+  display: block;
+  margin: 1.5rem 0;
+  max-width: 100%;
+}
+
+pre.mermaid,
+pre[class*="language-mermaid"] {
+  background: transparent;
+  padding: 0;
+}
+
+/* rehype-mermaid renders inline SVG inside a <p> sometimes — handle both */
+p > svg[aria-roledescription],
+p > svg[id^="mermaid"],
+.prose svg[aria-roledescription] {
   display: block;
   margin: 1.5rem auto;
   max-width: 100%;
-  background: transparent;
-  padding: 1rem;
+  height: auto;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -285,7 +294,7 @@ p > svg {
 /* -------------------------------------------------------------------------- */
 
 .meta {
-  font-size: 14px;
+  font-size: 12.5px;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--text-dim);
@@ -300,7 +309,7 @@ p > svg {
 }
 
 .katex-display {
-  margin: 1.25rem 0;
+  margin: 1.1rem 0;
   overflow-x: auto;
   overflow-y: hidden;
 }
@@ -312,18 +321,19 @@ p > svg {
 table {
   border-collapse: collapse;
   width: 100%;
-  margin: 1.5rem 0;
-  font-size: 16px;
+  margin: 1.25rem 0;
+  font-size: 14px;
 }
 
 th,
 td {
   text-align: left;
-  padding: 0.5rem 0.75rem;
+  padding: 0.4rem 0.7rem;
   border-bottom: 1px solid var(--rule);
+  vertical-align: top;
 }
 
 th {
   font-weight: 700;
-  border-bottom: 2px solid var(--rule);
+  border-bottom: 1.5px solid var(--text);
 }
