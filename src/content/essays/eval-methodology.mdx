@@ -1,6 +1,6 @@
 ---
 title: "Eval methodology: 30 surfaces, what worked, what was theater"
-date: 2026-05-19
+date: 2026-05-18
 status: published
 tier: infra
 summary: "V2 accumulated 30+ eval surfaces — gates, smoke, multi-bench, judge, recall, autoresearch, inference benchmarks, WM leaderboard, continuous loops. Three produced actionable signal. Six prevented incidents. Twenty-one were theater. The structural fix is one operator-relevant gate (ADR-007), not thirty synthetic suites."
@@ -8,397 +8,752 @@ related: ["pipeline-integrity-audit","autoresearch-saga","reward-modeling","mult
 readTime: 13
 ---
 
-We ran 30 distinct evaluation surfaces across fourteen months of V2. Three produced signal that changed a decision. Six caught failure classes before they reached production. Twenty-one ran on schedules, accumulated artifacts, and were never read by a human or consumed by any downstream pipeline. The most-cited number on every dashboard — a "gate streak" of 3,850 — had never observed a single failure in 3,850 consecutive cycles. The 8.86% perseus-condition fix-rate headline survived four months because no surface separated patch-row denominators from end-to-end-cohort denominators. The structural lesson is not "add a 31st eval"; it is to graduate one operator-relevant gate against a known-clean cohort, and to mark every other surface as either debugging instrumentation (kept) or theater (cut).
+> tl;dr: Perseus V2 ran for roughly fourteen months and at audit time
+> (2026-05-18) had 30 distinct evaluation surfaces live or recently
+> retired. Three of them produced signal that changed a decision.
+> Six of them caught a specific class of failure before it reached
+> production. The remaining twenty-one ran on schedules, accumulated
+> artifacts, and were never read by a human or consumed by any
+> downstream pipeline. The most-cited number on every dashboard —
+> `gate streak = 3850` — had never observed a single failure in
+> 3,850 consecutive cycles. The 8.86% perseus-condition fix rate
+> headline survived four months because no surface separated patch-row
+> denominators from end-to-end-cohort denominators. The structural
+> lesson is not "add a 31st eval"; it is to graduate one operator-
+> relevant gate against a known-clean cohort, and to mark every other
+> surface as either debugging instrumentation (kept) or theater (cut).
 
-This essay is the post-mortem. ADR-007 is the architectural conclusion: a benchmark that does not gate a code change is a hobby.
+## 1. What counted as an "eval surface"
 
-## 1. What we counted as an eval surface
-
-We counted anything that fired a measurement on a perseus-condition row, a candidate prompt, a checkpoint, or a runtime config, and emitted a number, label, or pass/fail verdict. The catalog was reconstructed from `scripts/*.{sh,py}`, the eval/multi_bench/judge_bootstrap/muzero subsystems, the operational-policy block in our top-level project memory, and on-disk artifact directories on engram and cato.
+Anything that fired a measurement on a perseus-condition row, a
+candidate prompt, a checkpoint, or a runtime config, and emitted a
+number, label, or pass/fail verdict. The catalog source is
+`HISTORY/32_eval_methodology.md`, reconstructed from `scripts/*.{sh,py}`,
+the `src/{eval,multi_bench,judge_bootstrap,muzero}/` subsystems, the
+operational-policy block in `Claude.md`, and on-disk artifact
+directories on engram and cato.
 
 Thirty surfaces. They group into nine functional buckets.
 
 ```mermaid
-flowchart TB
+graph TB
     subgraph Gates["Gates (release-readiness)"]
-        G1[#1 gate5 five-case suite + 3-cycle streak]
+        G1[#1 gate5 5-case suite + 3-cycle streak]
         G2[#3 retrieval non-regression gate]
         G3[#15 gate streak counter]
-        G4[#17 gate stabilize, superseded]
-        G5[#21 default two-case synthetic suite]
+        G4[#17 gate_stabilize.sh - superseded]
+        G5[#21 default 2-case synthetic suite]
     end
-    subgraph Smoke["Smoke / preflight"]
-        S1[#18 full system smoke]
-        S2[#19 sweep preflight]
-        S3[#20 canary + promote canary]
-        S4[#2 stability local 120-min]
+
+    subgraph Smoke["Smoke / preflight (deploy-time)"]
+        S1[#18 full_system_smoke.sh]
+        S2[#19 sweep_preflight.sh]
+        S3[#20 canary.sh + promote_canary.sh]
+        S4[#2 stability_local 120-min]
     end
+
     subgraph MultiB["Multi-bench (real fix-rate)"]
-        M1[#4 5 model x 2 cond x 1632 sweep]
-        M2[#5 retrieval-only sweep]
+        M1[#4 5-model x 2-cond x 1632 sweep]
+        M2[#5 retrieval-only multi-bench]
         M3[#6 multi-bench-ralph rolling resume]
     end
+
     subgraph Judge["Judge (post-hoc verdict)"]
         J1[#7 stratified-500 docker bootstrap]
         J2[#8 mswebench harness]
-        J3[#28 judge audit separated denominators]
+        J3[#28 judge_audit.py separated denominators]
     end
-    subgraph Recall["Recall@k vs fix patch gold"]
-        R1[#9 planner recall v1]
-        R2[#10 planner recall v2]
-        R3[#22 swe mb 5-case ripgrep suite]
+
+    subgraph Recall["Recall@k vs fix_patch gold"]
+        R1[#9 planner_recall_eval v1]
+        R2[#10 planner_recall_eval v2]
+        R3[#22 swe_mb 5-case ripgrep suite]
     end
-    subgraph Autor["Autoresearch (prompt MCTS)"]
+
+    subgraph Autoresearch["Autoresearch (prompt MCTS)"]
         A1[#23 v1 restart-per-candidate]
-        A2[#24 v3/v4 per-request override]
+        A2[#24 v3/v4 plan_system_override]
     end
-    subgraph Infer["Inference benchmarking"]
-        I1[#11 perseus inference bench]
-        I2[#12 cato inference sweep]
-        I3[#29 perseus 10x benchmark]
+
+    subgraph Inference["Inference benchmarking"]
+        I1[#11 perseus_inference_bench.py]
+        I2[#12 cato_inference_sweep.sh]
+        I3[#29 perseus_10x_benchmark.py]
     end
+
     subgraph WM["WM leaderboard / ship loop"]
         W1[#25 WM knob sweeps v1-v6]
-        W2[#26 auto eval WM 5-head R-squared]
-        W3[#27 auto ship WM threshold loop]
+        W2[#26 auto_eval_wm 5-head R2]
+        W3[#27 auto_ship_wm threshold loop]
     end
-    subgraph Cont["Continuous loops"]
-        C1[#13 eval runner loop]
+
+    subgraph Continuous["Continuous loops"]
+        C1[#13 eval_runner.sh loop]
         C2[#14 perseus doctor classifier]
         C3[#16 tinker variant rotation 30m]
-        C4[#30 eval watch per-eval]
+        C4[#30 eval_watch.sh per-eval]
     end
 ```
 
-Counting bucket members: Gates 5, Smoke 4, Multi-bench 3, Judge 3, Recall 3, Autoresearch 2, Inference 3, WM 3, Continuous 4 — thirty.
+Counting bucket members: Gates 5, Smoke 4, Multi-bench 3, Judge 3,
+Recall 3, Autoresearch 2, Inference 3, WM 3, Continuous 4 — totals
+thirty.
 
-The three categories we use below are orthogonal to bucket grouping. A surface can sit in any bucket; what matters is whether anyone ever read the output and acted on it.
+The three categories the rest of this essay uses are orthogonal to
+the bucket grouping. A surface can be in any bucket; what matters is
+**whether anyone ever read the output and acted on it**.
 
 <Figure src="eval-methodology-surface-matrix.png" alt="surface taxonomy" caption="30 V2 eval surfaces grouped by function. Three produced signal (green). Six prevented incidents (yellow). Twenty-one were theater (red). The class is the eval-without-graduation pattern: rich measurement, no consumer." n={1} />
 
 ## 2. Three surfaces that produced actionable signal
 
-A signal surface is one whose output was directly responsible, in the post-mortem, for changing a code path, hyperparameter, deployment decision, or research direction. Three qualify.
+A "signal" surface is one whose output, in the post-mortem, was
+directly responsible for changing a code path, a hyperparameter, a
+deployment decision, or a research direction. Three qualify.
 
 ### 2.1 Multi-bench fix-rate cohort (post T1–T9)
 
-Surface #4 — the full 5-model × 2-condition × 1,632-instance sweep — became signal-bearing only after the pipeline integrity audit landed on 2026-05-11. Before that, the per-row pass criterion was gated by a harness env flag the production loop never set; 27,542 rows came back with zero passes because no verdict was ever computed. The displayed pass rate was driven by a substring match against a column that was always NULL. It was zero by construction for four months.
+Surface #4, the full 5-model × 2-condition × 1632-instance sweep,
+became signal-bearing only **after the pipeline integrity audit
+landed** on 2026-05-11. Before that, the per-row pass criterion in
+`src/multi_bench/scoring.rs::Verdict::Pass` was gated by
+`PERSEUS_MULTI_BENCH_HARNESS=1`, which the production loop never set;
+27,542 rows came back `passed=0` because no verdict was ever
+computed. The displayed "pass rate" was a function of whether
+`row.result.as_deref() == Some("pass")` matched a column that was
+always NULL. It was zero by construction for four months.
 
-T1 added `judge_label`, `judge_source`, `judge_detail`, `judge_labeled_at` columns to the multi-bench row type and threaded the read path through both stores. T2 made the judge reward source actually read the new column. T6 added the collision guard against the harness's PR-keyed verdict bug — without it, one upstream PR with five model variants and two conditions shared a single verdict that was fanned to ten collided rows, contaminating the headline pass-rate. T7 backfilled 5,044 already-poisoned rows and retagged them `harness_collided`.
+T1 added `judge_label` / `judge_source` / `judge_detail` /
+`judge_labeled_at` columns to `MultiBenchRow` and threaded the read
+path through both stores. T2 made `RewardSource::Judge` actually
+read the new column. T6 added the collision guard against the
+`<org>/<repo>:pr-<n>` keying bug in the mswebench harness — without
+it, one upstream PR with five model variants and two conditions
+shared a single verdict that was then fanned to ten collided rows,
+contaminating the headline pass-rate. T7 backfilled 5,044
+already-poisoned rows on 2026-05-18 and retagged them as
+`harness_collided`.
 
-After the audit, the cohort produced two genuinely surprising numbers:
+After the audit, the cohort produced two genuinely surprising
+numbers: baseline 19.76% vs perseus 8.86% paired pass-rate (per
+`judge_audit.py` separated-denominator audit on the live cohort,
+`condition='perseus'`, `judge_source='mswebench_harness'`). That
+8.86% headline survived for weeks before HISTORY/33 audited the
+`prediction_bytes` column and discovered every perseus-condition
+prediction was in the 146–253 byte range — empty diff envelope. The
+prompt rewrite shipped 2026-05-18 to fix the codex blocking-call
+pattern that drained the per-attempt budget before any file edit.
 
-$$
-\text{pass}_{\text{baseline}} = 19.76\%, \quad \text{pass}_{\text{perseus}} = 8.86\%
-$$
-
-on a paired filter where `condition = perseus`, `judge_source = mswebench_harness`. That 8.86% headline survived for weeks before HISTORY/33 audited the predicted-bytes column and discovered every perseus-condition prediction was in the 146–253 byte range — an empty diff envelope. The prompt rewrite shipped 2026-05-18 to fix the codex blocking-call pattern that drained the per-attempt budget before any file edit.
-
-The surface produced signal only because the rows were classified by `judge_source` and the report kept four separate denominators visible. The same rows, aggregated to a single pass-rate, told the wrong story for four months. We return to this in §4.7 — the deepest failure mode is stacking three honest layers of measurement on top of a broken substrate.
+The surface produced signal **only** because the rows were classified
+by `judge_source` (`mswebench_harness` vs `harness_collided` vs
+`harness_unsupported`) and the report kept four separate
+denominators visible. The same rows, aggregated to a single pass-rate,
+told the wrong story for four months.
 
 ### 2.2 Judge-label corpus (mswebench harness + T6 collision guard)
 
-Surface #8 — the ByteDance multi-SWE-bench harness adapter, live since 2026-05-02 — is the upstream of #4's actionable signal. It deserves its own slot because the labels themselves (not the aggregate fix-rate) fed the reward-modelling pipeline. With $\text{judge\_label} \in \{0.0, 0.5, 1.0\}$ and T6-aware source distinction, the label corpus is the substrate for both the judge-reward path in muzero-export and the 16-dim nano-judge distillation.
+Surface #8 — the ByteDance multi-SWE-bench harness adapter, live
+since 2026-05-02 — is the upstream of #4's actionable signal. It
+deserves to be counted as its own signal-producing surface because
+the labels themselves (not the aggregate fix-rate) were what fed the
+reward modelling pipeline. `judge_label ∈ {0.0, 0.5, 1.0}` with the
+T6-aware `judge_source` distinction is the substrate for both
+`RewardSource::Judge` in muzero-export and the gpt-5.4-nano-medium
+16-dim distillation pass.
 
-Two consumers downstream:
+The signal was actionable when consumers existed downstream. Two did:
+the muzero-export `--reward-source judge` path (so WM checkpoints
+trained on real verdicts after 2026-05-11) and the
+`scripts/judge_audit.py` cohort report (so the operator could read
+honest pass-rates instead of `passed=0`).
 
-1. The muzero-export judge-reward path, so WM checkpoints trained after 2026-05-11 see real verdicts in their HL-Gauss bins instead of the silent zero-reward bucket that produced four months of regressed value heads.
-2. The audit script's cohort report, so the operator reads honest pass-rates instead of the always-NULL substring match that haunted the dashboards.
+Two consumers, real signal. Most surfaces have zero consumers.
 
-Two consumers, real signal. Most surfaces have zero consumers. The harness adapter itself cost roughly three engineering days plus the slimmed-dataset-subset performance fix (a roughly 33x parse-time reduction by writing only the matching rows to the harness's input file). The label corpus that resulted is the single most valuable artifact V2 produced for V3.
+### 2.3 Retrieval recall@k v2 with `fix_patch` grounding
 
-### 2.3 Retrieval recall@k v2 with fix-patch grounding
+Surface #10 — `scripts/planner_recall_eval_v2.py` — produced signal
+during the autoresearch v4 campaign. v1 (`planner_recall_eval.py`)
+scored each candidate `PLAN_SYSTEM` prompt by recall@k against gold
+files parsed from `fix_patch` `diff --git a/X b/Y` headers, which
+was correct as a measure of "did perseus return any gold file" but
+gave the same score to a candidate that returned 1000 files
+including the gold and one that returned only the gold. v2 added
+three signals that distinguished them:
 
-Surface #10, the v2 recall harness, produced signal during the autoresearch v4 campaign. v1 scored each candidate planner-system prompt by recall@k against gold files parsed from `diff --git a/X b/Y` headers. That was correct as a measure of "did perseus return any gold file" but gave the same score to a candidate that returned 1,000 files including the gold and one that returned only the gold. v2 added three signals that distinguished them:
-
-1. **Snippet-level overlap** against parsed hunk ranges. A candidate returning a 200-line excerpt overlapping a 5-line gold hunk scored higher than one returning the entire file.
-2. **Lift over a grep baseline**: per-instance $\Delta_i = \mathbb{1}[\text{perseus hit}] - \mathbb{1}[\text{rg hit}] \in \{-1, 0, +1\}$. Candidates with $\overline{\Delta} < -0.05$ were rejected outright; a planner-prompt strategy that underperformed grep is worse than not running the planner.
-3. **Diversity-balanced 100-instance pool** capped at 15 per family. Without the diversity cap, the ripgrep family dominated and recall scores reflected ripgrep-specific tuning rather than generalizable prompt quality.
+- **Snippet-level overlap** against the parsed `@@ -L,N +L,N @@`
+  hunk ranges. A candidate that returned a 200-line excerpt
+  overlapping the 5-line gold hunk scored higher than one that
+  returned the entire file.
+- **Lift vs `rg --files-with-matches` baseline**: per-instance
+  `perseus_hit − rg_hit ∈ {-1, 0, +1}`. Candidates with `mean_lift
+  < -0.05` were rejected outright; a planner-prompt strategy that
+  underperformed grep is worse than not running the planner.
+- **Diversity-balanced 100-instance pool** capped at
+  `MAX_PER_FAMILY=15`, cached at
+  `artifacts/autoresearch-instance-pool-v2.json`. Without the
+  diversity cap, the ripgrep family dominated the pool and
+  recall scores reflected ripgrep-specific tuning rather than
+  generalizable prompt quality.
 
 The composite score wired into autoresearch v4 was
+$0.50 \cdot \text{overlap} + 0.30 \cdot \text{lift} + 0.10 \cdot
+\text{recall@10} + 0.05 \cdot \text{mrr} + 0.05 \cdot
+\text{compactness}$ with explicit rejection of negative-lift prompts.
+The campaign finished and the winning prompts informed the next
+`PLAN_SYSTEM_BUILTIN` revision, then the surface was retired. The
+script is preserved.
 
-$$
-S = 0.50 \cdot \text{overlap} + 0.30 \cdot \text{lift} + 0.10 \cdot \text{recall@10} + 0.05 \cdot \text{MRR} + 0.05 \cdot \text{compactness}
-$$
-
-with explicit rejection of negative-lift prompts. The campaign finished and the winning prompts informed the next baked-in planner prompt revision, then the surface was retired. The script is preserved.
-
-That last detail is what distinguishes signal-bearing from theater: the campaign finished, the output was consumed, the surface was turned off. Theater surfaces never close out.
+That last detail is what distinguishes signal-bearing from theater:
+**the campaign finished, the output was consumed, the surface was
+turned off**. Theater surfaces never close out.
 
 ## 3. Six surfaces that prevented incidents
 
-A preventer surface is one that, at least once, refused to let a broken state proceed and saved a measurable amount of work. Six qualify.
+A "preventer" surface is one that, at least once, refused to let a
+broken state proceed and saved a measurable amount of work. Six
+qualify.
 
-### 3.1 Sweep preflight
+### 3.1 `sweep_preflight.sh` (#19)
 
-Surface #19 is a hard gate before launching the multi-bench runner. Five checks:
+Hard gate before launching `perseus-multi-bench run`. Five checks:
+perseus `/v1/health` on the exact worker URL; codex binary +
+co-resident `node` (the 2026-04-25 `spawn_codex` fix added the
+codex parent dir to child `PATH` so the `#!/usr/bin/env node`
+shebang resolves under non-interactive ssh — prior "empty patch"
+retries traced to `node: not found`); `AZURE_OPENAI_API_KEY` +
+endpoint sanity with `sk-*` prefix rejection (Azure→OpenAI key
+fallback in `runner.rs` had previously cost a full sweep); canary
+`/v1/query` with `X-External-Session-Id` that must round-trip with
+non-null `policy_fingerprint_sha`; zero `multi_bench_runs` rows
+stuck in `status='running'` > 45 min.
 
-1. Perseus health on the exact worker URL.
-2. Codex binary plus co-resident node (the 2026-04-25 spawn-codex fix added the codex parent dir to child PATH so the `#!/usr/bin/env node` shebang resolves under non-interactive ssh — prior "empty patch" retries traced to a missing node binary).
-3. Azure OpenAI key plus endpoint sanity, with explicit rejection of OpenAI-shaped keys (a key fallback in the runner had previously cost a full sweep).
-4. Canary query with an external-session-id header that must round-trip with a non-null policy fingerprint.
-5. Zero multi-bench rows stuck in `status=running` for more than 45 minutes.
+The preflight caught the wedge state at least three times in audit
+logs. Exit nonzero on any check → launcher refuses to spawn workers.
 
-The preflight caught the wedge state at least three times in audit logs. Exit nonzero on any check → launcher refuses to spawn workers.
+### 3.2 Canary deploys before full sweep (#20)
 
-### 3.2 Canary deploys before full sweep
+`scripts/canary.sh` launches `$BINARY serve --addr 127.0.0.1:18080`,
+waits for `/v1/health`, and — this is the load-bearing detail —
+verifies via `lsof -t -i:18080 -sTCP:LISTEN` that the listening PID
+actually matches the canary PID. The 2026-04 stale-canary bug was
+that a previous canary process held the port; the new "canary"
+binary `EADDRINUSE`'d silently, the health probe hit the old
+process, and the deploy was reported successful. The PID-verify
+catch wrote `artifacts/deploy/canary.env` only when the matching
+listener was the right process. `promote_canary.sh` reads keys
+safely (no `source`-ing of envfiles).
 
-Surface #20 launches the canary on a private port, waits for health, and — this is the load-bearing detail — verifies that the listening PID matches the spawned canary PID. The 2026-04 stale-canary bug was that a previous canary held the port; the new canary `EADDRINUSE`'d silently, the health probe hit the old process, and the deploy was reported successful. The PID-verify catch writes the canary env file only when the matching listener is the right process. The promote script reads keys safely (no shell-sourcing of env files).
+`make ai-sweep-start` chains `ai-sweep-canary` first so that
+scaling to N workers is impossible without a 1-row canary passing.
 
-Our sweep-start make target chains the canary first, so scaling to N workers is impossible without a 1-row canary passing.
+### 3.3 Doctor `wedged` state (#14)
 
-### 3.3 Doctor "wedged" state
+`src/cli/doctor/mod.rs::classify_state` returns one of `live` /
+`wedged` / `idle` / `stale`. The `wedged` state — `planner_events_last_5m
+> 0 AND query_traces_last_5m == 0` — caught **24 stranded workers**
+during the 2026-04-25 post-thrash recovery. Before the state existed,
+doctor was binary (live or not) and the green light hid the failure
+mode where planner work was happening but nothing was finishing.
 
-The doctor classifier returns one of `live`, `wedged`, `idle`, `stale`. The `wedged` state — defined as planner events in the last five minutes but zero finished query traces — caught 24 stranded workers during the 2026-04-25 post-thrash recovery.
-
-```mermaid
-stateDiagram-v2
-    [*] --> live
-    live --> wedged: planner_events>0 AND query_traces==0
-    live --> idle: planner_events==0 AND queue==0
-    live --> stale: heartbeat>5m
-    wedged --> live: restart_succeeds
-    idle --> live: new_work
-    stale --> live: heartbeat_resumes
-    wedged --> [*]: kill
-    stale --> [*]: kill
-```
-
-Before the state existed, doctor was binary (live or not) and the green light hid the failure mode where planner work was happening but nothing was finishing. The same probe is exposed at three ops endpoints so remote agents and dashboards do not need ssh.
+The same probe is exposed at `/v1/ops/status`, `/v1/ops/sweep`, and
+`/v1/ops/training-readiness` so remote agents and dashboards don't
+need SSH. State-specific `next_actions` hint per render. JSON keeps
+`live` as a back-compat alias of `state == "live"`.
 
 ### 3.4 Basename dedup for retrieval indices
 
-Workdirs follow `<owner>__<repo-bug>__<model>__<condition>`. Before the 2026-04-25 fix, the retrieval helper returned the full workdir basename, so retrieval-service indexed every (model, condition) variant as a distinct qdrant collection. The fan-out was
+Workdirs follow `<owner>__<repo-bug>__<model>__<condition>`. Before
+the 2026-04-25 fix, `retrieval::basename_of` returned the full
+workdir basename, so retrieval-service indexed every (model,
+condition) variant as a distinct qdrant collection. The fan-out
+across 5 models × 2 conditions × 1632 instances was **8160 distinct
+collections for 1632 unique bugs** — 5× duplication because the
+model and condition fan-out occurs *after* indexing (codex's edits
+happen on the checked-out repo after the index is built).
 
-$$
-N_{\text{collections}} = 5 \cdot 2 \cdot 1{,}632 = 16{,}320
-$$
+The fix: strip the `__model__condition` suffix when present, return
+just the instance id. All five model variants share one qdrant
+collection. 5× fewer indexings, 5× faster preindex, no behaviour
+change. Three unit tests pin the behaviour
+(`basename_dedupes_multi_bench_model_fanout`,
+`basename_baseline_and_engram_dedupe_too`,
+`basename_passes_through_non_multi_bench_paths`).
 
-for what should have been 1,632 distinct repos. The model and condition fan-out occurs *after* indexing — codex's edits happen on the checked-out repo after the index is built — so all five model variants for one bug have identical source content. Five-times duplication, by construction.
+### 3.5 mswebench collision guard (T6)
 
-The fix strips the model and condition suffix when present and returns just the instance id. All five variants share one collection. Five-times fewer indexings, no behaviour change. Three unit tests pin the dedup behaviour.
+Detailed in §2.1 and the [multi-swe-bench wiring essay](/essays/multi-swe-bench-wiring/).
+The harness keys patches by `<org>/<repo>:pr-<n>`; perseus's 5×2
+fan-out collides at that key. `run_batch_via_mswebench` now rejects
+colliding rows **before** invoking the harness. Each colliding row
+gets `judge_source = 'harness_collided'` (new constant
+`JUDGE_SOURCE_COLLIDED`) with a NULL `judge_label`. Rows are
+preserved unlabelled so they can be re-judged in single-row batches
+later.
 
-### 3.5 Mswebench collision guard (T6)
+The retroactive T7 backfill SQL retagged 5,044 already-poisoned rows
+in the live cohort. The audit script keeps the collision rate as a
+separate denominator from the patch-row pass rate so the contamination
+is visible if it ever recurs.
 
-The harness keys patches by `<org>/<repo>:pr-<n>`; our 5×2 fan-out collides at that key. The batch runtime now rejects colliding rows before invoking the harness. Each colliding row gets a distinct `judge_source` and a NULL label. Rows are preserved unlabelled so they can be re-judged in single-row batches later.
+### 3.6 `judge_audit.py` separated denominators (#28)
 
-The retroactive T7 backfill SQL retagged 5,044 already-poisoned rows in the live cohort. The audit script keeps collision rate as a separate denominator from patch-row pass rate, so contamination is visible if it recurs.
+The honest cohort-level pass-rate audit. Ten numbered sections:
+cohort size, by-status, by-judge_source, patch-row pass-rate
+(denominator = `mswebench_harness` rows only — excludes collisions
+and unsupported), unsupported rate, collision rate (T6
+`harness_collided`), no-patch error rate, end-to-end pass rate
+(denominator = full COHORT — what "X% of seeded bugs got fixed"
+actually looks like), paired baseline-vs-perseus on instances with
+both verdicts, collision audit (instances with >1
+`mswebench_harness` row).
 
-### 3.6 Judge-audit separated denominators
+Filters: `--dataset`, `--condition`, `--model`,
+`--policy-fingerprint-sha` (joins via
+`query_traces.external_session_id == multi_bench_runs.run_id`).
+Read-only `psycopg2` (`conn.set_session(readonly=True)`).
 
-Surface #28 is the honest cohort report. Ten numbered sections: cohort size, by-status, by-source, patch-row pass-rate (denominator = harness-judged rows only, excluding collisions and unsupported), unsupported rate, collision rate, no-patch error rate, end-to-end pass rate (denominator = full cohort — what "X% of seeded bugs got fixed" actually looks like), paired baseline-vs-perseus on instances with both verdicts, collision audit. Each section names its denominator.
-
-Filters by dataset, condition, model, and policy fingerprint. Read-only psycopg2. The structural insight: the headline pass-rate number on most prior surfaces silently used whichever denominator made the numerator look largest. The audit refuses to collapse them.
-
-The arithmetic is unforgiving. Suppose the cohort has $N$ rows, of which $N_h$ have a harness verdict, $N_c$ are collision-flagged, $N_u$ are unsupported, $N_e$ erred out before producing a patch. Then the headline "pass rate" can be quoted as any of
-
-$$
-\frac{p}{N_h}, \quad \frac{p}{N_h + N_c}, \quad \frac{p}{N_h + N_c + N_u}, \quad \frac{p}{N}
-$$
-
-and each is a different number. Most prior dashboards picked the first by default (largest), then displayed it as if it were the last. The audit shows all four side by side, with their denominators labelled.
+The structural insight that distinguishes this from theater: each
+section names its denominator. The headline pass-rate number on most
+prior surfaces silently used whichever denominator made the
+numerator look largest. The audit refuses to collapse them.
 
 ## 4. Twenty-one theater / debugging-misuse surfaces
 
-The remaining twenty-one fell into seven failure modes. Each mode is a class — not "this surface was bad" but "this category of surface produces nothing of value without a structural fix".
-
-```mermaid
-flowchart LR
-    M[measurement fires] --> S{schedule?}
-    S -- yes --> A[artifact written]
-    A --> C{consumer reads it?}
-    C -- no --> T[theater]
-    C -- yes --> D{decision driven by it?}
-    D -- no --> T
-    D -- yes --> R[real eval]
-    T --> CLS{failure class}
-    CLS --> F1[4.1 gate never fails]
-    CLS --> F2[4.2 mock-everywhere]
-    CLS --> F3[4.3 no consumer]
-    CLS --> F4[4.4 debugging-as-graduation]
-    CLS --> F5[4.5 retired-before-signal]
-    CLS --> F6[4.6 one-shot, no closeout]
-    CLS --> F7[4.7 masks its own bug class]
-```
+The remaining twenty-one surfaces fell into seven failure modes.
+Each mode is a class — not "this surface was bad" but "this
+category of surface produces nothing of value without a structural
+fix".
 
 ### 4.1 Theater gates that never observed a failure
 
-Surfaces #1, #15, and #21 all share one property: at audit time, streak = 3,850 consecutive passes, required = 3. The gate had never observed a failure cycle. Our own operational-policy block reads: gate streak is release-check terminology only; it is not a planner or runtime control.
+Surface #1 (5-case gate suite + 3-cycle streak), surface #15 (gate
+streak counter), and surface #21 (synthetic 2-case `default` suite)
+all share one property: at audit time, `streak=3850` consecutive
+passes, `required=3`. The gate had never observed a failure cycle.
+Per `Claude.md`'s own operational-policy block: *"gate streak is
+release-check terminology only; it is not a planner/runtime control."*
 
-3,850 cycles at a 5-minute tick is roughly 13.4 days of continuous green. The cases in `gate5.json` score by substring match of expected against any returned hit path, against a baseline of quality = 3.0. The threshold is calibrated such that every realistic perseus output exceeds it.
+3,850 cycles at a 5-minute tick is roughly 13.4 days of continuous
+green. The cases in `benchmarks/suites/gate5.json` (auth, locale,
+parser, test, mcts) score by substring match of `expected` in any
+returned hit path, against a `quality=3.0` baseline. The threshold
+is calibrated such that every realistic perseus output exceeds it.
 
-A gate that has never observed a failure is not a gate. It is a heartbeat probe with a pass-fail printout. The streak counter appeared on every dashboard and gave the operator a number to point at that meant nothing.
+A gate that has never observed a failure is not a gate. It is a
+heartbeat probe with a pass/fail printout. The streak counter
+appeared on every dashboard and gave the operator a number to point
+at that meant nothing.
 
 ### 4.2 Mock-everywhere smoke
 
-Surface #2 and surface #17 both default to mock planner endpoints. The regression gate sub-step (#3) runs against the same suite as the main gate with mock endpoints unless an explicit live flag is set.
+Surface #2 (`stability_local.sh` 120-min window) and surface #17
+(`gate_stabilize.sh`, superseded) both default to `mock://local`
+planner endpoints. The regression-gate sub-step (#3,
+`gate5_retrieval`) runs against the same suite as the main gate
+with `mock://` endpoints unless `PERSEUS_REGRESSION_LIVE=1` is set.
 
-A smoke test where every dependency is mocked cannot fail in interesting ways. The transport layer never returns 5xx. The planner never times out. Retrieval-service is always reachable. The operator gets a green stability-passed and the actual production codepath has not been exercised. The fix is one flag and the discipline to flip it; production-mode runs are rare in the artifact history.
+A smoke test where every dependency is mocked cannot fail in
+interesting ways. The transport layer never returns 5xx. The planner
+never times out. The retrieval-service is always reachable. The
+operator gets a green "stability passed" and the actual production
+codepath has not been exercised.
+
+The fix is one knob (`_LIVE=1`) and the discipline to flip it. Both
+suites can flip it; production-mode runs are rare in the artifact
+history.
 
 ### 4.3 No-downstream-consumer harnesses
 
-Surface #5 (retrieval-only multi-bench) ran for two days and produced ~367 sweep logs plus ~3MB of structured telemetry, tagged by policy fingerprint. The corpus fed muzero-exports. No aggregated retrieval-quality scorecard was ever computed across the 367 logs. The headline metric for "how good is retrieval-only" never existed.
+Surface #5 (retrieval-only multi-bench sweep) ran for two days
+(2026-05-11 → 2026-05-13) and produced ~367 sweep logs on engram,
+~3MB of structured telemetry in `planner_events` / `tool_events` /
+`mcts_step_snapshots` tagged by `policy_fingerprint_sha`. The corpus
+fed muzero-exports. No aggregated retrieval-quality scorecard was
+ever computed across the 367 logs. The headline metric for "how
+good is retrieval-only" never existed.
 
-Surfaces #11 and #12 (inference benchmarks) ran on demand, deposited per-case reports into a structured directory, and were never aggregated across runs. The campaign artifact root is empty of campaign-level summaries. The cross-encoder rerank gold-event JSONL emits daily files joining with the service's event log on run id. No consumer reads it.
+Surface #11 (`perseus_inference_bench.py`) and #12
+(`cato_inference_sweep.sh`) ran on demand, deposited per-case
+reports into `artifacts/inference-bench/<bench_id>/{report.json,
+summary.csv}`, and were never aggregated across runs. The
+`artifacts/inference-bench/` directory exists; the campaign artifact
+root is empty of campaign-level summaries.
 
-A measurement that no downstream pipeline consumes is debugging output, not an eval. It is fine for measurements to be debugging output, as long as that classification is honest. The failure mode here is calling debugging output an eval — every surface in this class was treated as a graduation signal in some operator's mental model, even though no graduation criterion existed.
+The cross-encoder rerank gold-event JSONL
+(`PERSEUS_RETRIEVAL_GOLD_LOG=1`) emits
+`artifacts/retrieval-gold-events/YYYY-MM-DD.jsonl` daily joining
+with the service's `/var/lib/retrieval-events/` on `run_id`. No
+consumer or training pipeline reads it.
+
+A measurement that no downstream pipeline consumes is debugging
+output, not an eval. It is fine for measurements to be debugging
+output as long as that classification is honest. The failure mode
+here is **calling debugging output an "eval"** — every surface in
+this class was treated as a graduation signal in some operator's
+mental model even though no graduation criterion existed.
 
 ### 4.4 Debugging signal mislabeled as graduation signal
 
-The clearest example is surface #16, the tinker variant rotation loop. It runs every 30 minutes, exports the latest LoRA checkpoint, merges into base, launches per-variant vLLM on GPUs 2 through 6 / ports 19301 through 19305, runs the variant benchmark on five ripgrep cases, and updates a leaderboard. Sixty-five leaderboards exist at audit time.
+The clearest example is surface #16, the tinker variant rotation
+loop. It runs every 30 minutes, exports the latest LoRA checkpoint
+via `tinker_train/export.py`, merges into the base model, launches
+per-variant vLLM on GPUs 2..6 / ports 19301..19305, runs
+`benchmark_variants.py` on the 5 ripgrep cases from `swe_mb.json`,
+and updates a leaderboard at
+`cato:/home/cato-user/tinker_eval/leaderboard_*.md` (65 leaderboards
+at audit time).
 
-The composite score on the leader (v3_r128 step 10500) was
+The composite score on the leader (v3_r128 step 10500 at audit time)
+was `recall=0.20, any_hit=1.00, latency=49.4s, score=0.0040`. The
+top variant scored 0.4%. That is a **debugging dashboard** — useful
+for "is this checkpoint completely broken or producing some
+output" — but it was treated as a graduation signal for which
+tinker variant to ship. No variant ever cleared a meaningful
+threshold; the loop ran forever and produced a stream of
+leaderboards that nobody made a ship decision against.
 
-$$
-\text{recall} = 0.20, \quad \text{any\_hit} = 1.00, \quad \text{latency} = 49.4\,\text{s}, \quad S = 0.0040
-$$
+Same shape: surface #26 (`auto_eval_wm.py` 5-head R² leaderboard).
+For each of 24 WM checkpoint variants, score each epoch as
+`min(value_r2, fr_r2, sr_r2, prm_r2, confirm_acc)`, pick the best
+epoch, rank by min-head. Pass criterion: `min_head >= --threshold`
+(default 0.5, soft 0.3) → `[SHIP]` / `[soft]` / `[wait]`. At audit
+time, no variant cleared 0.5 on min-head; the highest min-head was
+on `wm_v4_random_split` at val_r2=0.997 which HISTORY/28 later
+established was row-split leakage. The honest min-head on
+`v3_chain_deepsets` was `terminal_reward_r2=0.112,
+file_recall_t_r2=0.119, nano_prm_score_r2=0.279` — clearly below
+the 0.5 threshold.
 
-The top variant scored 0.4%. That is a debugging dashboard — useful for "is this checkpoint completely broken" — but it was treated as a graduation signal for which tinker variant to ship. No variant ever cleared a meaningful threshold.
-
-Same shape: surface #26 ranks 24 WM checkpoint variants by min-head $R^2$:
-
-$$
-\text{score}(\theta) = \min\bigl(R^2_{\text{value}},\, R^2_{\text{fr}},\, R^2_{\text{sr}},\, R^2_{\text{prm}},\, \text{acc}_{\text{confirm}}\bigr)
-$$
-
-Pass criterion: $\text{score} \geq \tau$ with $\tau = 0.5$ default, $\tau = 0.3$ soft. At audit time, no variant cleared 0.5 on min-head; the highest min-head was `wm_v4_random_split` at val-$R^2$ of 0.997 which HISTORY/28 later established was row-split leakage. The honest min-head on `v3_chain_deepsets` was 0.112 — clearly below threshold.
-
-Surface #27 (the ship loop) polled #26 every 180 seconds and would have shipped if anything cleared. Nothing did. So both surfaces ran continuously, emitted leaderboards, and nothing shipped on their criterion — the actual ship decision used val-$R^2$ from #26 in a way that was specifically called out as contaminated. The graduation signal was contaminated; the mechanically-correct gate never fired.
+Surface #27 (`auto_ship_wm.py` min-head threshold ship loop) polled
+#26 every 180s and would have shipped if anything cleared. Nothing
+did. So both surfaces ran continuously, emitted leaderboards, and
+nothing shipped on their criterion — the actual ship decision used
+val_r2 from #26 in a way that was specifically called out as
+contaminated. The graduation signal was contaminated; the
+mechanically-correct gate never fired.
 
 ### 4.5 Retired-before-signal autoresearch surfaces
 
-Surface #23 (autoresearch v1) ran for nine minutes on 2026-04-22, produced 20 candidate variant scores into a timestamped artifact directory, and was retired. Top three variants scored 0.0952, 0.0476, 0.0119. None got promoted into the baked-in planner prompt; the campaign informed the next prompt revision in a fuzzy "we learned things" way rather than via a clean A/B.
+Surface #23 (prompt-autoresearch v1) ran for nine minutes on
+2026-04-22 (16:16–16:25 UTC), produced 20 candidate variant scores
+into
+`engram:/home/engram/Perseus/artifacts/prompt-sweeps/20260422T161634Z/`
+(1.8MB total), and was retired. Top three variants scored
+`v01_literal_flag_forensics 0.0952`,
+`v03_tests_to_source_backtrace 0.0476`,
+`v12_semantic_neighbor_push 0.0119`. None of those got promoted
+into `PLAN_SYSTEM_BUILTIN`; the campaign informed the next prompt
+revision in a fuzzy "we learned things" way rather than via a clean
+A/B.
 
-Surface #24 (v3 and v4 with the per-request planner-prompt override) did real MCTS-over-prompts with composite scoring from surface #10. The data rolled into the retrieval-only multi-bench loop from 2026-05-11. The campaign retired without anyone publishing the winning prompts in a file with provenance.
+Surface #24 (v3/v4 with `plan_system_override`) — the per-request
+override field that obsoleted the restart-per-candidate flow — did
+real MCTS-over-prompts with composite scoring from surface #10.
+No surviving `artifacts/prompt-autoresearch-v{3,4}/` directories;
+the data rolled into the retrieval-only multi_swe_bench loop (#5)
+from 2026-05-11. The campaign retired without anyone publishing the
+winning prompts in a file with provenance.
 
-The class failure: each autoresearch generation fired evals that were never validated against the next generation's baseline. v1 produced 0.0952 top score; v3 and v4 used a different metric, so the numbers are not comparable; nothing measured "did v3 beat v1 on v1's own metric". The [autoresearch saga](/essays/autoresearch-saga/) covers the four generations end-to-end.
+The class failure: each autoresearch generation fired evals that
+were never validated against the next generation's baseline. v1
+produced 0.0952 top score; v3/v4 used a different metric (composite
+overlap+lift+recall+mrr+compactness) so the numbers are not
+comparable; nothing measured "did v3 beat v1 on v1's own metric".
+
+Cross-link: the [autoresearch saga](/essays/autoresearch-saga/) covers
+the four generations end-to-end. The eval-methodology angle is just
+that none of the generations closed out with a published
+graduation.
 
 ### 4.6 One-shot knob sweeps without follow-through
 
-Surface #25 (WM knob sweeps v1 through v6) is the case study. v1 through v3 swept four hyperparameters on single-query wall-clock and produced a "winner" — $\alpha = 0.9$, UCB-C = 1.0, max-steps = 4, self-check = 0.4, latency = 15.22s — that was promoted into our env file. The $\alpha = 0.9$ value was anchored on the `wm_v4_random_split` val-$R^2$ that HISTORY/28 later established is row-split leakage; on production traffic those predictions are roughly noise. The 2026-05-18 emergency rollback dropped $\alpha$ from 0.9 back to 0.0 with the comment that the WM probes still fire (telemetry visible) but contribute zero to UCB.
+Surface #25 (WM knob sweeps v1–v6) is the case study. v1–v3 swept
+`(UCB_C, MAX_STEPS, WM_PRIOR_WEIGHT, SELF_CHECK)` on single-query
+wall-clock and produced a "winner" (α=0.9 / UCB_C=1.0 / MAX_STEPS=4
+/ SELF_CHECK=0.4 → 15.22s) that was promoted into
+`scripts/env.perseus`. The α=0.9 value was anchored on
+`wm_v4_random_split`'s val_r2=0.997 which HISTORY/28 audit later
+established is row-split leakage; on production traffic those
+predictions are roughly noise. The 2026-05-18 emergency rollback
+dropped α from 0.9 back to 0.0 in `scripts/env.perseus:123` with the
+comment that the wm_call probes still fire (telemetry visible) but
+contribute zero to UCB.
 
-v6 swept eleven WM stop-weight knobs over ~1,000 queries × 11 configs against the ripgrep and perseus repos. Top configs cfg000 and cfg010 sit in a timestamped directory. **Ship decision still pending.** No automated A/B harness exists to push the winning config into production safely.
+v6 swept eleven WM stop-weight knobs (`WM_STOP_W_VALUE`,
+`_W_JUDGE`, `_W_REWARD`, `_W_LINE_HITS`, `_W_PRIMARY`, `_W_STEP`,
+`_COMPOSITE`, `_LINE_SCALE`, `_PRIMARY_SCALE`, `_STEP_MID`,
+`_STEP_SOFT`) over ~1000 queries × 11 configs against ripgrep and
+Perseus repos. Top configs cfg000 and cfg010 sit in
+`perseus_sweeps_v6_20260517T174856/`. **Ship decision still
+pending.** No automated A/B harness exists to push the winning
+config into production safely.
 
-A one-shot knob sweep that does not close out with a documented "this is what we promote and this is the rollback path" is not useful. It produces a winner that sits in a directory until someone remembers to manually edit the env file, and the bookkeeping for which config is live drifts immediately.
+A one-shot knob sweep that doesn't close out with a documented
+"this is what we promote and this is the rollback path" is not
+useful. It produces a winner that sits in a directory until someone
+remembers to manually edit the env file, and the bookkeeping for
+which config is live drifts immediately.
 
 ### 4.7 Surfaces masking the class they were built for
 
-The cleanest example: every multi-bench surface (#4, #5, #6) is nominally a real fix-rate measurement. HISTORY/33 identified that the perseus condition produced prediction bytes in the range 146 to 253 across 6,545 labelled rows — empty diff envelopes. That is not a fix-rate question. The multi-bench rows existed for weeks, the judge labelled them, the audit script aggregated them, and nothing in the eval chain surfaced "the patch column is empty".
+The cleanest example: every multi-bench surface (#4, #5, #6) is
+nominally a "real fix-rate" measurement. The bug HISTORY/33
+identified is that the perseus condition produced
+`prediction_bytes ∈ [146, 253]` — empty diff envelopes — across
+6,545 labelled rows. That is **not a fix-rate question**. The
+multi-bench rows existed for weeks, the judge labelled them, the
+audit script aggregated them, and nothing in the eval chain
+surfaced "by the way, the patch column is empty".
 
-A surface built to measure fix rate cannot reveal an empty-patch class, because it aggregates over the predictions assuming they exist. The class failure was caught only when HISTORY/33 ran a separate query against the predicted-bytes column directly.
+A surface built to measure fix rate cannot reveal an empty-patch
+class because it aggregates over the predictions assuming they
+exist. The class failure was caught only when HISTORY/33's audit
+ran a separate query against `prediction_bytes` directly.
 
-Similar shape: surface #28 reported 8.86% perseus pass rate for weeks. The number was honest given the labels. The labels were honest given the predictions. The predictions were universally empty. **Stacking three honest layers of measurement on top of a broken substrate produces a confident wrong number.**
+Similar shape: surface #28 reported 8.86% perseus pass rate for
+weeks. The number was honest given the labels. The labels were
+honest given the predictions. The predictions were universally
+empty. **Stacking three honest layers of measurement on top of a
+broken substrate produces a confident wrong number.**
 
-The structural fix is not "audit the patches at the eval layer" — it is to audit at the substrate. Cohort cleanliness is a first-class property of the dataset, not a downstream check.
+The structural fix is not "audit the patches at the eval layer" —
+it is to audit at the substrate. Cohort cleanliness is a first-class
+property of the dataset, not a downstream check.
 
 ## 5. Per-surface verdict table
 
-The kept / killed / repurposed breakdown for all thirty surfaces. "Repurposed" means the surface itself was useful as debugging output, but the framing of it as an eval should change.
+The kept/killed/repurposed breakdown for all thirty surfaces.
+"Repurposed" means the surface itself was useful as debugging
+output but the framing of it as an eval should change.
 
 | # | Surface | Verdict | One-line justification |
 |---|---------|---------|------------------------|
-| 1 | gate5 5-case suite | killed | Streak of 3,850 never observed a failure; threshold calibrated below any realistic output |
-| 2 | stability local 120-min | repurposed | Useful as deploy-time runtime probe; drop "regression gate" framing |
-| 3 | retrieval non-regression gate | killed | Mock-by-default, runs against same gate5 suite that has never failed |
-| 4 | multi-bench full sweep | kept | Post-T1–T9, produces actionable cohort signal when read through the audit script |
-| 5 | retrieval-only multi-bench | repurposed | Telemetry collection for WM training; never aggregated a quality scorecard |
-| 6 | multi-bench-ralph rolling | kept | Operational driver, not an eval; correctly classified as a queue worker |
-| 7 | stratified-500 docker bootstrap | kept | Still the only path for non-mswebench families |
-| 8 | mswebench harness | kept | Substrate for every downstream label; T6 collision guard mandatory |
-| 9 | planner recall v1 | killed | Retired; superseded by v2 |
-| 10 | planner recall v2 | killed | Campaign finished; preserved as script |
-| 11 | perseus inference bench | repurposed | Useful debugging harness; never produced a campaign report |
-| 12 | cato inference sweep | repurposed | Same; one-off config comparisons |
-| 13 | eval runner loop | killed | Drives #1 and #15, both theater |
-| 14 | perseus doctor classifier | kept | Wedged state caught 24 stranded workers |
-| 15 | gate streak counter | killed | Counter on a gate that never fails is a constant, not a counter |
-| 16 | tinker variant rotation | repurposed | Useful as a "did this checkpoint break" probe; misused as graduation signal |
-| 17 | gate stabilize | killed | Already superseded by stability local; no consumers |
-| 18 | full system smoke | kept | Real API surface check per-PR / per-restart |
-| 19 | sweep preflight | kept | Caught at least three wedge states; refuses to spawn into broken infra |
-| 20 | canary + promote canary | kept | PID-verify catch on the stale-canary bug is load-bearing |
+| 1 | gate5 5-case suite | killed | 3850-streak never observed a failure cycle; threshold is calibrated below any realistic output |
+| 2 | stability_local 120-min | repurposed | Useful as a deploy-time runtime probe; rename "stability" → "deploy probe", drop the "regression gate" framing |
+| 3 | retrieval non-regression gate | killed | mock-by-default, runs against same gate5 suite that has never failed |
+| 4 | multi-bench full sweep | **kept** | Post-T1-T9, produces actionable cohort signal when read through judge_audit.py |
+| 5 | retrieval-only multi-bench | repurposed | Useful as a telemetry-collection harness for WM training; not an eval — no aggregated quality scorecard exists |
+| 6 | multi-bench-ralph rolling | **kept** | Operational driver, not an eval; correctly classified as a queue worker |
+| 7 | stratified-500 docker bootstrap | **kept** | Superseded by mswebench for the multi_swe_bench cohort; still the only path for non-mswebench families |
+| 8 | mswebench harness | **kept** | The substrate for every downstream label; T6 collision guard mandatory |
+| 9 | planner_recall_eval v1 | killed | Retired; superseded by v2 |
+| 10 | planner_recall_eval v2 | killed | Campaign finished; preserved as script |
+| 11 | perseus_inference_bench.py | repurposed | Useful debugging harness; never producted a campaign report |
+| 12 | cato_inference_sweep.sh | repurposed | Same; useful for one-off config comparisons |
+| 13 | eval_runner.sh loop | killed | Drives surfaces #1 and #15 both of which are theater |
+| 14 | perseus doctor classifier | **kept** | `wedged` state caught 24 stranded workers; structural value clear |
+| 15 | gate streak counter | killed | Counter on a gate that never fails is a constant; not a counter |
+| 16 | tinker variant rotation | repurposed | Useful as a "did this checkpoint completely break" probe; treated as graduation signal incorrectly |
+| 17 | gate_stabilize.sh | killed | Already superseded by stability_local; no consumers |
+| 18 | full_system_smoke.sh | **kept** | Real API surface check per-PR / per-restart |
+| 19 | sweep_preflight.sh | **kept** | Caught at least three wedge states; refuses to spawn into broken infra |
+| 20 | canary.sh + promote_canary.sh | **kept** | PID-verify catch on the stale-canary bug is load-bearing |
 | 21 | synthetic 2-case default suite | killed | Legacy fallback only; no production consumer |
-| 22 | swe-mb 5-case ripgrep suite | repurposed | Benchmark dataset; not an eval per se |
-| 23 | autoresearch v1 | killed | Retired without closing the loop on whether v1 beat baked-in |
-| 24 | autoresearch v3/v4 | killed | Same; retired without published winners |
-| 25 | WM knob sweeps v1–v6 | repurposed | Valuable hyperparam search; failure was not closing v6 with a ship decision |
-| 26 | auto eval WM 5-head R-squared | repurposed | Checkpoint health probe; min-head threshold never fired |
-| 27 | auto ship WM threshold loop | killed | Never tripped its trigger; production used contaminated val-R-squared |
-| 28 | judge audit | kept | The honesty surface; separated denominators caught the empty-patch class indirectly |
-| 29 | perseus 10x benchmark | kept | Baseline-vs-WM speedup with explicit pass criterion (10x AND quality &geq; 0.5) |
-| 30 | eval watch | kept | Live-debug for a specific eval run |
+| 22 | swe_mb 5-case ripgrep suite | repurposed | Useful as a benchmark dataset; not an eval per se — passed into #11/#12/#16/#29 |
+| 23 | prompt-autoresearch v1 | killed | Retired without closing the loop on whether v1 prompts beat baked-in |
+| 24 | prompt-autoresearch v3/v4 | killed | Same; campaign retired without published winners |
+| 25 | WM knob sweeps v1–v6 | repurposed | Genuinely valuable hyperparameter search; class failure was not closing v6 with a ship decision |
+| 26 | auto_eval_wm 5-head R² | repurposed | Useful as a "what does the checkpoint look like" probe; min-head threshold never fired |
+| 27 | auto_ship_wm threshold loop | killed | Never tripped its own trigger; production ships used contaminated val_r2 instead |
+| 28 | judge_audit.py | **kept** | The honesty surface; separated denominators caught the empty-patch class indirectly |
+| 29 | perseus_10x_benchmark.py | **kept** | Real baseline-vs-WM speedup measurement with explicit pass criterion (10x AND quality ≥ 0.5) |
+| 30 | eval_watch.sh | **kept** | Operational tail; useful as live-debug for a specific eval run |
 
-Score: kept 9, repurposed 8, killed 13. The kept set overlaps with the six preventers from §3 and the three signal-producers from §2.
+Score: kept 9, repurposed 8, killed 13. The "kept" set has overlap
+with the "incident preventer" list from §3 (six preventers, all
+kept) plus three signal-producing surfaces (#4, #8, #28) from §2.
 
-The killed set is dominated by gate-shaped surfaces with no failure mode (#1, #3, #15, #17, #21), retired one-shot campaigns that did not close out (#9, #10, #23, #24), and loops driving already-killed surfaces (#13, #27).
+The "killed" set is dominated by gate-shaped surfaces with no
+failure mode (#1, #3, #15, #17, #21), retired one-shot campaigns
+that didn't close out (#9, #10, #23, #24), and loops driving
+already-killed surfaces (#13, #27).
 
 ## 6. ADR-007: benchmark on your own use
 
-The structural fix is one architectural decision, not thirty surfaces. ADR-007 in V3's new index reads:
+The structural fix is one architectural decision, not thirty
+surfaces. ADR-007 (Architecture Decision Record number 7 in V3's
+new index) reads:
 
-> A benchmark that does not gate a code change is a hobby. Perseus will maintain one operator-relevant gate against a known-clean cohort. Every other surface is either explicit debugging instrumentation (kept, named as such) or removed.
+> A benchmark that does not gate a code change is a hobby. Perseus
+> will maintain one operator-relevant gate against a known-clean
+> cohort. Every other surface is either explicit debugging
+> instrumentation (kept, named as such) or removed.
 
-The "operator-relevant" criterion: the gate must measure something the operator would refuse to ship without. For Perseus, that is the multi-bench cohort fix-rate, filtered to the current policy fingerprint, read through `judge_audit.py`'s separated denominators. If the gate produces less than the baseline 19.76% perseus pass-rate on a 100-instance balanced pool with the current fingerprint, the deploy does not promote. One gate. Not thirty.
+The "operator-relevant" criterion: the gate must measure something
+the operator would refuse to ship without. For Perseus, that is the
+multi-bench cohort fix rate **filtered to the current policy
+fingerprint** and read through `judge_audit.py`'s separated
+denominators. If the gate produces less than 19.76% perseus pass
+rate (baseline) on a 100-instance balanced pool with the current
+policy fingerprint, the deploy does not promote. That is one gate.
+Not thirty.
 
-The "known-clean cohort" criterion is harder. The pipeline integrity audit (T1 through T9, 2026-05-11) and the prompt rewrite (2026-05-18) both revealed that the cohort itself was contaminated for weeks. The substrate has to be audited at the same cadence as the gate. Two scripts do this: an integrity backfill that retags already-contaminated rows and NULLs their label (preserving them for re-judgement in single-row batches), and the audit report itself.
+The "known-clean cohort" criterion is harder. The pipeline integrity
+audit (T1–T9, 2026-05-11) and the prompt rewrite (2026-05-18) both
+revealed that the cohort itself was contaminated for weeks. The
+substrate has to be audited at the same cadence as the gate. The
+two scripts that do this are:
 
-Both run on demand. ADR-007's discipline is that every promotion decision runs both before reading the gate output.
+- `scripts/pipeline_integrity_backfill.sql` — retags
+  already-contaminated rows from `mswebench_harness` to
+  `harness_collided` and NULLs their label, preserving them for
+  re-judgement in single-row batches.
+- `scripts/judge_audit.py` — separated-denominator report, filterable
+  by `dataset` / `condition` / `model` / `policy_fingerprint_sha`.
 
-The cost arithmetic that justifies cutting twenty-one surfaces: each surface has a per-cycle cost in compute, an integration-debt cost in code complexity, and an attention cost in operator hours spent looking at dashboards. Call the per-cycle compute cost $c_i$, the per-week attention cost $a_i$, and the integration debt $d_i$. The expected value of a surface is
-
-$$
-\mathbb{E}[V_i] = \Pr[\text{consumer acts}] \cdot \text{value}(\text{action}) - (c_i + a_i + d_i)
-$$
-
-For a surface with no consumer, $\Pr[\text{consumer acts}] = 0$ and the expected value is strictly negative. Twenty-one of thirty surfaces satisfied this. The cumulative attention cost alone — operator-time spent reading dashboards that drove no decision — was the single largest hidden expense of V2.
-
-```mermaid
-flowchart LR
-    A[code change] --> B{cohort clean?}
-    B -- no --> C[backfill SQL]
-    C --> B
-    B -- yes --> D[judge_audit.py\nfiltered to policy_fingerprint]
-    D --> E{paired delta &geq; 0?}
-    E -- no --> F[reject promotion]
-    E -- yes --> G[promote]
-    F --> A
-    G --> H[record fingerprint as live]
-```
+Both run on demand. ADR-007's discipline is that **every promotion
+decision runs both** before reading the gate output.
 
 ## 7. The cohort-fingerprint angle
 
-Every query trace carries `policy_fingerprint_sha`, added 2026-04-25 via a dedicated module and migration. The fingerprint captures git sha, planner-prompt sha, confirm-stop prompt sha, UCB-C value, self-check setting, retrieval endpoint and enabled flag, sha256 of sorted Perseus env-var values with secrets elided, and build time. It is the substrate-level provenance stamp.
+Every `query_traces` row carries `policy_fingerprint_sha` (added
+2026-04-25 via `src/policy_fingerprint.rs` and migration
+`009_policy_fingerprint.sql`). The fingerprint captures `git_sha`,
+planner-prompt sha, confirm-stop prompt sha, UCB-C value,
+self-check setting, retrieval endpoint + enabled flag, sha256 of
+sorted `PERSEUS_*` env-var values (secrets elided), build time. It
+is the substrate-level provenance stamp.
 
-The reason the fingerprint is first-class to eval methodology is that mid-sweep behaviour changes silently mixed pre- and post-policies in the same dataset. The 2026-04-25 retroactive note spells this out: UCB-C went from 1.5 to 2.2, self-check went from off to self-calibrated, the planner prompt got three line-item edits, all within hours, all during an active sweep. The rows produced before and after those changes were merged in the same multi-bench table with no way to filter them. Training a WM on the mixed cohort produced noisy supervision by construction.
+The reason the fingerprint is first-class to the eval methodology
+is that **mid-sweep behaviour changes silently mixed pre/post
+policies in the same dataset**. The 2026-04-25 retroactive note
+spells this out: UCB-C went 1.5 → 2.2, self-check went off →
+self-calibrated, the planner prompt got three line-item edits, all
+within hours of each other, all during an active sweep. The rows
+produced before those changes and after those changes were merged
+in the same `multi_bench_runs` table with no way to filter them.
+Training a WM on the mixed cohort produced noisy supervision by
+construction.
 
-The fix: every eval row ships the fingerprint. Every report filters by it. The audit script's fingerprint filter is required for any pass-rate that will be cited. The action-dist dashboard splits cohort-level behaviour by fingerprint so that a mid-sweep behavioural change does not silently contaminate the trend.
+The fix: every eval row ships `policy_fingerprint_sha`. Every
+report filters by it. `judge_audit.py --policy-fingerprint-sha
+<sha>` is a required filter for any pass-rate that will be cited.
+The dashboard split in `scripts/action_dist.sh` shows cohort-level
+behaviour split by fingerprint so that a mid-sweep behavioural
+change does not silently contaminate the trend.
 
-This is the cohort-cleanliness discipline that ADR-007 inherits as a precondition. Without it, the gate produces honest numbers over a contaminated substrate and the operator ships on those numbers.
+This is the cohort-cleanliness discipline that ADR-007 inherits as
+a precondition. Without it, the gate produces honest numbers over a
+contaminated substrate and the operator ships on those numbers.
 
 ## 8. What V3 keeps and what it does not
 
-Going into V3 (see [the reset](/essays/the-reset/)):
+Going into V3 (post-reset, see [the reset](/essays/the-reset/)), the
+inheritance is:
 
-1. **Kept (9 surfaces)**: multi-bench full sweep, multi-bench-ralph, stratified-500 docker bootstrap, mswebench harness, perseus doctor, full system smoke, sweep preflight, canary plus promote, judge audit, the 10x benchmark, eval watch.
-2. **Repurposed and explicitly renamed (8)**: stability local renamed to "deploy probe"; retrieval-only multi-bench reclassified as telemetry collection; the inference bench and cato sweep reclassified as debugging harnesses; tinker variant rotation reclassified as a checkpoint-health probe; the swe-mb 5-case suite reclassified as a benchmark dataset; WM knob sweeps reclassified as hyperparam search with a required ship-decision close-out; the WM 5-head leaderboard reclassified as a checkpoint health probe.
-3. **Killed (13)**: gate5 and friends, the eval runner loop, the retired autoresearch campaigns, gate stabilize, the auto-ship threshold loop, the synthetic default suite.
-4. **New (V3-only)**: ADR-007 graduation gate. Single operator-relevant multi-bench cohort fix-rate, filtered to current policy fingerprint, read through separated denominators, with explicit cohort-cleanliness preflight. Promotion requires the paired baseline-vs-perseus delta on the filtered cohort to be non-negative.
+**Kept (9 surfaces)**: multi-bench full sweep (#4), multi-bench-ralph
+(#6), stratified-500 docker (#7), mswebench harness (#8), perseus
+doctor (#14), full_system_smoke.sh (#18), sweep_preflight.sh (#19),
+canary.sh + promote_canary.sh (#20), judge_audit.py (#28),
+perseus_10x_benchmark.py (#29), eval_watch.sh (#30). Eleven
+counting the multi-bench operational driver as kept; nine if you
+collapse #4/#6 into one entity and treat the docker bootstrap as
+auxiliary to the mswebench harness.
+
+**Repurposed and explicitly renamed (8)**: stability_local renamed
+"deploy probe" (#2); retrieval-only multi-bench reclassified as
+telemetry collection (#5); inference benchmark and cato sweep
+reclassified as debugging harnesses (#11, #12); tinker variant
+rotation reclassified as a "did the checkpoint break" probe (#16);
+swe_mb 5-case suite reclassified as a benchmark dataset (#22); WM
+knob sweeps reclassified as hyperparameter search with a required
+ship-decision close-out (#25); auto_eval_wm reclassified as a
+checkpoint health probe (#26).
+
+**Killed (13)**: gate5 and friends (#1, #3, #15, #17, #21),
+eval_runner loop (#13), retired autoresearch campaigns (#9, #10,
+#23, #24), gate_stabilize (#17 — overlap with #1's killed status),
+auto_ship_wm threshold loop (#27), the synthetic default suite
+(#21).
+
+**New (V3-only)**: ADR-007 graduation gate. Single operator-relevant
+multi-bench cohort fix rate, filtered to current
+`policy_fingerprint_sha`, read through `judge_audit.py` separated
+denominators, with explicit cohort-cleanliness preflight via
+`pipeline_integrity_backfill.sql`. Promotion requires the paired
+baseline-vs-perseus number on the filtered cohort to be non-negative.
 
 That is one new surface. Not thirty.
 
-## 9. The eval-without-graduation pattern
+## 9. The eval-without-graduation pattern (recap)
 
-The class failure is uniform across the 21 theater surfaces. Each one had:
+The class failure is uniform across the 21 theater surfaces. Each
+one had:
 
-1. A measurement.
-2. A schedule.
-3. An artifact directory.
-4. No consumer that read the artifact and made a decision.
+- A measurement
+- A schedule
+- An artifact directory
+- No consumer that read the artifact and made a decision
 
-When a measurement has no consumer, the act of measuring becomes the work product. The streak counter is the clearest case: it exists to be looked at, and looking at it changes nothing. The tinker leaderboard is the same shape: 65 leaderboard files, each a snapshot of which LoRA variant is "winning" by a score of 0.4%, none used to make a ship decision.
+When a measurement has no consumer, the act of measuring becomes
+the work product. The streak counter is the clearest case: it
+exists to be looked at, and looking at it changes nothing. The
+tinker leaderboard is the same shape: 65 leaderboard files, each
+one a snapshot of which LoRA variant is "winning" by a score of
+0.4%, none of them used to make a ship decision.
 
-The opposite shape — measurements with consumers — is rare. Multi-bench post-T1–T9 has the audit script as its consumer; the audit output drove the 2026-05-18 prompt rewrite. The v2 recall metric had autoresearch v4 as its consumer; the composite score drove candidate prompt selection. The doctor's wedged state had the operator as its consumer; the state classification drove twenty-four restart actions in one incident.
+The opposite shape — measurements with consumers — is rare. Multi-
+bench post-T1-T9 has `judge_audit.py` as its consumer; the audit
+output drove the 2026-05-18 prompt rewrite. The recall@k v2 metric
+had autoresearch v4 as its consumer; the composite score drove
+candidate prompt selection. perseus doctor's `wedged` state had the
+operator as its consumer; the state classification drove twenty-four
+restart actions in one incident.
 
-Three signal-producers. Six preventers. Twenty-one with no consumer.
+Three signal-producers. Six preventers. Twenty-one with no
+consumer. The structural fix is to require a consumer at surface-
+creation time, and to delete or repurpose any surface that does
+not have one within thirty days.
 
-The structural fix is to require a consumer at surface-creation time, and to delete or repurpose any surface that does not have one within thirty days. ADR-007 codifies the first half; the second half is operational discipline. We have not yet earned the right to call it solved — the v6 WM sweep is still pending a ship decision as of this writing, which means at least one surface remains in the "produced a winner, no consumer plumbed it through" bucket. The discipline is to close that loop before adding another surface, not after.
+## Sources
+
+- `/Users/sam/code/perseus/parking_lot/v2_archive_2026-05-18/HISTORY/32_eval_methodology.md`
+  — canonical surface catalog with quick index, per-surface
+  what/pass-criterion/runner/frequency/outputs/active blocks.
+- `/Users/sam/code/perseus/parking_lot/v2_archive_2026-05-18/HISTORY/33_multibench_detail.md`
+  — perseus-condition empty-patch class; `prediction_bytes ∈ [146,
+  253]` across 6,545 rows.
+- `/Users/sam/code/perseus/parking_lot/v2_archive_2026-05-18/HISTORY/28_muzero_wm_research.md`
+  — WM v4 random-split leakage; honest baseline metrics for
+  v3_chain_deepsets.
+- `Claude.md` 2026-05-11 entry — pipeline integrity audit T1–T9
+  landed; `judge_label` column, `harness_collided` source,
+  `pipeline_integrity_backfill.sql`, `judge_audit.py`.
+- `Claude.md` 2026-05-18 entry — perseus-condition prompt rewrite +
+  WM α emergency disable; rationale and rollback path.
+- `Claude.md` 2026-04-25 entry — UCB-C and self-check changes mid-
+  sweep; policy fingerprint introduction.
+- `Claude.md` operational policy block — gate requirement (5-case,
+  3-cycle), stabilization window (120 min), degradation handling
+  (alert-only, manual rollback), no automated rollback trigger,
+  gate streak is release-check terminology only.
+- `src/cli/doctor/mod.rs::classify_state` — live / wedged / idle /
+  stale states; `wedged` detection logic.
+- `src/multi_bench/scoring.rs::Verdict::Pass` — F2P + P2P gating;
+  `PERSEUS_MULTI_BENCH_HARNESS=1` flag.
+- `src/policy_fingerprint.rs` + migration `009_policy_fingerprint.sql`
+  — fingerprint capture and propagation.
+- `scripts/judge_audit.py` — ten-section separated-denominator
+  report; psycopg2 read-only.
+- `scripts/sweep_preflight.sh`, `scripts/canary.sh`,
+  `scripts/promote_canary.sh`, `scripts/full_system_smoke.sh`,
+  `scripts/stability_local.sh`, `scripts/eval_runner.sh`,
+  `scripts/eval_watch.sh`, `scripts/auto_eval_wm.py`,
+  `scripts/auto_ship_wm.py`, `scripts/perseus_10x_benchmark.py`,
+  `scripts/planner_recall_eval.py`,
+  `scripts/planner_recall_eval_v2.py`,
+  `scripts/prompt_autoresearch_v3.py`,
+  `scripts/prompt_autoresearch_v4.py`,
+  `scripts/perseus_inference_bench.py`,
+  `scripts/cato_inference_sweep.sh` — referenced surface runners.
+- `benchmarks/suites/{gate5,gate5_retrieval,default,swe_mb}.json` and
+  `benchmarks/baselines/*.json` — suite and baseline shapes.
+- `migrations/{002_observability,005_index_build_status,006_planner_bodies,007_mcts_step_snapshots,008_judge_labels,009_policy_fingerprint,010_typed_planner_events}.sql`
+  — observability + judge-label + policy-fingerprint substrate.
+- Engram artifact roots: `/home/engram/Perseus/artifacts/sweep-logs/`,
+  `/home/engram/Perseus/artifacts/prompt-sweeps/20260422T161634Z/`,
+  `/home/engram/multi-bench-ralph.{log,stdout}`.
+- Cato artifact roots:
+  `/home/cato-user/tinker_eval/leaderboard_*.md` (65 files at audit
+  time), `/home/cato-user/perseus_sweep{,2,3}.{sh,log}`,
+  `/home/cato-user/perseus_sweeps_v6_20260517T174856/`.

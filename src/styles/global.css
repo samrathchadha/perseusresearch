@@ -15,7 +15,7 @@
 }
 
 /* -------------------------------------------------------------------------- */
-/* Tokens (light mode, warm earthy)                                            */
+/* Tokens                                                                      */
 /* -------------------------------------------------------------------------- */
 
 :root {
@@ -37,10 +37,6 @@
   --grid-max: 1280px;
   --page-pad: 2.5rem;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Base                                                                        */
-/* -------------------------------------------------------------------------- */
 
 *,
 *::before,
@@ -66,9 +62,7 @@ body {
 }
 
 @media (max-width: 720px) {
-  body {
-    font-size: 15.5px;
-  }
+  body { font-size: 15.5px; }
 }
 
 ::selection {
@@ -76,10 +70,7 @@ body {
   color: var(--bg);
 }
 
-/* -------------------------------------------------------------------------- */
-/* Links                                                                       */
-/* -------------------------------------------------------------------------- */
-
+/* Links */
 a {
   color: var(--link);
   text-decoration: underline;
@@ -88,23 +79,10 @@ a {
   text-decoration-color: rgba(138, 111, 58, 0.45);
   transition: color 0.12s ease, text-decoration-color 0.12s ease;
 }
+a:hover, a:focus { color: var(--link-hov); text-decoration-color: var(--link-hov); }
 
-a:hover,
-a:focus {
-  color: var(--link-hov);
-  text-decoration-color: var(--link-hov);
-}
-
-/* -------------------------------------------------------------------------- */
-/* Headings                                                                    */
-/* -------------------------------------------------------------------------- */
-
-h1,
-h2,
-h3,
-h4,
-h5,
-h6 {
+/* Headings */
+h1, h2, h3, h4, h5, h6 {
   color: var(--text);
   line-height: 1.2;
   margin: 2rem 0 0.6rem;
@@ -120,70 +98,24 @@ h1 {
 }
 
 @media (max-width: 720px) {
-  h1 {
-    font-size: 30px;
-  }
+  h1 { font-size: 30px; }
 }
 
-h2 {
-  font-weight: 700;
-  font-size: 22px;
-  margin-top: 2.5rem;
-}
+h2 { font-weight: 700; font-size: 22px; margin-top: 2.5rem; }
+h3 { font-weight: 700; font-size: 17px; margin-top: 1.75rem; }
+h4, h5, h6 { font-weight: 700; font-size: 15.5px; }
 
-h3 {
-  font-weight: 700;
-  font-size: 17px;
-  margin-top: 1.75rem;
-}
+p { margin: 0 0 0.9rem; }
+strong { font-weight: 700; }
+em { font-style: italic; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
 
-h4,
-h5,
-h6 {
-  font-weight: 700;
-  font-size: 15.5px;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Paragraph + inline                                                          */
-/* -------------------------------------------------------------------------- */
-
-p {
-  margin: 0 0 0.9rem;
-}
-
-strong {
-  font-weight: 700;
-}
-
-em {
-  font-style: italic;
-}
-
-hr {
-  border: 0;
-  border-top: 1px solid var(--rule);
-  margin: 2.5rem 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Lists                                                                       */
-/* -------------------------------------------------------------------------- */
-
-ul,
-ol {
+ul, ol {
   padding-left: 1.4em;
   list-style-position: outside;
   margin: 0 0 0.9rem;
 }
-
-li {
-  margin-bottom: 0.25em;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Blockquote                                                                  */
-/* -------------------------------------------------------------------------- */
+li { margin-bottom: 0.25em; }
 
 blockquote {
   border-left: 2px solid var(--rule);
@@ -193,15 +125,8 @@ blockquote {
   color: var(--text-dim);
 }
 
-/* -------------------------------------------------------------------------- */
-/* Code                                                                        */
-/* -------------------------------------------------------------------------- */
-
-pre,
-code {
-  font-family: var(--mono);
-}
-
+/* Code — white background per Sam's note */
+pre, code { font-family: var(--mono); }
 pre,
 pre.astro-code,
 pre[class*="language-"] {
@@ -215,43 +140,17 @@ pre[class*="language-"] {
   margin: 1.1rem 0;
   color: var(--text);
 }
-
-pre code,
-pre.astro-code code {
+pre code, pre.astro-code code {
   background: transparent !important;
   padding: 0;
   font-size: inherit;
 }
+code { font-size: 0.88em; color: var(--link-hov); }
+p code, li code, td code, th code { background: transparent; padding: 0 0.15em; }
 
-code {
-  font-size: 0.88em;
-  color: var(--link-hov);
-}
-
-p code,
-li code,
-td code,
-th code {
-  background: transparent;
-  padding: 0 0.15em;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Figures — full reading-column width                                         */
-/* -------------------------------------------------------------------------- */
-
-figure {
-  margin: 1.75rem 0;
-  text-align: left;
-}
-
-figure img,
-figure svg {
-  max-width: 100%;
-  height: auto;
-  display: block;
-}
-
+/* Figures — flush left, no fixed width */
+figure { margin: 1.75rem 0; text-align: left; }
+figure img, figure svg { max-width: 100%; height: auto; display: block; }
 figcaption {
   font-style: italic;
   font-size: 13.5px;
@@ -259,44 +158,20 @@ figcaption {
   margin-top: 0.5rem;
   line-height: 1.45;
 }
+figcaption strong { font-style: normal; color: var(--text); }
 
-figcaption strong {
-  font-style: normal;
-  color: var(--text);
-}
-
-/* -------------------------------------------------------------------------- */
-/* Mermaid                                                                     */
-/* -------------------------------------------------------------------------- */
-
+/* Mermaid (rendered to inline SVG at build) */
 .mermaid,
 svg[id^="mermaid"],
-.expressive-code {
+.prose svg[aria-roledescription] {
   display: block;
   margin: 1.5rem 0;
   max-width: 100%;
-}
-
-pre.mermaid,
-pre[class*="language-mermaid"] {
-  background: transparent;
-  padding: 0;
-}
-
-/* rehype-mermaid renders inline SVG inside a <p> sometimes — handle both */
-p > svg[aria-roledescription],
-p > svg[id^="mermaid"],
-.prose svg[aria-roledescription] {
-  display: block;
-  margin: 1.5rem auto;
-  max-width: 100%;
   height: auto;
+  background: transparent;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Meta line (date + read time)                                                */
-/* -------------------------------------------------------------------------- */
-
+/* Meta line */
 .meta {
   font-size: 12.5px;
   letter-spacing: 0.05em;
@@ -304,40 +179,25 @@ p > svg[id^="mermaid"],
   color: var(--text-dim);
 }
 
-/* -------------------------------------------------------------------------- */
-/* KaTeX                                                                       */
-/* -------------------------------------------------------------------------- */
-
-.katex {
-  font-size: 1em;
-}
-
+/* KaTeX */
+.katex { font-size: 1em; }
 .katex-display {
   margin: 1.1rem 0;
   overflow-x: auto;
   overflow-y: hidden;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Tables                                                                      */
-/* -------------------------------------------------------------------------- */
-
+/* Tables */
 table {
   border-collapse: collapse;
   width: 100%;
   margin: 1.25rem 0;
   font-size: 14px;
 }
-
-th,
-td {
+th, td {
   text-align: left;
   padding: 0.4rem 0.7rem;
   border-bottom: 1px solid var(--rule);
   vertical-align: top;
 }
-
-th {
-  font-weight: 700;
-  border-bottom: 1.5px solid var(--text);
-}
+th { font-weight: 700; border-bottom: 1.5px solid var(--text); }

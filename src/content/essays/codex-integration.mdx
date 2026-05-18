@@ -8,383 +8,449 @@ related: ["the-reset","multi-swe-bench-wiring"]
 readTime: 6
 ---
 
-We claim that the right way to stitch Codex rollouts to perseus retrieval traces is a single nullable
-column on `query_traces` plus three pieces of glue outside the core. The column is the contract; the
-glue is disposable. Before 2026-04-25 this contract did not exist, and the consequence was a MuZero
-policy head training against a constant: every parquet row had `action_name='unknown'` and an empty
-visit distribution because the join we needed could not succeed by construction. The fix is not in core.
-It is in `lab/codex/`, and we argue here that it should stay there forever.
+> tl;dr: Codex is one consumer of perseus, not part of its core. Three
+> pieces of glue thread a perseus `run_id` back to the Codex rollout
+> that spawned it: a `perseus-codex` CLI shim that auto-detects the
+> active rollout (env → `lsof $PPID` → newest-mtime fallback), an
+> `X-External-Session-Id` header that round-trips through the
+> `query_traces.external_session_id` column, and a `codex_trace.py`
+> reverse-join script that prints an event window from the Codex side
+> given a perseus `run_id`. Before 2026-04-25 none of this existed.
+> The muzero-export pipeline tried to join `multi_bench_runs.run_id`
+> (`<instance>-<uuid>`) against `query_traces.run_id` (`qry-<uuid>`),
+> got the empty set every time, and emitted training rows with
+> `action_name='unknown'` and empty `visit_distribution`. The fix is
+> not in core. It's in `lab/codex/` and stays there.
 
-The strong version of the claim has three parts. First, the link must be carried by the request and
-persisted by the server; inferring it server-side from timing or content correlation is unsound and we
-should not try. Second, the link must be optional; making it required would force every non-Codex
-consumer to invent a session id it does not have. Third, the reverse-direction lookup must be a
-first-class HTTP endpoint, not a SQL incantation; the asymmetric cost of "easy to write a trace, hard to
-read it back" is exactly how an integration silently degrades for weeks before anyone notices.
+## 1. The V2 problem
 
-## 1. Two namespaces, zero overlap
+Two run_ids. Two namespaces. Zero overlap.
 
-The multi-bench driver inserts one row per `(instance, model, condition)` triple into the runs table
-with a primary key of the form $\textsf{instance}\text{-}\textsf{uuid}$, e.g.
-`astropy__astropy-12907-a3f8c1d2-...`. That row is the outer key of a trajectory: it carries the bug,
-the gold patch, the F2P/P2P test lists, the eventual judge label.
+The multi-bench driver inserts one row per `(instance, model,
+condition)` into `multi_bench_runs` and stamps a primary key of the
+form `<instance>-<uuid>`, e.g. `astropy__astropy-12907-a3f8c1d2-...`.
+That row is the trajectory's outer key — it carries the bug, the
+gold patch, the F2P/P2P test lists, the eventual judge label.
 
-Inside that row's lifecycle, Codex shells out one or more times to the perseus retrieval endpoint. Each
-call mints a fresh `query_traces` row keyed by $\textsf{qry}\text{-}\textsf{uuid}$, a uuid generated
-server-side at query time. That row holds the perseus-internal story: planner events, MCTS step
-snapshots, tool events, hits, diagnostics.
+Inside that row's lifecycle, Codex shells out one or more times to
+the perseus `/v1/query` endpoint to get retrieval hits. Each call
+generates a `query_traces` row keyed by `qry-<uuid>` (a fresh uuid
+minted server-side at query time). That row carries the perseus
+side of the story: planner events, MCTS step snapshots, tool events,
+the final hits, the diagnostics blob.
 
-The two namespaces are disjoint. An instance-prefixed id never starts with `qry-`; a query id never
-carries an instance prefix. The naive equi-join on `run_id` returns the empty set on every cohort, every
-time. Concretely, if $M$ is the multi-bench table and $Q$ is the query-traces table, then
+The two namespaces are disjoint by construction. `<instance>-<uuid>`
+never starts with `qry-`. `qry-<uuid>` never carries an instance
+prefix. The naive join
 
-$$
-|M \bowtie_{\text{run\_id}=\text{run\_id}} Q| = 0
-$$
+```sql
+SELECT *
+FROM multi_bench_runs mb
+JOIN query_traces qt ON qt.run_id = mb.run_id
+```
 
-for every sweep we have ever run, and for every sweep we ever will, because the keys are minted by
-disjoint generators.
+returns zero rows on every cohort, every time.
 
-This was tolerable for a while because nothing downstream needed the join. The driver tracked outcomes
-via the multi-bench status column. The dashboard rendered each side independently. The first system that
-actually needed both sides stitched per-step was MuZero export, and the symptom was loud: a constant
-policy target. The fields meant to come from the perseus side (`action_name` from `tool_events`, the
-visit distribution from `mcts_step_snapshots`, `chosen_action_index`) all collapsed to their defaults.
-The policy head was learning nothing because there was nothing to learn from.
+This wasn't noticed initially because downstream consumers mostly
+didn't need the join. The sweep driver tracked outcomes via
+`multi_bench_runs.status`. The dashboard rendered each side
+separately. The training pipeline — muzero-export — was the first
+system that needed both sides stitched per-step.
 
-A loss-function sanity check makes the point. The MuZero policy loss is the cross-entropy of the network
-output against the search visit distribution $\pi^M_t$ at each step:
+The symptom in muzero-export was concrete. Each parquet row carried
+fields like `action_name`, `visit_distribution`,
+`chosen_action_index` meant to come from the perseus side
+(`tool_events` for actions, `mcts_step_snapshots` for visits). The
+join returned nothing, so every step got the default:
+`action_name='unknown'`, `visit_distribution=[]`,
+`chosen_action_index=null`. The policy head was training against a
+constant.
 
-$$
-\mathcal{L}_\pi = -\sum_t \sum_a \pi^M_t(a)\, \log p_\theta(a \mid s_t).
-$$
+The architectural answer was obvious in hindsight: add a column the
+multi-bench side can populate at query time, that perseus persists
+verbatim, that downstream tools reverse-join on. Call it
+`external_session_id`. Make it nullable. Don't retrofit the
+`run_id` namespace; just add the explicit link column.
 
-When the join silently fails, $\pi^M_t$ degenerates to the all-zeros vector (or a uniform vector after a
-defensive normalization), and the gradient $\nabla_\theta \mathcal{L}_\pi$ either drives the network to
-a degenerate constant or vanishes outright. In neither case is there learning signal. The reward and
-value heads were similarly starved on the cross-traversal of trajectory and step. A constant target is
-not a small bug; it is the absence of the training data the head exists to consume.
+## 2. The fix (2026-04-25)
 
-The architectural answer is forced once you state the problem. We do not get to retrofit the run-id
-namespace; the keys are already in use by both sides. What we can do is add an explicit link column the
-multi-bench side populates at query time, perseus persists verbatim, and downstream tools reverse-join
-on. We named it `external_session_id`. We made it nullable. We did not touch the existing keys.
+Three pieces, none of them in core.
 
-We considered three alternatives and rejected them. The first was to make perseus mint a deterministic
-id from query content plus a timestamp; this is fragile under retries and under benign re-runs (the same
-query at two times is two different traces and must be kept distinct, while the same query in a single
-sweep is one trace and must stay singular). The second was to put the link in the response and have the
-caller persist it; this puts the contract on the wrong end of the wire, because the caller is the one
-with the authoritative session identity and the server is the one writing the durable row. The third was
-to log the link to a sidecar JSONL and never touch the database schema; this trades a real index for a
-grep, and at sweep scale that is the difference between a one-second query and a five-minute scan. The
-chosen design has one column, one nullable header, one partial index, and one new HTTP route. It is the
-smallest contract we could find that admits both forward and reverse lookups in $O(\log n)$.
+### Piece one: the `perseus-codex` CLI shim
 
-## 2. Three pieces of glue
+For the interactive case — a developer at a Mac terminal running
+`codex`, with Codex shelling out to `perseus` to get retrieval hits
+mid-session — perseus has no way to know which Codex rollout file
+the call belongs to. The Codex CLI doesn't pass its session id to
+its subprocesses. So we wrote a wrapper.
 
-Glue has a structure. There is a forward path that stamps the link onto a query as it happens, and a
-reverse path that walks from a perseus trace back to the originating Codex turn. The forward path splits
-cleanly into an interactive case (a developer at a terminal) and a sweep case (a non-interactive
-subprocess), and they want different mechanisms. The reverse path is a single script. We describe each
-in prose; the structural argument is in the diagram in section 4.
+`scripts/perseus-codex` is a bash shim that runs a three-fallback
+discovery chain before exec-ing the real `perseus` binary:
 
-### The CLI shim, for the interactive case
+1. **`$CODEX_SESSION_ID`** — if the caller set this env var
+   explicitly, take it verbatim. Always wins. The escape hatch for
+   automation that knows its own session.
 
-In the interactive case a developer runs Codex at a terminal and Codex shells out to perseus mid-session
-for retrieval. Perseus has no way to know which rollout file the call belongs to because the Codex CLI
-does not pass its session id to its subprocesses. We wrote a wrapper, `perseus-codex`, that runs a
-three-fallback discovery chain before exec-ing the real perseus binary.
+2. **`lsof -p $PPID`** — enumerate the parent process's open file
+   descriptors and grep for the rollout JSONL path. Codex keeps its
+   rollout file open for appending throughout a session, so its path
+   shows up in the parent's open-fd list. Extract the uuid via
 
-The first fallback is an environment variable named `CODEX_SESSION_ID`. If the caller sets it
-explicitly, the shim takes the value verbatim and stops. This is the escape hatch for automation that
-already knows its own session id and does not want any inference.
+   ```bash
+   sed -n 's/.*rollout-.*-\([0-9a-f-]\{36\}\)\.jsonl.*/\1/p'
+   ```
 
-The second fallback enumerates the parent process's open file descriptors and greps for a rollout JSONL
-path. Codex keeps its rollout file open for appending throughout a session, so the path appears in the
-parent's fd list. A loose regex pulls the uuid out of a filename like `rollout-<timestamp>-<uuid>.jsonl`
-without constraining the timestamp format, because Codex has changed it a few times and we do not want
-to re-deploy the shim every time the upstream renames a field.
+   The middle field captures the ISO timestamp without constraining
+   its format — Codex has changed it a few times.
 
-The third fallback sorts session files under the Codex home directory by mtime, takes the newest, and
-accepts it only if its mtime is within 30 seconds. The 30-second window is the load-bearing guardrail.
-Without it, a stale session from yesterday gets its id stapled onto today's unrelated perseus
-invocation, and the reverse-join silently joins on the wrong rollout. The window is short enough to
-exclude stale sessions and long enough to cover Codex's typical $\textsf{function\_call} \to
-\textsf{function\_output}$ turn budget, so a real in-flight session is still inside it.
+3. **Newest mtime under `~/.codex/sessions/`** — `ls -t` sorted
+   newest-first, take the head, but only if its mtime is within 30
+   seconds. The 30-second window is the key guardrail: a stale
+   session from yesterday must not have its id stapled onto today's
+   unrelated `perseus` invocation. 30s matches Codex's typical
+   "function_call → function_output" turn budget, so a real
+   in-flight session is still inside the window.
 
-The choice of 30 seconds is a bias-variance trade. Let $T$ be the staleness threshold. A larger $T$
-raises the probability that an unrelated stale session is misidentified as active; a smaller $T$ raises
-the probability that a legitimate in-flight session is missed because its rollout has not been flushed
-recently enough. Codex flushes the rollout on every event boundary, and the typical turn fires events on
-at most a handful of seconds; 30 seconds gives the legitimate case a margin of 5x while still excluding
-sessions that ended several minutes ago. We could imagine tuning $T$ down further with a per-session
-keep-alive heartbeat from Codex, but that requires upstream cooperation we do not have and the
-false-positive rate at 30 seconds is empirically zero across the sweeps we have inspected.
+If all three fail, the shim exec's `perseus` with the same argv it
+received, logs `no active Codex session detected; running perseus
+unchanged` to stderr, and proceeds. The perseus call still works;
+the row just lands with `external_session_id = NULL` and can't be
+reverse-joined later. Soft failure.
 
-If all three fallbacks fail, the shim exec's perseus with the original argv, logs `no active Codex
-session detected; running perseus unchanged` to stderr, and proceeds. The call still works; the row
-lands with the link column null and cannot be reverse-joined later. Soft failure. The stderr line
-matters: without it, the failure is silent and you only notice when training rows turn up with
-`action_name='unknown'`.
+When discovery succeeds, the shim exec's `perseus "$@"
+--external-session-id "$sid"`. `exec` not subshell — so perseus's
+exit code propagates verbatim and signals land directly on the
+child. The stderr log line is critical for debugging "why is
+`external_session_id` NULL on this trace": without it the failure is
+silent.
 
-When discovery succeeds, the shim exec's perseus with the original argv plus `--external-session-id
-<sid>`. We use `exec`, not a subshell, so the exit code propagates verbatim and signals land on the
-child directly.
+### Piece two: the `X-External-Session-Id` header path
 
-The order of the fallbacks matters and reflects a strict precedence of authority. An explicit
-environment variable is the highest authority because the caller is asserting they know. An open file
-descriptor on the parent is the next authority because it is direct evidence of an active session right
-now. The mtime heuristic is last because it is the only one that can be wrong about a session that is
-not actually associated. Reversing the order — letting mtime win when both signals are present —
-would create a class of bug we cannot debug after the fact because the wrong link gets persisted and the
-trace looks plausible.
+For the sweep case — perseus-multi-bench spawning Codex
+non-interactively, with Codex calling `perseus-query` on every
+retrieval step — there's no rollout-file lookup to do. The
+multi-bench driver already knows the session id: it's the
+`multi_bench_runs.run_id` it just inserted. The chain is:
 
-### The header round-trip, for the sweep case
+1. Driver builds `mb_run_id = "<instance>-<uuid>"` and inserts the
+   `multi_bench_runs` row.
+2. Driver calls `spawn_codex(... mb_run_id)` which sets the env var
+   `PERSEUS_EXTERNAL_SESSION_ID=<mb_run_id>` on the child.
+3. Codex child boots with that env var in scope.
+4. Codex's prompt instructs it to call `perseus-query "<bug
+   summary>"` as its first action. (Codex is the LLM; the prompt is
+   how we steer it.)
+5. `perseus-query` reads `$PERSEUS_EXTERNAL_SESSION_ID` and fires
+   `curl -sS -X POST -H "X-External-Session-Id:
+   $PERSEUS_EXTERNAL_SESSION_ID" $PERSEUS_URL/v1/query --data-binary
+   "$BODY"`.
+6. Perseus's `/v1/query` handler reads the header, runs MCTS, and
+   persists a `query_traces` row with `external_session_id =
+   <mb_run_id>`.
 
-In the sweep case there is no rollout file to discover. The multi-bench driver already knows the session
-id because it just minted the multi-bench row. The forward chain is mechanical: the driver inserts the
-row, spawns Codex with the link id set as the `PERSEUS_EXTERNAL_SESSION_ID` environment variable, Codex
-runs with the prompt instructing it to call `perseus-query "<bug summary>"` as its first action, the
-`perseus-query` shim reads the env var and sends a POST with an `X-External-Session-Id` header, and the
-perseus query handler reads the header, runs MCTS, and persists a `query_traces` row with the link id in
-the new column.
+The HTTP wire supports both body field and header. `core::contracts::QueryRequest`
+declares `external_session_id: Option<String>` with `#[serde(default)]`;
+the handler reads the header as a fallback when the body doesn't
+carry the field:
 
-The HTTP wire accepts the link in two places. The request struct declares a nullable field
-`external_session_id` with a serde default, and the handler additionally reads the same header as a
-fallback when the body does not carry the field. Body wins on conflict, because the body is explicit
-caller intent and the header is the path for callers that can only set headers (a curl-driven shim
-threaded through environment variables). The migration that introduced the column added both the link id
-and a sibling sub-id `external_step_id` for callers wanting to distinguish multiple perseus calls within
-a session, with a partial index over the link column that excludes null rows so the index size scales
-with the fraction of session-tagged traces rather than the full table.
+```rust
+if req.external_session_id.is_none() {
+    req.external_session_id = header_str(&headers, "X-External-Session-Id");
+}
+```
 
-Multi-bench's retrieval-only mode fans out three variants per row, tagged `issue_full`, `error_focus`,
-and `symbol_focus` on the sub-id. The two-column design lets us aggregate by session for cohort metrics
-and by sub-id for variant-level ablations without re-keying.
+Body wins on conflict — the body field is "explicit caller intent."
+The header is the fallback for callers that can only set headers
+(like a curl-based shim driven by environment variables).
 
-A subtle correctness point: the body field and the header field must agree when both are present, or the
-body wins. The reason is that the body is part of the request payload that the caller signed off on (it
-appears in audit logs as part of the same blob), while the header is part of the transport envelope that
-intermediaries can rewrite. If a proxy strips or rewrites the header, the body still carries the intent.
-The implementation reflects this: if the body field is null, the handler reads the header; otherwise the
-header is ignored. Symmetric "if header present, body is ignored" would be wrong because it inverts the
-authority relationship.
+`migrations/003_external_trace.sql` adds both columns nullable plus
+a partial index excluding NULL rows so size scales with the
+fraction of session-tagged traces. `external_step_id` is the
+sibling sub-id for callers wanting to distinguish multiple perseus
+calls within a session — multi-bench's retrieval-only mode fans out
+3 variants per row and tags each (`issue_full`, `error_focus`,
+`symbol_focus`).
 
-### The reverse-join script
+### Piece three: `codex_trace.py` reverse-join
 
-Given a perseus run id, the reverse-join walks it back to the originating Codex turn. The script is
-stdlib-only Python and has two modes. In run-id mode it fetches the trace from the perseus HTTP API,
-reads the link id off the returned record, globs for the matching rollout file under the Codex home
-directory, decodes the rollout line by line (silently skipping malformed lines), scans for the first
-`function_call` event whose payload mentions perseus (case-insensitive substring), treats that event as
-the anchor, and prints a window of $\pm W$ events around it, default $W = 20$. In session-id mode it
-skips the perseus lookup entirely, globs directly for the rollout file by uuid, and dumps all events;
-useful when you know the rollout uuid from the shim's stderr log and just want to inspect the Codex side
-without a DB round-trip.
+Given a perseus `run_id`, walk it back to the originating Codex
+turn. `scripts/codex_trace.py` is stdlib-only Python 3.11+ with two
+modes.
 
-The whole thing is about 150 lines. No dependencies. Runs on a Mac, on cato, on engram, anywhere the
-rollout files happen to live or are NFS-mirrored.
+`--run-id <perseus_run_id>` mode:
 
-The anchor heuristic — first `function_call` mentioning perseus — is a deliberate choice over
-alternatives. We could match on exact perseus run id (the rollout records the curl command in its
-function-call payload, so the run id appears verbatim), but that fails on the case we care about most:
-the run that returned hits Codex chose to ignore. We could match on timestamp proximity to the trace,
-but Codex's rollout timestamps and perseus's database timestamps come from different clocks separated by
-a network. The substring anchor is robust to both failure modes and only goes wrong on the (negligible)
-case where the Codex rollout mentions perseus in some context unrelated to a function call, in which
-case the operator sees the context immediately and re-runs with an earlier window.
+1. `GET /v1/runs/<run_id>/trace` via `urllib.request`. Exits 2 on
+   404.
+2. Read `trace["external_session_id"]`. Exit 4 if absent — the
+   trace wasn't invoked via the shim.
+3. Glob `~/.codex/sessions/**/rollout-*-{session_id}.jsonl`. Exit 3
+   if no match.
+4. Read the rollout file line-by-line, JSON-decode each line
+   (silently skip malformed lines).
+5. `pick_window(events, window)` scans for the first
+   `function_call` event whose dumped payload contains
+   `"perseus"` (case-insensitive substring). That's the anchor: the
+   Codex turn that invoked perseus. Return `events[anchor - window :
+   anchor + window + 1]`, default `window=20`.
+6. Print each event as `json.dumps(ev, indent=2, sort_keys=True)`.
 
-## 3. The PATH-prepend bug, adjacent
+`--session-id <uuid>` mode skips the perseus lookup entirely. Glob
+directly for the rollout file by uuid and dump all events. Useful
+when you know the rollout uuid from the shim's stderr log and just
+want to inspect the Codex side without round-tripping through the
+DB.
 
-We mention this because it shipped in the same patch and looks like a session-id bug from the outside
-even though it is a separate defect. The multi-bench driver spawns Codex as a non-interactive subprocess
-on the cato workers. Codex ships as a Node.js shell script whose shebang is the `env`-mediated lookup of
-`node`. Under non-interactive ssh, the inherited PATH is the minimal one from `/etc/environment`, and
-`nvm` does not initialize because it only runs in interactive shells. The child Codex would exit before
-its first chat call with `node: not found`, the driver would see an empty diff and classify the row as
-$\textsf{CodexNoPatch}$, the retries would fail the same way, and the row would eventually flip to
-failed with the unhelpful label.
+The whole thing is ~150 lines. No dependencies beyond Python
+stdlib. Runs on the Mac, on cato, on engram — anywhere the rollout
+files happen to live (or are NFS-mirrored).
 
-The fix prepends two directories to the child's PATH: the directory containing the Codex binary (which
-is also where the sibling `node` lives in the same install), and the perseus scripts directory (where
-`perseus-query` lives, because the Codex prompt references it by bare name and without the prepend Codex
-would fall back to hand-rolling curl, which broke on shell-hostile characters in real bug summaries:
-parentheses, backticks, ellipses).
+## 3. The `spawn_codex` PATH-prepend fix
 
-Two ssh-environment bugs in one block. Both surface as empty patch at the driver level; only the
-captured stdout reveals the underlying `node: not found`. We list it here because the bug class is the
-same as the one the session-id work targets: silent integration failures that masquerade as model
-failures.
+Adjacent to the session-id work but technically a separate bug. The
+multi-bench driver's `spawn_codex` function in
+`src/multi_bench/runner.rs` spawns Codex as a non-interactive
+subprocess on the cato workers. Codex ships as a Node.js shell
+script with `#!/usr/bin/env node` at the top.
 
-The asymmetry is brutal. Model failures are expected, statistically distributed, and have known failure
-modes; integration failures are bimodal (works perfectly or 100% broken) and frequently invisible
-because they cause downstream metrics to look "normal but bad." A sweep where 30% of runs hit `node: not
-found` looks indistinguishable from a sweep where the model has regressed by 30% if you only look at
-pass-rates. The lesson generalizes: any integration that crosses an OS process boundary or a
-shell-environment boundary needs explicit health-check telemetry, and "did the patch end up non-empty?"
-is not a health check, it is an outcome metric.
+Under non-interactive ssh — the way the multi-bench driver invokes
+Codex on cato — `node` was not on the inherited `PATH`. nvm
+initializes only in interactive shells; the non-interactive PATH is
+the minimal one from `/etc/environment`. Codex would exit before
+its first chat call with `env: 'node': No such file or directory`.
+The driver, watching for an empty `git diff` after the codex run,
+would classify the row as `FailureLabel::CodexNoPatch` and retry.
+The retries would fail the same way. The row would eventually flip
+to `failed` with the unhelpful label.
 
-## 4. The trace-join flow
+The fix prepends `dirname(codex_bin)` to the child's `PATH`:
 
-Here is the full forward-and-reverse path on one picture.
+```rust
+let existing = std::env::var("PATH").unwrap_or_default();
+let mut prefix = String::new();
+if let Some(parent) = cfg.codex_bin.parent() {
+    prefix.push_str(&parent.to_string_lossy());
+    prefix.push(':');
+}
+if let Ok(cwd) = std::env::current_dir() {
+    let scripts = cwd.join("scripts");
+    if scripts.is_dir() {
+        prefix.push_str(&scripts.to_string_lossy());
+        prefix.push(':');
+    }
+}
+cmd.env("PATH", format!("{prefix}{existing}"));
+```
+
+`dirname(codex_bin)` is where the sibling `node` from the same
+install lives. `$cwd/scripts` is prepended too so the spawned Codex
+finds `perseus-query` on PATH — Codex's prompt references it by
+bare name, and without the prepend Codex would fall back to
+hand-rolling curl, which broke on shell-hostile characters in real
+bug summaries (parens, backticks, ellipses).
+
+Two ssh-environment problems in one block. Both surface as "empty
+patch" at the driver level; only the stdout.log reveals `node: not
+found`. Bug class: silent environment failures masquerading as
+model failures.
+
+## 4. The new HTTP surface
+
+`GET /v1/query/by_external_session/{sid}?limit=<n>` returns every
+perseus `run_id` whose `external_session_id` matches the given sid,
+ordered by `occurred_at desc`, truncated to `limit` (default 50,
+clamped to 1000).
+
+Defined in `src/api/router.rs`:
+
+```rust
+.route(
+    "/v1/query/by_external_session/{sid}",
+    get(handlers::query_by_external_session),
+)
+```
+
+The handler delegates to
+`App::list_query_traces_by_external_session(sid, limit)` which
+delegates to
+`Store::list_query_traces_by_external_session(sid, limit)`. The
+postgres impl is a straightforward query against the partial index
+from migration 003:
+
+```sql
+SELECT run_id, occurred_at, index_id, query, top_k, external_step_id
+FROM query_traces
+WHERE external_session_id = $1
+ORDER BY occurred_at DESC
+LIMIT $2
+```
+
+The returned projection is metadata only — `run_id`, `occurred_at`,
+`index_id`, `query`, `top_k`, `external_step_id`. The full
+`record` JSONB (hits + scorecard + MCTS snapshot + graph) is left
+out for response size. Callers who need the full trace follow up
+with `GET /v1/runs/{run_id}/trace`.
+
+`codex_trace.py` is the primary consumer of this endpoint, but
+it's also useful from the dashboard and from ad-hoc shell debugging
+during a sweep:
+
+```bash
+curl -s "http://66.172.10.101:18192/v1/query/by_external_session/<mb_run_id>?limit=100" | jq .
+```
+
+Returns `{traces: [{run_id, occurred_at, ...}]}`. Each entry is a
+separate perseus MCTS call that the same Codex session made.
+Cardinality of 0 on a `condition='perseus'` row is the canonical
+"integration broken" signal: either the env var wasn't threaded
+through `spawn_codex`, or Codex bypassed `perseus-query` and used
+raw curl without the `-H` flag.
+
+## 5. The flow, end-to-end
+
+The whole trace-join thread in one picture:
 
 ```mermaid
 flowchart TD
-    A["Codex rollout file\n~/.codex/sessions/.../rollout-ts-uuid.jsonl"]
-    B["perseus-multi-bench driver\ninsert multi_bench_runs row\nmb_run_id = instance-uuid"]
-    C["spawn_codex\nenv: PERSEUS_EXTERNAL_SESSION_ID = mb_run_id\nPATH: dirname(codex_bin) + scripts/ + inherited"]
-    D["Codex child\nfunction_call: perseus-query bug summary"]
-    E["perseus-query shim\ncurl POST /v1/query\nheader: X-External-Session-Id"]
-    F["perseus /v1/query\nbody or header into req.external_session_id\nrun MCTS, persist trace"]
-    G["query_traces row\nrun_id = qry-uuid\nexternal_session_id = mb_run_id"]
-    H["GET /v1/query/by_external_session/mb_run_id\nreturns list of qry-uuids"]
-    I["codex_trace.py --run-id qry-uuid\ntrace to rollout to event window"]
-
-    A --> B --> C --> D --> E --> F --> G --> H --> I --> A
+    A["Codex rollout<br/>~/.codex/sessions/.../rollout-...-uuid.jsonl"] --> B["perseus-multi-bench<br/>spawn_codex"]
+    B --> C["Codex child process<br/>env: PERSEUS_EXTERNAL_SESSION_ID=mb_run_id<br/>PATH: dirname(codex_bin)+scripts/+inherited"]
+    C --> D["Codex turn<br/>function_call: perseus-query bug-summary"]
+    D --> E["perseus-query shim<br/>curl POST /v1/query<br/>H: X-External-Session-Id: $PERSEUS_EXTERNAL_SESSION_ID"]
+    E --> F["perseus /v1/query handler<br/>req.external_session_id = body or header<br/>run MCTS, persist trace"]
+    F --> G["query_traces row<br/>run_id: qry-uuid<br/>external_session_id: mb_run_id"]
+    G --> H["GET /v1/query/by_external_session/mb_run_id<br/>returns list of qry-uuids"]
+    H --> I["codex_trace.py --run-id qry-uuid<br/>reverse-join: trace -> rollout -> window"]
+    I --> A
 ```
 
-Forward: the rollout uuid is threaded as an environment variable into the Codex child, threaded as a
-header onto the curl call, and landed in a database column on the trace row. Reverse: the database
-column is queried, the rollout file is located by uuid glob, and a window of events around the anchoring
-function call is dumped.
+Forward: rollout uuid threaded as env var, threaded as header,
+landed in DB column. Reverse: DB column queried, rollout file
+located, event window extracted.
 
-## 5. The reverse-lookup endpoint
+## 6. Why this lives in `lab/codex/`
 
-The HTTP surface adds one route. Given a session id, return every perseus run id whose link column
-matches, ordered by occurrence descending and truncated to a caller-supplied limit (default 50, clamped
-to 1000). The handler delegates to an app method which delegates to a store method; the postgres
-implementation is a single SELECT against the partial index from the migration. The returned projection
-is metadata only: run id, occurrence timestamp, index id, query string, top-$k$, and the sub-id. The
-full record JSONB (hits plus scorecard plus MCTS snapshot plus graph) is left out for response size, and
-callers who need it follow up with the per-run trace endpoint.
+Codex is one consumer of perseus. There will be others. There
+already are others — perseus-multi-bench itself is a non-Codex
+consumer (the retrieval-only mode bypasses Codex entirely and POSTs
+directly to `/v1/query`), and operators calling the HTTP API by
+hand are a third.
 
-Reverse-join is the primary consumer of this endpoint, but the same query is useful from the dashboard
-and from ad-hoc shell debugging during a sweep. Cardinality of zero on a perseus-condition row is the
-canonical broken-integration signal: either the env var was not threaded through the spawn, or Codex
-bypassed the shim and used raw curl without the header.
+The generic primitive — "let a caller stamp a session id on a
+query, persist it, expose a reverse-lookup endpoint" — belongs in
+core. That's what `external_session_id` on `QueryRequest`, the
+header alias, the `query_traces` column, and
+`/v1/query/by_external_session/{sid}` collectively are. None of
+those know about Codex. They'd work the same for a Claude Code
+consumer, an internal agent, a future tool.
 
-The state machine of a trace's link is small but worth drawing because each transition has a distinct
-failure mode.
+Codex-specific glue knows Codex's specific rollout file layout,
+`$CODEX_HOME` convention, and `node`-shebang gotcha:
 
-```mermaid
-stateDiagram-v2
-    [*] --> Unlinked: request arrives without session id
-    [*] --> Linked: request arrives with body field
-    [*] --> Linked: request arrives with header only
-    Unlinked --> Linked: never (link is set at write time)
-    Linked --> [*]: persisted to query_traces
-    Unlinked --> [*]: persisted with null external_session_id
-```
+- `perseus-codex` knows the rollout filename pattern
+  `rollout-<timestamp>-<uuid>.jsonl` and the directory layout
+  `~/.codex/sessions/<YYYY>/<MM>/<DD>/`.
+- `spawn_codex` knows about Codex's `#!/usr/bin/env node` shebang
+  and about `$CODEX_HOME` redirection for sweep isolation.
+- `codex_trace.py` knows the rollout event schema: `task_started`,
+  `function_call`, `function_output`, `reasoning`, `task_completed`.
+- The prompt rewrite (`PERSEUS_SYSTEM_PROMPT`,
+  `render_perseus_prompt`) knows what Codex needs to be told about
+  the `perseus-query` shim, the env vars, the header contract.
 
-Once a trace is persisted, its link is immutable. We do not provide an admin endpoint to backfill the
-link on a previously-unlinked trace, and we should not, because the operator has no way to verify which
-session the trace truly belonged to and a wrong backfill is worse than a missing link.
+None of this generalizes. A Claude Code integration would have its
+own session-file convention, home-dir layout, prompt vocabulary,
+and gotchas. Putting any of this in core means either a
+Codex-shaped interface others work around or a generic abstraction
+that's Codex-with-extra-steps. Both are worse than `lab/codex/`.
 
-## 6. Why this lives outside core
-
-We claim Codex is one consumer of perseus and there will be others. There already are others. The
-retrieval-only mode of the multi-bench driver bypasses Codex entirely and posts directly to the query
-endpoint. Operators calling the HTTP API by hand are a third. The generic primitive — let a caller
-stamp a session id on a query, persist it, expose a reverse-lookup endpoint — is what belongs in core.
-That is the link column on the request type, the header alias, the database column, and the
-reverse-lookup endpoint together. None of those four know about Codex. They work the same for any
-consumer.
-
-Codex-specific glue knows things only Codex knows. The shim knows the rollout filename pattern and the
-directory layout under the Codex home. The spawn helper knows about the Node.js shebang and about a
-per-sweep redirection of the Codex home directory for isolation. The reverse-join knows the rollout
-event schema: `task_started`, `function_call`, `function_output`, `reasoning`, `task_completed`. The
-system prompt knows what Codex specifically needs to be told about the shim, the env vars, and the
-header contract.
-
-None of this generalizes. A Claude Code integration would have its own session-file convention, its own
-home-directory layout, its own prompt vocabulary, and its own gotchas. Putting any of it in core means
-either a Codex-shaped interface that other consumers work around or a generic abstraction that is
-Codex-with-extra-steps. Both are worse than the current arrangement, which keeps the generic primitive
-in core and the Codex-specific helpers in `lab/codex/` indefinitely. The boundary is grep-enforced in
-CI; any import of the codex lab from inside core fails the build.
-
-The graduation criterion for `lab/codex/` is explicit and we hold ourselves to it: this module never
-graduates wholesale. The generic primitive is already in core. The Codex-specific helpers stay outside
-indefinitely. We expect the same boundary for every future agent integration we add — a thin generic
-primitive in core (column, header, lookup) and an arbitrary amount of agent-specific glue in a sibling
-lab directory. If the right boundary turns out to be different for a future agent, we move the line
-then; we do not move it pre-emptively.
+`lab/codex/README.md` makes the graduation criterion explicit: this
+module never graduates wholesale. The generic primitive is already
+in core. Codex-specific helpers stay in `lab/` forever. CI
+grep-fails any `from perseus.lab.codex` import inside `core/**`.
+The boundary is enforced, not hoped-for.
 
 ## 7. What this enables downstream
 
-Three things, in decreasing order of impact.
+Three things, in order of impact.
 
-1. The MuZero export pipeline can decorate every trajectory row with the real action name, the real
-visit distribution, the planner prompt, and the completion. The reverse-lookup endpoint plus the
-existing per-run accessors gives the trajectory assembler everything it needs to populate the row. The
-policy and reward heads finally have signal instead of a constant.
+**MuZero export.** Before, every training row had
+`action_name='unknown'`. After,
+`list_query_traces_by_external_session(mb_run_id, N)` returns the
+list of perseus calls; per call, `list_mcts_steps` returns the root
+visit distribution and `list_tool_events` returns the executed
+action. The trajectory assembler in `src/muzero/trajectory/mod.rs`
+walks all three and emits parquet rows decorated with the real
+action name, visit distribution, planner prompt, and completion.
+The policy and reward heads finally have signal.
 
-2. End-to-end debugging becomes tractable. The question "Codex called perseus three times during this
-multi-bench row; the patch was empty; where did it break?" decomposes into one curl per step: count the
-perseus-query invocations in captured stdout, list the perseus run ids via the reverse-lookup endpoint,
-walk planner events per run, and dump the rollout event window per run via the reverse-join script. Each
-step is a single command.
+**End-to-end debugging.** "Codex called perseus 3 times during this
+mb row; the patch was empty. Where did it break?" becomes
+tractable: forward via `stdout.log` (count `perseus-query`
+invocations), bridge via
+`/v1/query/by_external_session/<mb_run_id>` (list of perseus
+`run_id`s), forward per run via `/v1/query/<run_id>/events`
+(planner call sequence, tool calls, confirm_stop, give_up), reverse
+via `codex_trace.py --run-id <run_id>` (rollout event window). Each
+step is one curl or grep.
 
-3. Cohort sanity checks are now a SQL query away. We left-join multi-bench rows against the link column
-with a $\textsf{HAVING COUNT}(\cdot) = 0$ clause and filter to the perseus condition within a recent
-time window; the result is exactly the set of rows where the perseus condition was selected but no
-perseus call was ever made. That is a broken-integration signal, detectable in seconds, fixable before
-it contaminates a whole sweep. The 2026-04-25 fix made the question askable; the policy-fingerprint work
-later that day made it askable per-cohort.
+**Cohort sanity checks.** The query
 
-The cohort-sanity query is worth running as a CI check before any new sweep launches. The check is
-cheap: it scans the partial index and aborts the sweep launcher if any recent perseus-condition row has
-zero perseus calls. The check is also nearly free of false positives: in legitimate retries or partial
-sweeps, the row is in some state other than `done` and the launcher's filter excludes it. The only false
-positive we have observed is the brief window during a sweep restart where multi-bench rows are inserted
-ahead of their first perseus call, which the launcher handles by waiting on a settle interval before
-evaluating the check.
+```sql
+SELECT
+  mb.run_id,
+  COUNT(DISTINCT qt.run_id) AS perseus_run_count
+FROM multi_bench_runs mb
+LEFT JOIN query_traces qt
+  ON qt.external_session_id = mb.run_id
+WHERE mb.condition = 'perseus'
+  AND mb.completed_at > now() - interval '24 hours'
+GROUP BY mb.run_id
+HAVING COUNT(DISTINCT qt.run_id) = 0
+LIMIT 50;
+```
 
-## 8. Failure modes we still accept
+returns the rows where the perseus condition was selected but no
+perseus call was ever made. That's a broken-integration signal,
+detectable in seconds, fixable before contaminating a whole sweep.
+The 2026-04-25 fix made it possible to ask this question; the
+`policy_fingerprint` work later that day made it possible to ask it
+per-cohort.
 
-We are not done. Three known gaps survive the 2026-04-25 fix and we want to be honest about them.
+See [the reset](/essays/the-reset/) for the broader fingerprint and
+cohort-hygiene story this fits into. See [multi-swe-bench
+wiring](/essays/multi-swe-bench-wiring/) for the harness side of the
+same sweep pipeline — different bug class, same era, same lesson:
+silent integration failures are worse than loud ones, and joining
+on the right column matters more than picking the right one to
+start with.
 
-The first gap is the substring match in the reverse-join's anchor selection. A rollout that mentions
-perseus in a reasoning event before the first function call will produce a window centered on the
-reasoning rather than the call. The workaround is straightforward (widen the window) but the right fix
-is to filter on event kind before the substring match. We have not done this because the case is rare
-and changing the anchor algorithm has the property that previous reverse-join outputs become
-non-reproducible.
+---
 
-The second gap is that the sub-id is currently set only by multi-bench's retrieval-only mode. An
-interactive Codex session that makes 17 perseus calls in a row will have 17 traces all sharing one
-session id and no sub-id to distinguish them. The reverse-join handles this correctly (returns all 17 in
-occurrence order), but the forward direction is awkward: there is no way to ask "which of the 17 calls
-did Codex use the hits from?" without parsing the rollout function-output events. The fix is a per-call
-sub-id generated client-side and stamped onto each curl, and we have not landed it because the
-interactive case has been low-priority next to the sweep case.
+## Sources
 
-The third gap is the policy-fingerprint interaction. The fingerprint column lives on the trace row, not
-on the multi-bench row, so it captures the perseus configuration at query time and not the multi-bench
-configuration at sweep launch. For cohort hygiene we want both, and we currently rely on the convention
-that the sweep launcher records the multi-bench-side fingerprint in a sidecar artifact rather than in
-the database. This works but it is fragile; an honest design would have a configuration-snapshot table
-that both sides reference. We flag it as future work in [the reset](/essays/the-reset/) rather than
-fixing it here, because the changes interact with the per-cohort gate logic and we want one place to
-make the change.
-
-## 9. The shape of the contract
-
-Stepping back, the entire integration is described by four objects: a nullable column on the trace row,
-a nullable header on the request, a partial index on the column, and one new HTTP route. Everything else
-— shim, env-var threading, prompt rewrite, reverse-join script — is a consumer of those four. The
-discipline of keeping the contract small is what makes it possible to put the glue outside the core; if
-any of the four had grown a special case for Codex, the boundary would have leaked, and `lab/codex/`
-would not be a separate lab anymore. As we add Claude Code and other agent integrations, the test of
-whether the design is right is whether each new integration adds zero columns and zero routes to core.
-If it does not, the contract was too narrow; if it does, the contract is doing its job.
-
-The forward-only thread — env var to header to column — is unremarkable in isolation. What matters
-is that the reverse direction now exists and is cheap. The space of questions you can ask about a sweep
-changes shape when reverse-join is one curl. See [the reset](/essays/the-reset/) for the broader
-cohort-hygiene story this fits into, and [multi-swe-bench wiring](/essays/multi-swe-bench-wiring/) for
-the harness side of the same pipeline, which has the same flavor of bug: silent integration failures are
-worse than loud ones, and joining on the right column matters more than picking the right one to start
-with.
+- `parking_lot/v2_archive_2026-05-18/HISTORY/45_codex_integration.md`
+  §1–§12 — the canonical V2 codex-integration writeup. Shim
+  discovery chain, `spawn_codex` PATH-prepend, HTTP wire, migration
+  003, MuZero-export trajectory decoration, debugging recipe.
+- `lab/codex/README.md` — scope, graduation criteria, ADR-006 /
+  ADR-012 boundary rationale, current status (empty;
+  V2-archive-port pending).
+- `Claude.md` 2026-04-23 (external-session-trace branch) — the
+  `QueryTraceRecord` field additions, the
+  `migrations/003_external_trace.sql` partial index, the
+  `--external-session-id` / `--external-step-id` CLI flags, the
+  `perseus-codex` shim's three-fallback discovery, the
+  `codex_trace.py` reverse-join.
+- `Claude.md` 2026-04-25 (multi-bench ↔ perseus trajectory
+  linkage) — the run_id namespace problem, the
+  `PERSEUS_EXTERNAL_SESSION_ID` env-var threading, the muzero-export
+  walk through `external_session_id`.
+- `Claude.md` 2026-04-25 (experiment-integrity fixes) — the
+  `spawn_codex` PATH-prepend that resolved `node: not found` under
+  non-interactive ssh.
+- `src/api/handlers.rs::query_by_external_session`,
+  `src/api/router.rs` — the HTTP surface.
+- `src/multi_bench/runner.rs::spawn_codex`,
+  `src/multi_bench/prompt.rs` — the sweep-side integration and the
+  Codex-facing system prompt.
+- `scripts/perseus-codex`, `scripts/perseus-query`,
+  `scripts/codex_trace.py` — the three pieces of glue themselves.

@@ -4,398 +4,897 @@ date: 2026-05-18
 status: published
 tier: pipeline
 summary: "Each WM head encodes a different question. HL-Gauss 51-bin softmax for value, tanh for judge, signed scalar for step_reward, softmax over 17 actions for policy. Plus per-step shaping and terminal reward signals that train them."
-related: ["muzero-pipeline","wm-training-sweep","wm-in-the-loop","p3pp-codet5p-220m","pipeline-integrity-audit","multi-swe-bench-wiring","nano-judge-distillation"]
+related: ["muzero-pipeline","wm-training-sweep","wm-in-the-loop","p3pp-codet5p-220m"]
 readTime: 14
 ---
 
 import Figure from "../../components/Figure.astro";
 
-## Thesis
+## Why four heads, not one scalar
 
-A world model that emits one scalar collapses four distinct questions into one estimator and pays for it everywhere downstream. We argue that the right factorisation for an MCTS-coupled WM in a sparse-reward, bimodal-outcome regime is exactly four heads on a shared trunk: a categorical HL-Gauss value head, a tanh-bounded judge head, a signed step-reward head, and a softmax policy head over the action set. Each head has a different codomain, a different loss, a different normalisation, and a different training target. The trunk shares parameters so that auxiliary supervision regularises the representation; the heads stay independent so that each question is answered in its natural geometry. This essay derives every head from its question and shows where the scalar-regression alternative breaks.
+Perseus is MuZero. The MCTS planner pulls one prior per option per
+expansion. That prior is a blend of the LLM's own policy and a learned
+world model's belief about the same state. If the world model only
+emitted one scalar — say, "probability this search succeeds" — the
+planner would inherit a single point estimate, mass-produced across
+every expansion of a tree that needs to distinguish between *is this
+node fruitful*, *is this node terminal in a good way*, *was this step
+useful*, and *which action should I try next from here*. One scalar
+collapses four questions into one. Four heads keep them apart.
 
-## 1. Why four heads, not one scalar
+The four heads share a frozen `Salesforce/codet5p-110m-embedding`
+encoder and a small MLP trunk. After three weeks of architecture
+sweeps the conclusion was unambiguous: across 78+ named training
+runs no architecture beat frozen codet5p + MLP trunk on
+value/fr/sr/prm
+([`HISTORY/28_muzero_wm_research.md:570-575`](https://github.com/starling-sh/perseus)).
+LoRA-on-encoder, full fine-tune, random-init transformer, JEPA, EBM,
+TRM, kNN — they all lose. The trunk is settled. What's left is what
+goes on top of it.
 
-Perseus is MuZero. The MCTS planner pulls one prior per option per expansion, blended from the LLM's own policy and a learned world model's belief about the same state. The expansion needs four things at once: is this node fruitful in expectation, is this node terminal in a good way, was the last step useful, and which action should we try next. These are not the same quantity. One scalar — say, $\Pr[\text{search succeeds}]$ — answers none of them precisely and all of them badly.
-
-We share a frozen codet5p-110m-embedding encoder and a small MLP trunk across heads. After 78 named training runs and three weeks of architecture sweeps, no alternative trunk beat frozen codet5p plus MLP across $\{v, j, r, \pi\}$ (HISTORY/28 §research). LoRA-on-encoder, full fine-tune, random-init transformer, JEPA, EBM, TRM, kNN — every alternative lost on at least one head while gaining nothing on the others. The trunk is settled. The remaining design question is the head bank.
+This essay walks through each head in turn — what question it
+answers, how the loss is shaped, why it's normalised the way it is,
+and what the reward signal looks like that trains it. Plus the
+terminal reward $R$ that's the final value target. Plus the joint
+loss that ties them together.
 
 <Figure
   src="wm-v3-chain-deepsets-head-r2.png"
   alt="Multi-head joint training vs single-head specialists"
-  caption="Multi-head joint training beats single-head specialists on every head. Joint training (gold) versus single-head specialist (gray) across the four prediction heads. Numbers from v3_chain_deepsets honest baseline."
+  caption="Multi-head joint training beats single-head specialists on every head. Joint training (gold) vs single-head specialist (gray) across the 4 prediction heads. Numbers from v3_chain_deepsets honest baseline."
   n={1}
 />
 
-The v3 chain sweep ran the ablation directly. Variants that zeroed every loss weight except one head collapsed on every other head while gaining nothing on the specialised one. PRM-only attained $R^2 = 0.535$ on PRM but $-1.04$ on value, $-0.079$ on file recall, $-2.56$ on step reward. Joint training regularises the trunk: auxiliary supervision pulls the shared representation toward features useful for multiple questions simultaneously. With a single head, the trunk overfits to one head's noise.
+The Phase-3 chain sweep ran this comparison directly. The
+`v3_chain_ds_prm_only` and `v3_chain_ds_value_only` variants zeroed
+every loss weight except one head; the joint variants kept all heads
+active. The single-head specialists *collapsed on every other head*
+while gaining nothing on the head they specialised in. PRM-only got
+$R^2 = 0.535$ on PRM but $-1.04$ on value, $-0.079$ on fr, $-2.56$ on
+sr ([`HISTORY/28:148-149`](https://github.com/starling-sh/perseus)).
+The joint trainer regularises the trunk — auxiliary supervision
+pulls the shared representation toward features that are useful for
+multiple questions at once. With only one head, the trunk overfits
+to that head's noise.
 
-## 2. Forward pass and decode pipeline
+That's the architectural baseline. Now to the heads.
 
 ```mermaid
 flowchart LR
-  S[state_text] --> E[codet5p-110m encoder\nfrozen, 256-d pooled]
-  E --> D[MLP / DeepSets trunk]
-  D --> V[value MLP &rarr; 51 logits]
-  D --> J[judge MLP &rarr; tanh scalar]
-  D --> R[step_reward MLP &rarr; signed scalar]
-  D --> P[policy MLP &rarr; 17 logits]
-  V --> VD[HL-Gauss decode\nv_hat in V_min, V_max]
-  J --> JD[tanh-bounded j in -1, +1]
-  R --> RD[signed scalar r]
-  P --> PD[softmax pi over 17 tools]
-  VD --> NV[value_to_norm\nscale to 0, 1]
-  JD --> NJ[judge_to_norm\nscale to 0, 1]
-  RD --> NR[tanh squash]
-  NV --> UCB[UCB prior blend]
-  PD --> UCB
+  S[state_text] --> E[codet5p encoder frozen 256-d]
+  E --> D[DeepSets / MLP trunk pool]
+  D --> V[value MLP -> logits 51]
+  D --> J[judge MLP -> tanh scalar]
+  D --> R[step_reward MLP -> signed scalar]
+  D --> P[policy MLP -> logits 17]
+  V --> VD[HL-Gauss decode v_hat]
+  J --> JD[tanh-bounded j]
+  R --> RD[signed r]
+  P --> PD[softmax pi 17 tools]
 ```
 
-Every expansion runs this pipeline once. The encoder is frozen. The trunk takes the 256-dimensional pooled encoder output and projects to four head-specific MLPs in parallel. Decoding is per-head: HL-Gauss expectation for value, identity-with-tanh-squash for judge and step reward, softmax for policy. The result lands in a `WmHeads` record consumed by the UCB blend.
+---
 
-## 3. Head 1 — Value: HL-Gauss 51-bin softmax
+## Head 1: Value — HL-Gauss 51-bin softmax over $[V_\text{min}, V_\text{max}]$
 
-The value head answers: if the planner runs to termination from this state under the current policy, what discounted return should it expect? Formally $v(s) = \mathbb{E}[R \mid s, \pi]$ with $R$ the terminal reward defined in §7 and intermediate shaping rolled in.
+The value head answers: *if the planner runs to termination from
+this state under the current policy, what discounted return should
+it expect?*
 
-We discretise the support $[V_{\min}, V_{\max}]$ into $N = 51$ bins with centres
+That's an unbounded scalar in principle. In practice for Perseus
+trajectories it's bounded — terminal rewards live in $[-1, +1]$ and
+per-step shaping is small. The current v4 line uses support
+$[V_\text{min}, V_\text{max}] = [-1.0, +1.0]$
+([`HISTORY/14_wm_training.md:51`](https://github.com/starling-sh/perseus)).
+The original Phase-2 `finetune_codet5p` line used $[-10, +2]$ — wider
+support, but the expectation was off-scale anyway because
+`terminal_reward` was bug-zero at the time
+([`HISTORY/28:78`](https://github.com/starling-sh/perseus)). For
+intuition I'll use $[-10, +2]$ throughout the math since that's the
+range that survives in the in-repo `perseus/core/wm/heads.py` ADR:
 
-$$c_i = V_{\min} + (V_{\max} - V_{\min}) \cdot \frac{i}{N - 1}, \quad i \in \{0, 1, \dots, 50\}.$$
+```python
+VMIN: float = -10.0
+VMAX: float = 2.0
+```
+([`heads.py:12-13`](https://github.com/starling-sh/perseus))
 
-The head emits 51 logits $\ell(s) \in \mathbb{R}^{51}$. We softmax and read the expectation:
+### The HL-Gauss representation
 
-$$\pi_i(s) = \frac{\exp(\ell_i(s) - \max_k \ell_k(s))}{\sum_j \exp(\ell_j(s) - \max_k \ell_k(s))}, \qquad \hat v(s) = \sum_{i=0}^{50} \pi_i(s)\, c_i.$$
+Discretise the support into $N=51$ bins. Bin $i$ has center
+$c_i = V_\text{min} + (V_\text{max} - V_\text{min}) \cdot i / (N-1)$,
+which puts $c_0 = V_\text{min}$, $c_{50} = V_\text{max}$, and the
+remaining 49 evenly spaced. The head emits 51 logits; softmax over
+them gives a probability distribution $\pi(s) = \{\pi_0, \pi_1, \dots,
+\pi_{50}\}$. To recover a scalar prediction we take the expectation
+under the categorical:
 
-The $\max$-subtraction is the standard numerical stability shift; it preserves softmax output and prevents overflow on logits that drift high during training. The current v4 line uses $[V_{\min}, V_{\max}] = [-1, +1]$; the earlier Phase-2 line used $[-10, +2]$ inherited from a bug-zero terminal reward regime that the 2026-05-11 audit later fixed. The ADR-of-record keeps the wider range so that residual shaping accumulation cannot push targets out of support.
+$$\hat v(s) = \sum_{i=0}^{50} \pi_i(s) \cdot c_i$$
 
-### 3.1 Why categorical beats scalar regression on bimodal sparse-reward data
+Decode in code:
 
-The corpus is heavily imbalanced toward failure. Of 19,881 multi-bench rows, 691 carry $\text{judge\_label} = 1.0$, a 3.5 percent global pass rate (HISTORY/28). Successful trajectories pile their value-target distribution near $+1$; failed trajectories pile theirs near $-1$. There is almost nothing in between.
+```python
+def decode_hl_gauss(logits: list[float]) -> float:
+    if not logits:
+        return 0.0
+    n = len(logits)
+    m = max(logits)
+    exps = [math.exp(x - m) for x in logits]
+    z = sum(exps)
+    probs = [e / z for e in exps]
+    centers = [VMIN + (VMAX - VMIN) * i / (n - 1) for i in range(n)]
+    return sum(p * c for p, c in zip(probs, centers, strict=True))
+```
+([`heads.py:27-36`](https://github.com/starling-sh/perseus))
 
-A scalar regression head fit with mean-squared error on this distribution minimises loss by predicting the *mean*, which sits near $-0.93$, missing both modes catastrophically. This is exactly what happened with `p3pp_codet5p_220m` on 2026-05-14: a 220m codet5p variant with eight heads and an MSE-scalar value head, trained on the contaminated pre-fix corpus, produced $R^2 = -745$ on both train and val (HISTORY/28 §308-315). That is not a generalisation failure; it is the residual sum of squares exceeding the total sum of squares by three orders of magnitude. Gradient descent through 220m parameters pushed predictions into nonsense space.
+The $m = \max(\text{logits})$ subtraction is the standard numerical-
+stability trick — it doesn't change the softmax output, but it keeps
+$\exp$ from overflowing on logits that drifted high during training.
+
+### Why discrete bins beat scalar regression on bimodal sparse-reward data
+
+This was the load-bearing decision. The corpus is heavily
+imbalanced toward fail: of 19,881 multi-bench rows, only 691 carry
+$\text{judge\_label} = 1.0$ — a ~3.5% global pass rate
+([`HISTORY/28:484-498`](https://github.com/starling-sh/perseus)).
+Successful trajectories pile their value-target distribution near
+$+1.0$. Failed trajectories — the vast majority — pile theirs near
+$-1.0$. There's almost nothing in between. A scalar regression head
+fit with MSE on this distribution will minimize loss by predicting
+the *mean*, which sits somewhere around $-0.93$, missing both modes
+catastrophically.
+
+This is exactly what happened with `p3pp_codet5p_220m` (May 14,
+2026). The 220m codet5p variant with 8 heads, MSE-scalar value,
+trained on the pre-fix contaminated corpus, produced
+$R^2 = -745$ — train and val both
+([`HISTORY/28:308-315`](https://github.com/starling-sh/perseus)).
+That's not a generalization failure. That's the model emitting
+predictions so far from the targets that the residual sum of
+squares exceeds the total sum of squares by three orders of
+magnitude. The head capacity was big enough that gradient descent
+on MSE through 220m parameters just pushed predictions out into
+nonsense space.
 
 <Figure
   src="p3pp-codet5p-220m-r2-vs-hl-gauss.png"
   alt="Scalar MSE vs HL-Gauss"
-  caption="Scalar MSE on bimodal sparse-reward targets produced R-squared of -744 on the 220m codet5p run. HL-Gauss with 51 bins recovered to near-zero R-squared with no other change. Discrete bin representation absorbs the bimodality that scalar regression cannot."
+  caption="Scalar MSE on bimodal sparse-reward targets produced R² = -744 on the 220m codet5p run. HL-Gauss with 51 bins recovered to near-zero R² without any other change. Discrete bin representation absorbs the bimodality that scalar regression cannot."
   n={2}
 />
 
-HL-Gauss absorbs the bimodality. Failed trajectories map to mass on bins near $c_0$. Successful trajectories map to mass near $c_{50}$. The cross-entropy training objective does not penalise the model for putting mass on multiple modes — it only cares whether the right bin has high probability. The expectation $\hat v$ falls out at decode time, and the variance of the gradient estimator is independent of the target's location in support, unlike MSE whose gradients scale linearly with target magnitude (Bellemare et al. 2017; Imani et al. 2018).
+The HL-Gauss representation absorbs this. With 51 bins, "failed
+trajectory" maps to high probability mass on the bins near
+$c_0 = -10$ (or $-1$ in the v4 line). "Succeeded trajectory" maps to
+high mass near $c_{50}$. The cross-entropy training objective
+**doesn't penalize the model for putting mass on multiple modes** —
+it only cares whether the right bin has high probability. The
+expectation $\hat v(s)$ falls out at decode time.
 
-To see the gradient-variance argument concretely: with scalar MSE the loss is $(v_{\text{pred}} - R)^2$ and $\partial \mathcal{L}/\partial v_{\text{pred}} = 2(v_{\text{pred}} - R)$. The gradient scales linearly with the residual; on the failure mode at $R = -1$ the trunk gets a strong negative-direction signal even when predictions are near zero, while on the success mode at $R = +1$ it gets a strong positive signal. The trunk solves the average problem — predict zero — and stops moving. With categorical cross-entropy the loss is $-\sum_i q_i \log \pi_i$ and the gradient is $\partial \mathcal{L}/\partial \ell_i = \pi_i - q_i$, bounded in $[-1, 1]$ regardless of target location. The bimodal training distribution shows up as two distinct attractors in the categorical landscape rather than one averaged point.
+The original DeepMind C51 / HL-Gauss line (Bellemare et al., 2017;
+Imani et al., 2018) gives the theoretical justification: the
+categorical loss is consistent with a kernel-smoothed target, and
+the variance of the gradient estimator is independent of the
+target's location in support — unlike MSE, whose gradients scale
+linearly with the target value.
 
-The v4 sweep replaced MSE-scalar value with HL-Gauss 51-bin on $[-1, +1]$ and the value-head failures stopped being catastrophic (HISTORY/14 §51-52). The deployed `wm_v4_random_split` reaches $R^2 = 0.997$ on its random-row split. We note up front that this number is inflated by trajectory leakage across the random split; see the WM training sweep essay for the instance-split story. The representational point is independent: the categorical head does not blow up.
+For Perseus specifically: the v4 sweep replaced MSE-scalar value
+with HL-Gauss 51-bin on $[-1, +1]$ and the value-head failures stopped
+being catastrophic
+([`HISTORY/14:51-52`](https://github.com/starling-sh/perseus)). The
+deployed `wm_v4_random_split` reaches $R^2 = 0.997$ on its (leaky)
+random-row split with 51-bin HL-Gauss
+([`HISTORY/14:83`](https://github.com/starling-sh/perseus)). The
+generalization story is separate (see §6 on
+[wm training sweep](/essays/wm-training-sweep/)); the point here is
+that the *representation* doesn't blow up.
 
-### 3.2 Bin width and kernel bandwidth
+### Normalization
 
-With $N = 51$ bins on $[-1, +1]$ the bin width is $\Delta = 2/50 = 0.04$. The kernel-smoothed target distribution centred on a true return $R$ uses a Gaussian kernel with bandwidth $\sigma$ tuned to roughly half the bin width — too narrow and the target collapses to a one-hot which throws away the consistency benefit of HL-Gauss; too wide and the target smears across many bins and the head can no longer resolve neighbouring returns. The standard choice $\sigma = \Delta$ keeps a target centred at a bin centre at $\pi_i \approx 0.4$ on the nearest bin and decays sharply on either side, giving the head enough resolution to distinguish $R = +0.5$ from $R = +0.9$ while still propagating density to adjacent bins on near-misses.
+Decoded value $\hat v \in [V_\text{min}, V_\text{max}]$ is signed.
+But the planner needs a prior in $[0, 1]$ to blend with the LLM
+prior. So we map linearly:
 
-### 3.3 Value normalisation for UCB
+$$v_\text{norm} = \frac{v - V_\text{min}}{V_\text{max} - V_\text{min}} \in [0, 1]$$
 
-UCB consumes a prior in $[0, 1]$. We map linearly:
+Implemented as:
 
-$$v_{\text{norm}} = \mathrm{clip}_{[0,1]}\!\left( \frac{\hat v - V_{\min}}{V_{\max} - V_{\min}} \right) \in [0, 1].$$
+```python
+def value_to_norm(value: float) -> float:
+    return max(0.0, min(1.0, (value - VMIN) / (VMAX - VMIN)))
+```
+([`heads.py:39-40`](https://github.com/starling-sh/perseus))
 
-The clip is defensive: if a buggy checkpoint emits a value above $V_{\max}$, we feed UCB a saturated $1$ rather than nonsense. The clip never triggers in well-behaved checkpoints because the HL-Gauss expectation is an inner product of a probability distribution with bin centres in $[V_{\min}, V_{\max}]$, so $\hat v$ is mathematically bounded by support. The clip exists for endpoint-failure cases where the wire format degrades.
+The clamp is defensive — if a buggy ckpt emits a value above
+$V_\text{max}$, we clip to $1.0$ rather than feed nonsense into the
+UCB blend.
 
-## 4. Head 2 — Judge: tanh-bounded scalar
+---
 
-The judge head answers: would a downstream LLM judge accept the final answer reachable from this state? This is structurally different from value. Value is a continuous discounted return over an open-ended sequence; judge is a one-shot binary outcome. A sigmoid for $\Pr[\text{pass} \mid s]$ would be a reasonable choice. We use tanh-bounded scalar instead, output in $(-1, +1)$.
+## Head 2: Judge — tanh-bounded scalar
 
-### 4.1 Why tanh, not sigmoid
+The judge head answers: *if a downstream LLM judge were to run on
+the final answer from this state, would it accept?*
+
+This is structurally different from value. Value is the discounted
+expected return — a continuous quantity over an open-ended sequence
+of future states. Judge is a one-shot binary outcome: pass or fail.
+You could train it as a sigmoid for $\Pr[\text{pass} \mid s]$, and
+that's a reasonable choice. The line that exists in the in-repo
+ADR uses a tanh-bounded scalar instead — output in $(-1, +1)$ where
+$+1$ means *will pass*, $-1$ means *will fail*, and intermediate
+values express confidence.
+
+### Why tanh and not sigmoid
 
 Two reasons.
 
-1. **Symmetry.** The training target after the 2026-05-11 audit is $\text{target}(s) = 2 \cdot \text{judge\_label}(s) - 1$, with $\text{judge\_label} \in \{0, 0.5, 1\}$ for fail, partial, pass. That maps to $\{-1, 0, +1\}$ — symmetric around zero. Tanh's codomain is $(-1, +1)$; sigmoid's is $(0, 1)$. Matching codomain to target keeps gradient flow well-scaled at both modes. A sigmoid trained against a boundary value of $0$ saturates differently than at boundary $1$; that representational asymmetry tanh avoids.
+**Symmetry.** The training target after the 2026-05-11 audit is the
+mapped judge label:
 
-2. **Distillation alignment.** The Phase-2 line that became Strand-1 served by `wm_serve.py` was designed to distill against gpt-5.4-nano-medium's 16-dim calibrated outputs at 39.59 USD per 60,565 rows (HISTORY/34). The calibrated value target from that path lives in $[-1, +1]$. The judge head was specced to consume that target shape directly. The 16-dim distillation artifact never landed, but the head was designed against the specified shape, and the live v4 trainer's `judge_value` head, where present, retains the tanh-symmetric convention.
+$$\text{target}(j) = 2 \cdot \text{judge\_label} - 1$$
 
-### 4.2 Training signal: harness verdicts
+where $\text{judge\_label} \in \{0.0, 0.5, 1.0\}$ (fail / partial / pass).
+That maps to $\{-1.0, 0.0, +1.0\}$ — symmetric around zero. Tanh's
+codomain is $(-1, +1)$, sigmoid's is $(0, 1)$. Matching the codomain
+to the target keeps gradient flow well-scaled at both modes. A sigmoid
+trained against a target that's literally at the boundary value 0
+saturates differently than at boundary value 1 — there's a
+representational asymmetry that tanh-on-$[-1,+1]$ avoids.
 
-The production training signal for the judge head is the multi-swe-bench harness verdict. Labels are deterministic: run the harness binary against the model patch in a network-isolated Docker sandbox, parse the report.
+**Distillation alignment.** The Phase-2 `finetune_codet5p` line — the
+arch that became Strand-1 served by `wm_serve.py` — was specced to
+distill against `gpt-5.4-nano-medium`'s 16-dim calibrated outputs at
+$39.59 / 60,565 rows
+([`HISTORY/34:442-475`](https://github.com/starling-sh/perseus)). The
+`calibrated_value_target_v2` summary scalar from that path lives in
+$[-1, +1]$. The judge head was designed to consume that target shape
+directly. (Note: the 16-dim distillation path is documented but the
+artifact never landed — `python/gen_value_targets_v2.py` doesn't
+exist; see [pipeline integrity audit](/essays/pipeline-integrity-audit/)
+for the honesty story. The head was still designed against the
+specified shape, and the live v4 trainer's `judge_value` head, when
+present, retains the tanh-symmetric target convention.)
 
-$$\text{judge\_label} = \begin{cases} 1.0 & \text{every F2P passes AND every P2P preserved} \\ 0.5 & \text{some F2P pass OR P2P regression} \\ 0.0 & \text{no F2P passes OR harness error} \end{cases}$$
+### Training the judge head against test-pass labels
 
-No float thresholds, no recalibration, no human judgment in the loop (HISTORY/34 §103-106). The training loop maps $\{0, 0.5, 1\} \to \{-1, 0, +1\}$ via the affine $2x - 1$ and fits MSE against the tanh output.
+The actual production training signal for the judge head is the
+multi-swe-bench harness verdict. Quoting from
+[`HISTORY/34:97-105`](https://github.com/starling-sh/perseus):
 
-The loss is masked where the judge label is unavailable: rows with $\text{judge\_source} \in \{\texttt{harness\_unsupported}, \texttt{harness\_collided}\}$ contribute zero gradient to the judge head regardless of any heuristic value (T2 in the audit). The deployed `wm_v4_random_split` checkpoint does not have a judge head — the v4 trainer dropped it in favour of value, file recall, step reward, PRM, and confirm-stop (HISTORY/14 §51-58). The judge head exists only in the earlier Strand-1 checkpoints. The wm-serve decoder handles this gracefully by returning a neutral midpoint when the loaded checkpoint has no judge head weights.
+> `judge_label ∈ {0.0, 0.5, 1.0}` from running gold-patch tests
+> against the model patch:
+> - **1.0** — every F2P passes AND every P2P preserved.
+> - **0.5** — partial: some F2P pass OR P2P regression.
+> - **0.0** — no F2P passes OR harness error.
 
-### 4.3 Judge normalisation for UCB
+The labels are deterministic — they come from running the harness
+binary in a Docker sandbox (`docker run --rm --network none --cpus 2
+--memory 4g`) and parsing `final_report.json`. No float thresholds,
+no recalibration
+([`HISTORY/34:103-106`](https://github.com/starling-sh/perseus)). The
+training loop maps $\{0.0, 0.5, 1.0\} \to \{-1.0, 0.0, +1.0\}$ via the
+same affine and fits MSE against the tanh output.
 
-Same logic as value: map signed range to $[0, 1]$.
+The deployed `wm_v4_random_split` ckpt **does not have a judge head** —
+the v4 trainer dropped it in favour of value, fr, sr, prm, confirm
+([`HISTORY/14:51-58`](https://github.com/starling-sh/perseus)). The
+judge head exists only in the earlier Strand-1 `finetune_codet5p`
+ckpts. The `wm-serve` decoder handles this gracefully by returning
+`None` for judge_value when the ckpt has no `heads.judge_value.fc.*`
+weights:
 
-$$j_{\text{norm}} = \mathrm{clip}_{[0,1]}\!\left( \frac{j + 1}{2} \right) \in [0, 1].$$
+```python
+judge = float(resp.get("judge_value", 0.0))
+```
+([`client.py:82`](https://github.com/starling-sh/perseus))
 
-In the live deployment, judge is not currently blended into UCB; it is surfaced in telemetry as `wm_last_judge_value` for ops dashboards and reserved for alternative blending strategies (a separate $\alpha_j$ weight).
+If the response doesn't carry a `judge_value` field, we default to
+$0.0$ (the neutral midpoint of the target).
 
-## 5. Head 3 — Step reward: signed scalar with shaping
+### Normalization
 
-The step-reward head answers: at this state, what immediate shaping reward did the action just taken produce? This is a per-step quantity. It exists to give the value head denser supervision during training: every step in a trajectory carries a step-reward target, while only the terminal step carries a $\pm 1$ judge label. Dense supervision regularises the trunk and gives the encoder gradients to bend even on states whose terminal outcome the model is not yet confident about.
+Same logic as value: map signed range to $[0, 1]$ for UCB blending.
 
-### 5.1 The shaping signal
+$$j_\text{norm} = \frac{j + 1}{2} \in [0, 1]$$
 
-Let $a_t$ be the action at step $t$, $\text{hits}_t$ the tool evidence list, and $G$ the gold file set when known (from the multi-bench oracle patch). The shaping function is
+```python
+def judge_to_norm(judge: float) -> float:
+    return max(0.0, min(1.0, (judge + 1.0) / 2.0))
+```
+([`heads.py:43-44`](https://github.com/starling-sh/perseus))
 
-$$r_t = \begin{cases}
-0 & a_t = \texttt{give\_up} \\
--0.2 & |\text{hits}_t| = 0 \\
-0.1 + 0.2 \cdot \mathbb{1}[\exists h \in \text{hits}_t : h.\text{line\_start} \neq \emptyset] + 1.0 \cdot |\text{top5}(\text{hits}_t) \cap G| & \text{otherwise}
-\end{cases}$$
+---
 
-Case by case:
+## Head 3: Step reward — signed scalar
 
-1. **`give_up` gets zero.** Giving up is a state transition on the leaf, not a tool result. Penalising it would tell the planner never to give up, which conflicts with the explicit branch-exhausted action in the planner contract. Rewarding it would bias toward early termination. Neutral is the only honest signal.
+The step reward head answers: *at this state, what immediate shaping
+reward did the action produce?*
 
-2. **Empty result gets $-0.2$.** No hits is informative — the tool-argument combination did not fire on the corpus — but the penalty is small because empty results are normal during exploration. We do not want the planner to fear-cluster around tools that have ever returned zero, only to notice that a sequence of empty tools is a degenerate branch.
+This is a per-step quantity. It exists to give the value head
+denser supervision during training — every step in the trajectory
+carries a step-reward target, while only the terminal step carries a
+$\pm 1$ judge label. The dense supervision regularises the trunk and
+gives the encoder gradients to bend even on states whose terminal
+outcome the model isn't yet confident about.
 
-3. **Non-empty result gets $+0.1$ baseline.** Tool outputs are evidence; evidence is positive.
+### The shaping signal
 
-4. **Line-bearing evidence adds $+0.2$.** If at least one hit carries a line start — the tool resolved to specific lines, not just a path-level match — the reward bumps to $+0.3$ total. Line-bearing evidence is qualitatively higher signal than path-level.
+From [`perseus/core/training/rewards.py:14-39`](https://github.com/starling-sh/perseus):
 
-5. **Gold-file recall adds $+1.0$ per landed file.** If we have a known gold file set, every gold file landing in the top-5 hits adds $+1.0$. This is the dominant term: a trajectory that lands three gold files in a single step scores $+0.3 + 3.0 = +3.3$. Only the top 5 count, which forces the planner to learn to rank gold files upward in the result list, not merely include them somewhere.
-
-The shape is asymmetric: penalties bounded at $-0.2$, rewards unbounded in principle. Gold sets are typically 1–4 files, so the practical max is around $+4$ per step.
-
-### 5.2 The shaping signal as a regulariser
-
-The dominant practical role of the step-reward head during training is not its own predictions; it is the gradient flow it provides to the trunk. Trajectories vary in length from a handful of steps to several dozen, but each carries only one terminal reward. Without per-step shaping, all $T$ steps in a trajectory propagate gradient from the same scalar $R$ through the value bootstrap chain, which is information-poor: the encoder cannot tell whether the trajectory succeeded because step 3 was decisive or because every step contributed equally. The step-reward signal provides per-step credit assignment for free: a step that landed two gold files in its top-5 gets a $+2.1$ shaping reward that flows directly into the trunk, telling the encoder that this state's representation should encode "this is the kind of state where gold files land". Without that signal, the encoder learns an averaged "this is a state late in a successful trajectory" representation that is much less actionable.
-
-The discount factor $\gamma = 0.95$ makes the per-step shaping signal compose into the value bootstrap. A step at distance $T - t$ from the terminal contributes $\gamma^{T-t}$ to the value target. Over a trajectory of length 20 the terminal contributes $0.95^{20} \approx 0.36$ and the per-step shaping carries the remaining $0.64$ of the value-target signal. That ratio is intentional: we want the trunk to learn from shaping more than from sparse terminals.
-
-### 5.3 Why tanh squash on the normaliser
-
-The reward head emits a signed scalar and can produce both negative and positive predictions. For telemetry and for any auxiliary blending, we squash with tanh:
-
-$$r_{\text{norm}} = \tanh(r) \in (-1, +1).$$
-
-A clip-and-divide alternative would have flat regions where gradients vanish; tanh only saturates, never flatlines. The step-reward head is not currently blended into UCB; the value of $r_{\text{norm}}$ is surfaced in `RetrievalDiagnostics` and used in training as an auxiliary loss target. Tanh keeps the head from emitting huge predictions when the gold-recall term dominates, which would destabilise the joint loss.
-
-The derivative $\tanh'(x) = 1 - \tanh^2(x)$ stays positive everywhere, so gradient flow through the squash never vanishes; it only attenuates as predictions saturate. By contrast a piecewise-linear clip would cut gradient flow to zero outside the linear region, which compounds the dead-neuron problem under any optimiser with momentum. The choice between tanh and a smooth sigmoid is largely cosmetic — both keep gradient alive — but tanh's symmetric range matches the signed nature of the step reward and avoids the implicit-bias offset that sigmoid would introduce.
-
-## 6. Head 4 — Policy: softmax over 17 ToolName actions
-
-The policy head answers: given this state, what action distribution would MCTS visits produce here? This is the MuZero policy head. It is trained against the empirical visit distribution at the root of the tree:
-
-$$\pi^M_t(a \mid s_t) = \frac{N(s_t, a)}{N(s_t)}, \qquad N(s_t) = \sum_a N(s_t, a).$$
-
-Visit counts are captured after each MCTS iteration's expansion and backprop and persisted to a per-step snapshot table (migration 007).
-
-### 6.1 The action set
-
-Perseus's tool registry has 17 actions: `give_up`, `search_text`, `search_path`, `open_file`, `snippet_extract`, `symbol_lookup`, `references_lookup`, `callgraph_neighbors`, `dependency_neighbors`, `sibling_scan`, `similar_files_embedding`, `diff_pattern_scan`, `test_locator`, `error_signature_match`, `broad_scan`, `repo_stats`, `hybrid_search`. The policy head emits 17 logits; softmax gives a 17-dimensional probability vector. The natural training target is $\pi^M_t$, fit with cross-entropy.
-
-### 6.2 Why softmax over an action set, not a Q-function
-
-This is the AlphaZero / MuZero design choice. A Q-head that outputs 17 expected returns and argmaxes is possible but loses information. The policy head learns a *distribution*, not a single estimate; it expresses exploration uncertainty in the same shape MCTS uses. At expansion time, the planner blends WM and LLM priors per action:
-
-$$\text{prior}_{\text{blend}}(a) = (1 - \alpha) \cdot \pi_{\text{LLM}}(a) + \alpha \cdot \pi_{\text{WM}}(a).$$
-
-If the WM has high confidence that one action is correct, the WM-side prior peaks near $1$ on that action and dilutes the others. If the WM is uncertain, it stays close to uniform $1/17$ and contributes minimal information beyond the LLM prior. The decoder defaults to exactly that uniform when the server response carries no policy field, so missing data fails open rather than skewing search.
-
-### 6.3 Training under temperature
-
-The visit distribution $\pi^M_t$ used as policy target is the result of UCB selection with an exploration constant tuned to be open-handed; in the current line UCB-C sits at $2.2$ after the 2026-04-25 depth-tuning. That choice matters for the policy head because the targets it sees are the visit counts produced under that exploration policy. A more exploitative tree (low UCB-C) produces visit distributions concentrated on a single action and trains the policy head to be peaky; a more exploratory tree produces flatter visit distributions and trains a smoother policy prior. We deliberately keep UCB-C high during training so the policy head learns a prior with non-trivial support across the action set rather than collapsing onto whichever action MCTS preferred most on the last expansion.
-
-### 6.4 The visit-distribution parser bug
-
-A latent bug in the policy training pipeline is worth flagging because it killed an entire era of WMs silently. The Rust snapshot table writes children as a JSON list-of-objects. The pre-2026-05-11 Python loader only handled $\texttt{Dict}[\texttt{str}, \texttt{int}]$ and silently fell through to a uniform default on the object-list shape. So the policy head trained against uniform targets across the entire post-2026-04-23 corpus (HISTORY/28 §425-427).
-
-Combined with the terminal-reward-equals-zero contamination on the value head, *two of the four heads were training against degenerate targets* for roughly three weeks before the audit landed. This bug does not crash and does not surface as a loss-curve anomaly — uniform targets give plausible cross-entropy values; only an explicit validator catches it. The fix is one line in the parser. See §8 for the full audit story.
-
-## 7. Reward signal: terminal reward $R$
-
-
-
-Each head trains against its own target, but the value head's target is itself a downstream of the terminal reward $R$ — the scalar that defines whether a trajectory succeeded.
-
-$$R = \begin{cases}
-2 \cdot \text{judge\_label} - 1 & \text{if judge label available, in } [-1, +1] \\
-|\text{top5} \cap G| \,/\, |G| & \text{else if gold files known, in } [0, 1] \\
-0 & \text{otherwise (filtered out of training data)}
-\end{cases}$$
-
-The value target at step $t$ is the bootstrapped discounted return
-
-$$v^{\text{tgt}}_t = \sum_{k=0}^{T-t-1} \gamma^k\, r_{t+k} + \gamma^{T-t}\, R, \qquad \gamma = 0.95.$$
-
-### 7.1 Why judge is the truth-source
-
-The judge label comes from running the harness binary against the multi-bench gold tests. It is deterministic ground truth: no statistical model interpreting the verdict, no calibration step, no human in the loop. The harness returns "Resolved" for pass, "Unresolved" or "Errored" for fail, "NotFound" for unsupported. Pass means F2P tests pass and P2P tests are preserved. When this label is available, it is *the* truth.
-
-### 7.2 Why file recall is fallback, not primary
-
-File recall — top-5 hits intersected with the gold file set — is the fallback when judge is missing. It is a proxy: landing gold files in the top-5 hits is necessary for a successful patch but not sufficient. You could land all the gold files and still emit a wrong patch; the judge would say fail, but file recall would say $1.0$. Hence the precedence: judge first, file recall second, zero last.
-
-The asymmetry between codomain $[-1, +1]$ for judge-derived $R$ and $[0, 1]$ for file-recall-derived $R$ is intentional. Judge-failure is informative: a hard zero target on the $-1$ end of value support pushes the head to predict large negative values on states that lead to confirmed failures, which is the signal we want for pruning UCB. File-recall-failure is weaker: a row with zero gold-file overlap might still be a recoverable trajectory (the search just missed the relevant files in top-5), so we do not want the head to brand it with the same penalty magnitude as a confirmed harness failure. Mapping the fallback to $[0, 1]$ rather than $[-1, +1]$ keeps file-recall-derived rows from contaminating the lower half of value support.
-
-## 8. The 2026-05-11 audit and why it matters
-
-Any honest research log has to address this directly. The terminal-reward fix is the single largest bug in the WM line.
-
-The terminal-reward extractor in the muzero export binary was reading a column on `multi_bench_runs` that was always NULL — that column was never populated by either the multi-bench driver or the harness scoring path. Combined with the binary's default reward-source being file recall AND most invocations omitting the dataset flag (so the gold file set was empty too), every export produced parquet rows with $\text{terminal\_reward} = 0$.
-
-```mermaid
-flowchart TD
-  A[multi_bench_runs.result NULL] --> B[pick_terminal_reward returns 0]
-  C[--reward-source default fileRecall] --> B
-  D[--dataset omitted &rarr; gold_files empty] --> B
-  B --> E[every parquet row: terminal_reward = 0]
-  E --> F[value head trains against zero targets]
-  F --> G[R-squared catastrophic for 3 weeks]
+```python
+def shape_step_reward(
+    tool: ToolName,
+    evidence: ToolEvidence,
+    *,
+    gold_files: set[str] | None = None,
+) -> float:
+    if tool is ToolName.GIVE_UP:
+        return 0.0
+    if not evidence.hits:
+        return -0.2
+    r = 0.1
+    if any(h.line_start is not None for h in evidence.hits):
+        r += 0.2
+    if gold_files:
+        top5_paths = {h.path for h in evidence.hits[:5]}
+        landed = top5_paths & gold_files
+        r += 1.0 * len(landed)
+    return r
 ```
 
-Window: 2026-04-23 first export through 2026-05-11 fix. Three weeks of WM training off contaminated targets. For 17 days, every checkpoint trained with reward source set to judge regressed toward zero by construction. The value head's $R^2$ was catastrophic not because the model was bad, not because the representation was wrong, not because the data was small, but because every row's target was literally $0$ due to a NULL column read.
+The formula in math:
 
-The audit shipped as T1 through T9:
+$$r_t = \begin{cases}
+0 & \text{if } a_t = \texttt{give\_up} \\
+-0.2 & \text{if } |\text{hits}_t| = 0 \\
+0.1 + 0.2 \cdot \mathbb{1}[\exists h \in \text{hits}_t : h.\text{line\_start} \ne \varnothing] + 1.0 \cdot |\text{hits}_t^{\text{top5}} \cap G| & \text{else}
+\end{cases}$$
 
-1. **T1.** The Rust row struct reads the migration-008 judge columns end to end.
-2. **T2.** The judge reward source reads the raw judge label and masks invalid sources to zero.
-3. **T3.** The binary default reward source flipped from file recall to judge.
-4. **T4.** Python visit-distribution loader handles the object-list shape; policy head stops training against uniform targets.
-5. **T5.** Stratified sample dedupes the (instance, model, condition) triple.
-6. **T6.** Harness-id collision guard.
-7. **T7.** Backfill SQL.
-8. **T8.** Honest-denominator audit script.
-9. **T9.** The strikethrough block in the project root doc preserving the 2026-05-05 entry verbatim with strike markers, so the history reads honestly on a casual scroll.
+Read this case by case.
 
-T9 matters most. The 2026-05-05 entry had claimed the terminal-reward fix shipped, with a 500-trajectory smoke histogram to prove it. The smoke never ran. The fix was not there. The retraction is the institutional response to *don't overpromise; verify before claiming success.*
+**`give_up` → 0.0.** Giving up isn't a tool result; it's a state
+transition on the leaf. Penalising it would tell the planner "never
+give up", which conflicts with the explicit branch-exhausted action
+in the planner contract
+(`Claude.md` non-negotiable §4). Rewarding it would obviously bias
+toward early termination. Neutral is the only honest signal.
 
-## 9. The joint loss
+**Empty result → -0.2.** No hits is informative — it tells the
+planner "this tool/argument combination didn't fire on the corpus".
+Penalty is small (-0.2) because empty results are a normal part of
+exploration; we don't want to teach the planner to fear-cluster
+around tools that have ever returned zero. But it's nonzero, because
+a sequence of empty tools is a sign of a degenerate branch.
 
-All four heads share the trunk. They train jointly. The total loss is a weighted sum:
+**Hits exist → +0.1 base.** Any non-empty tool result gets a small
+positive baseline. Tool outputs are evidence; evidence is positive.
 
-$$\mathcal{L} = \mathcal{L}_v + \lambda_j\, \mathcal{L}_j + \lambda_r\, \mathcal{L}_r + \lambda_\pi\, \mathcal{L}_\pi$$
+**Line-bearing → +0.2 bonus.** If at least one hit carries a
+`line_start` (i.e., the tool resolved to specific lines in a file,
+not just a path-level match), the reward bumps to +0.3 total.
+Line-bearing evidence is qualitatively higher-signal than
+path-level — it means the planner can directly read the relevant
+snippet rather than re-scanning the file. The 0.2 increment is
+calibrated so it's bigger than the +0.1 base but smaller than the
+file_recall multiplier below.
 
-where
+**Gold-file recall → +1.0 per landed file.** If we have a known
+gold file set $G$ (from the multi-bench oracle patch), every gold
+file that lands in the top-5 hits adds +1.0. This is the dominant
+term — a trajectory that lands 3 gold files in a single step scores
+$+0.3 + 3.0 = +3.3$. The hit-list ranking matters: only the top 5
+count, which forces the planner to learn to rank gold files
+*upward* in the result list, not just include them somewhere.
 
-$$\mathcal{L}_v = - \sum_{i=0}^{50} q_i(R)\, \log \pi_i(s), \qquad q_i(R) = \frac{\exp(-(c_i - R)^2 / 2\sigma^2)}{\sum_k \exp(-(c_k - R)^2 / 2\sigma^2)}$$
+The shape is asymmetric: penalties bounded at $-0.2$, rewards
+unbounded in principle. Gold sets are typically 1–4 files, so the
+practical max is around $+4$ per step.
 
-is the categorical cross-entropy of the value softmax against the kernel-smoothed target distribution centred on $R$ with bandwidth $\sigma$ tuned to bin width;
+### Why tanh for normalization
 
-$$\mathcal{L}_j = \mathbb{1}[\text{judge available}] \cdot (j_{\text{pred}} - (2 \cdot \text{judge\_label} - 1))^2$$
+The reward head emits a signed scalar — it can produce both negative
+(penalty) and positive (reward) predictions. To map into $[0, 1]$ for
+UCB blending we use tanh:
 
-is the masked MSE of judge prediction;
+$$r_\text{norm} = \tanh(r) \in (-1, +1)$$
 
-$$\mathcal{L}_r = \frac{1}{T} \sum_{t=1}^{T} (r_{\text{pred},t} - r_t)^2$$
+```python
+def step_reward_to_norm(step: float) -> float:
+    return math.tanh(step)
+```
+([`heads.py:47-48`](https://github.com/starling-sh/perseus))
 
-is the per-step MSE of step reward; and
+Wait — that returns a value in $(-1, +1)$, not $[0, 1]$. That's
+intentional. The step reward isn't blended into UCB the same way
+value and judge are; it's surfaced in `RetrievalDiagnostics` for
+telemetry (the `wm_last_value` and `wm_last_judge_value` fields are
+named in
+[`Claude.md:WM-in-the-Loop:wm_last_judge_value`](https://github.com/starling-sh/perseus))
+and used in training as an auxiliary loss target, not as a direct
+input to expansion. The tanh squash is for gradient stability — it
+prevents the head from emitting huge predictions when the gold-recall
+term dominates, which would destabilise the joint loss.
 
-$$\mathcal{L}_\pi = - \sum_a \pi^M_t(a \mid s_t)\, \log \pi_{\text{pred}}(a \mid s_t)$$
+A clip-and-divide alternative would have flat regions where
+gradients vanish; tanh only saturates, never flatlines.
 
-is the cross-entropy of policy softmax against the empirical MCTS visit distribution. In the v4 trainer the loss weights are roughly $\lambda_j \approx 0.5$, $\lambda_r \approx 0.5$, $\lambda_\pi \approx 1.0$. The v4 line drops judge in favour of file recall, step reward, PRM, and confirm-stop, but the multi-head principle is preserved.
+---
 
-### 9.1 Joint training beats single-head specialists
+## Head 4: Policy — softmax over 17 ToolName actions
 
-The v3 chain sweep ran the ablation:
+The policy head answers: *given this state, what's the action
+distribution that MCTS visits would produce?*
 
-| Variant | head focus | $R^2_v$ | $R^2_{\text{prm}}$ | $R^2_{\text{fr}}$ | $R^2_{\text{sr}}$ |
+This is the MuZero policy head. It's trained against the empirical
+visit distribution at the root of the tree:
+
+$$\pi^M_t(a \mid s_t) = \frac{N(s_t, a)}{N(s_t)}$$
+
+where $N(s_t, a)$ is the visit count for action $a$ from state
+$s_t$, and $N(s_t) = \sum_a N(s_t, a)$. The visit distribution is
+captured after each MCTS planner iteration's expansion + backprop and
+persisted to the `mcts_step_snapshots` table (migration 007, see
+`Claude.md` "Per-step MCTS snapshots" section).
+
+### The 17 actions
+
+Perseus's tool registry has 17 entries
+([`Claude.md` "Tooling Surface (Current)"](https://github.com/starling-sh/perseus)):
+
+```
+give_up, search_text, search_path, open_file, snippet_extract,
+symbol_lookup, references_lookup, callgraph_neighbors,
+dependency_neighbors, sibling_scan, similar_files_embedding,
+diff_pattern_scan, test_locator, error_signature_match,
+broad_scan, repo_stats, hybrid_search
+```
+
+The policy head emits 17 logits; softmax gives a 17-dim probability
+vector. The natural training target is the visit distribution
+$\pi^M_t$, fit with cross-entropy.
+
+### Why softmax over an action set, not a Q-function
+
+This is the AlphaZero / MuZero design choice. You *could* train a
+Q-head that outputs 17 expected returns and pick the argmax. But
+the policy head learns a distribution, not a single estimate — it
+expresses *exploration uncertainty* in the same shape the MCTS
+search uses. At expansion time, the planner blends the WM policy
+prior into the UCB term:
+
+$$\text{prior}_\text{blended}(a) = (1 - \alpha) \cdot \pi_\text{LLM}(a) + \alpha \cdot \pi_\text{WM}(a)$$
+
+The WM-side prior is one component per action. If the WM has high
+confidence that `hybrid_search` is the right move, $\pi_\text{WM}$
+peaks near $1.0$ on that action and dilutes everything else. If the
+WM is uncertain, $\pi_\text{WM}$ stays close to uniform $(1/17)$ and
+contributes minimal information beyond the LLM prior.
+
+The fallback in `client.py:_decode` for the case where the response
+carries no `policy_prior` field defaults exactly to that uniform:
+
+```python
+if not policy:
+    for t in ToolName:
+        policy[t] = 1.0 / len(ToolName)
+```
+([`client.py:92-94`](https://github.com/starling-sh/perseus))
+
+### The visit-distribution parser bug
+
+A latent bug in the policy training pipeline is worth flagging
+because it killed an entire era of WMs silently. From
+[`HISTORY/28:425-427`](https://github.com/starling-sh/perseus):
+
+> Python `parse_visit_distribution` silently fell through to
+> uniform on object-list emit → Policy head trained against uniform
+> targets.
+
+The Rust `mcts_step_snapshots` table writes children as a JSON
+list-of-objects. The pre-2026-05-11 Python loader only handled
+`Dict[str, int]` and fell through to a uniform default on the
+object-list shape. So the policy head trained against uniform
+targets across the entire post-2026-04-23 corpus. Combined with the
+`terminal_reward = 0` contamination on the value head, **two of
+the four heads were training against degenerate targets** for ~3
+weeks before the T1–T9 audit landed
+([`HISTORY/28:423-446`](https://github.com/starling-sh/perseus)).
+
+This bug doesn't crash and doesn't surface as a loss-curve
+anomaly (uniform targets give plausible cross-entropy values); only
+an explicit validator catches it. The fix — T4 in the audit — is
+one of the cheapest patches in a 40-day research effort
+([`HISTORY/28:437`](https://github.com/starling-sh/perseus)).
+
+### Decoding the policy prior
+
+```python
+policy_raw = resp.get("policy_prior", {})
+policy: dict[ToolName, float] = {}
+if isinstance(policy_raw, dict):
+    for name, p in policy_raw.items():
+        try:
+            policy[ToolName(str(name))] = float(p)
+        except ValueError:
+            continue
+```
+([`client.py:84-91`](https://github.com/starling-sh/perseus))
+
+The `try/except ValueError` silently skips tool names the WM emits
+that aren't in the current enum — a deprecated tool from an older
+training run shouldn't crash deployment. The per-tool lookup at use
+time has a uniform default:
+
+```python
+def policy_prior_for(self, tool: ToolName) -> float:
+    return self.policy_prior.get(tool, 1.0 / max(len(self.policy_prior), 1))
+```
+([`heads.py:23-24`](https://github.com/starling-sh/perseus))
+
+If a tool isn't in the policy dict, return uniform. This avoids
+KeyErrors during MCTS expansion for tools that the WM never saw
+during training.
+
+---
+
+## Reward signal 5: Terminal reward $R$ — the value-target target
+
+Each head trains against its own target. But the value head's
+target is itself a downstream of the **terminal reward** $R$ — the
+scalar that defines whether a trajectory succeeded.
+
+From [`perseus/core/training/rewards.py:42-59`](https://github.com/starling-sh/perseus):
+
+```python
+def terminal_reward(
+    final_hits: list[Hit],
+    *,
+    gold_files: set[str] | None = None,
+    judge_label: float | None = None,
+) -> float:
+    if judge_label is not None:
+        return 2.0 * judge_label - 1.0    # map [0,1] to [-1, +1]
+    if gold_files:
+        top5 = {h.path for h in final_hits[:5]}
+        return len(top5 & gold_files) / max(len(gold_files), 1)
+    return 0.0
+```
+
+The three branches in math:
+
+$$R = \begin{cases}
+2 \cdot \text{judge\_label} - 1 & \text{if judge available, in } [-1, +1] \\
+|\text{top5} \cap G| / |G| & \text{else if gold files known, in } [0, 1] \\
+0 & \text{else (filter out of training data)}
+\end{cases}$$
+
+### Why judge_label is the truth-source
+
+`judge_label` comes from running the harness binary against the
+multi-bench gold tests. It's a deterministic ground truth — there's
+no statistical model interpreting the verdict, no calibration step,
+no human judgment. Pass means F2P tests pass and P2P tests are
+preserved. Anything else is fail or partial. From
+[`HISTORY/34:139-145`](https://github.com/starling-sh/perseus):
+
+> Same `{0.0, 0.5, 1.0}` shape ... derived from a different harness
+> binary. `HarnessVerdict::Resolved → 1.0`, `Unresolved / Errored →
+> 0.0`, `NotFound → harness_unsupported`.
+
+When this label is available, it's *the* truth. The affine $2 \cdot
+\text{judge\_label} - 1$ maps it to symmetric $[-1, +1]$ for HL-Gauss
+training.
+
+### Why file_recall is a fallback, not a primary signal
+
+File recall (top-5 hits intersected with the gold file set) is the
+fallback when judge_label is missing. It's a *proxy* — landing
+gold files in your top-5 hits is *necessary* for a successful patch
+but not *sufficient*. You could land all the gold files and still
+emit a wrong patch; the judge label would say fail, but file_recall
+would say $1.0$. Hence the precedence: judge first, file_recall
+second, zero last.
+
+### The 2026-05-11 T1–T9 audit
+
+This is the section that, in any honest research log, has to be
+addressed directly. The terminal reward fix is the single largest
+bug in the WM line.
+
+From [`HISTORY/28:401-417`](https://github.com/starling-sh/perseus):
+
+> `pick_terminal_reward(RewardSource::Judge)` in
+> `src/muzero/export.rs` was reading `MultiBenchRow.result` (always
+> NULL on the live `multi_bench_runs` table — that column was never
+> populated by either the multi-bench driver or the harness scoring
+> path). Combined with the binary's default `--reward-source
+> fileRecall` AND most invocations omitting `--dataset` (so
+> `gold_files` was empty too), every export produced parquet rows
+> with `terminal_reward = 0` ... Window: 2026-04-23 (first export) →
+> 2026-05-11 (fix). ~3 weeks of WM training off contaminated
+> targets.
+
+For 17 days, every checkpoint trained off `--reward-source judge`
+regressed toward zero by construction. The value head's R² was
+catastrophic not because the model was bad, not because the
+representation was wrong, not because the data was small — but
+because every row's target was literally 0.0 due to a NULL column
+read.
+
+What landed (commit `0022056a`, 2026-05-11):
+
+- **T1**: `MultiBenchRow` reads migration-008 columns.
+  ([`HISTORY/34:352-362`](https://github.com/starling-sh/perseus))
+- **T2**: `RewardSource::Judge` reads raw `judge_label`, masks
+  invalid sources (`harness_unsupported` / `harness_collided` →
+  $0.0$ regardless).
+  ([`HISTORY/34:364-371`](https://github.com/starling-sh/perseus))
+- **T3**: Binary default `--reward-source` flipped from
+  `fileRecall` to `judge`.
+  ([`HISTORY/34:374-376`](https://github.com/starling-sh/perseus))
+- **T4**: Python visit-distribution loader handles object-list shape.
+  ([`HISTORY/34:378-384`](https://github.com/starling-sh/perseus))
+- **T5**: `stratified_sample` dedupes triples.
+- **T6**: Harness-id collision guard.
+- **T7**: Backfill SQL.
+- **T8**: `judge_audit.py` honest-denominator report.
+- **T9**: The retraction text in `Claude.md` that names the
+  2026-05-05 entry as a fix that was specified but never landed.
+  ([`HISTORY/34:414-417`](https://github.com/starling-sh/perseus))
+
+T9 matters most. The 2026-05-05 `Claude.md` entry had claimed the
+terminal-reward fix shipped, with a 500-trajectory smoke histogram
+to prove it. The smoke never ran. The fix wasn't there. T9 is the
+strikethrough block — the original prose preserved verbatim with
+`~~strike~~` markers, so the project history reads honestly even on
+a casual scroll. The standard set by that retraction is
+articulated in the user's auto-memory: *don't overpromise; verify
+before claiming success — Sam lost a month to confident half-fixes;
+measure before declaring outcomes*. The 2026-05-05 entry violated
+that explicitly. The 2026-05-11 retraction is the institutional
+response.
+
+See [pipeline integrity audit](/essays/pipeline-integrity-audit/)
+for the full audit trace.
+
+---
+
+## Reward signal 6: Multi-head joint training — the joint loss
+
+All four heads share the same trunk. They train jointly. The total
+loss is a weighted sum:
+
+$$\mathcal{L} = \mathcal{L}_v + \lambda_j \mathcal{L}_j + \lambda_r \mathcal{L}_r + \lambda_\pi \mathcal{L}_\pi$$
+
+where:
+
+- $\mathcal{L}_v$ — cross-entropy of the value softmax over the
+  51-bin target (kernel-smoothed around the true $R$).
+- $\mathcal{L}_j$ — MSE of judge prediction against the affine-mapped
+  judge target $2 \cdot \text{judge\_label} - 1$, masked out when the
+  judge label isn't available.
+- $\mathcal{L}_r$ — MSE of step reward against the shaping signal
+  $r_t$ from §3 above, applied at every step.
+- $\mathcal{L}_\pi$ — cross-entropy of policy softmax against the
+  empirical MCTS visit distribution $\pi^M_t$.
+
+The $\lambda$ weights tune the relative contribution. In the v4
+trainer the values are roughly $\lambda_j \approx 0.5$,
+$\lambda_r \approx 0.5$, $\lambda_\pi \approx 1.0$ (see
+[`HISTORY/14:51-58`](https://github.com/starling-sh/perseus) — the
+v4 line drops judge in favour of fr/sr/prm/confirm, but the
+multi-head principle is preserved).
+
+### Why joint training beats single-head specialists
+
+The v3 chain sweep ran every single-head ablation. Quoting
+[`HISTORY/28:147-156`](https://github.com/starling-sh/perseus):
+
+| Variant | head focus | value_r2 | prm_r2 | fr_r2 | sr_r2 |
 |---|---|---|---|---|---|
-| chain ds prm only | PRM only | -0.161 | **0.535** | -0.079 | -2.56 |
-| chain ds value only | value only | -0.218 | -1.04 | -0.091 | -2.52 |
-| chain ds fr only | fr only | -0.159 | -1.80 | -0.370 | -2.53 |
-| chain ds sr only | sr only | -0.164 | -1.88 | -0.079 | -0.177 |
+| `v3_chain_ds_prm_only` | PRM only | -0.161 | **0.535** | -0.079 | -2.56 |
+| `v3_chain_ds_value_only` | value only | -0.218 | -1.04 | -0.091 | -2.52 |
+| `v3_chain_ds_fr_only` | fr only | -0.159 | -1.80 | -0.370 | -2.53 |
+| `v3_chain_ds_sr_only` | sr only | -0.164 | -1.88 | -0.079 | -0.177 |
 
-Zero every loss except one head and every other head's $R^2$ collapses to deeply negative. The PRM-only run gets the best PRM number anywhere but every other head loses signal. The trunk overfits to one head's noise and the latent geometry stops being useful for everything else.
+Notice what happens when you zero every loss except one head:
+**every other head's $R^2$ collapses to deeply negative**. The
+PRM-only run gets PRM R² 0.535 (the best PRM anywhere) but value
+R² $-0.161$, fr $-0.079$, sr $-2.56$. The trunk overfits to the
+single head's noise and loses the signal for everything else.
 
-Joint training is the regulariser. Auxiliary supervision pulls the trunk toward representations useful for multiple questions at once. The latent space stays anchored on multiple objectives simultaneously, which prevents pathological solutions where the trunk memorises a single head's training labels. The v4 production line generalised this further: it keeps five heads (value, confirm, file recall, step reward, PRM) and reports a value head at $R^2 = 0.997$ on the random-split champion. Even discounting for the trajectory leakage in random-row splitting, the floor of multi-head joint training in distribution is so much higher than any single-head specialist that the ablation question is closed.
+Multi-head joint training is the regulariser. Auxiliary supervision
+pulls the trunk toward representations that are useful for multiple
+questions at once. The geometry of the latent space stays anchored
+on multiple objectives simultaneously, which prevents pathological
+solutions where the trunk memorizes the single head's training
+labels.
 
-### 9.2 Loss-weight sensitivity
+The v4 production line generalised this: it kept 5 heads (value,
+confirm, fr, sr, prm) and reports its value head as $R^2 = 0.997$
+on the random-split champion
+([`HISTORY/14:83`](https://github.com/starling-sh/perseus)). Even
+acknowledging the trajectory leakage that inflates that number,
+the *floor* of multi-head joint training in distribution is so much
+higher than any single-head specialist that the ablation question is
+closed.
 
-The ratio $\lambda_j : \lambda_r : \lambda_\pi$ has to balance two competing pressures. Too much weight on policy and the trunk specialises to action distributions, which are noisy because visit counts depend on the exploration constant and tree budget; the value head loses signal because the trunk no longer encodes outcome-predictive features. Too much weight on value and the policy head trains against an under-regularised representation that does not encode action-conditional structure; the prior the planner consumes at expansion stops being useful. We landed at roughly unit weight on policy and half weight on auxiliary heads in v4. The honest story is that we never ran a clean grid over $\lambda$; the values were chosen by mechanical sympathy with v3 chain sweep results and held there. A proper sweep is one of the open items on the WM training-sweep essay.
+### What the joint loss looks like at inference
 
-## 10. How the heads feed UCB
+At inference we don't see the loss — we see the four head outputs
+decoded:
 
-The blend at expansion time is a single linear combination per action with the value prior pulled from the value head's normalised output:
+```python
+def _decode(resp: dict[str, object]) -> WmHeads:
+    if "value_logits" in resp:
+        value = decode_hl_gauss(list(resp["value_logits"]))
+    else:
+        value = float(resp.get("value", 0.0))
+    judge = float(resp.get("judge_value", 0.0))
+    step = float(resp.get("step_reward", 0.0))
+    policy_raw = resp.get("policy_prior", {})
+```
+([`client.py:77-84`](https://github.com/starling-sh/perseus))
 
-$$\text{prior}_{\text{blend}}(s, a) = (1 - \alpha) \cdot \pi_{\text{LLM}}(a \mid s) + \alpha \cdot v_{\text{norm}}(s).$$
+Note the conditional on `value_logits` vs `value`. If the wm-serve
+endpoint returns the full 51-dim logit vector, we decode it
+ourselves with `decode_hl_gauss`. If it returns the pre-decoded
+scalar `value`, we take it directly. This lets wm-serve choose
+whether to ship logits over the wire (cheap, defers decoding to
+client) or scalars (more compact, slight loss of fidelity if the
+client wanted to do anything other than expectation).
 
-Both priors are clamped to $[0, 1]$ before combination; the blend coefficient $\alpha$ is a hard-asserted operator setting, not a clamp. The asymmetry reflects provenance: $\alpha$ is set by the operator via an environment knob and a buggy value is a deployment mistake we want to surface loudly; the priors are model outputs and a buggy value is a model bug we want to absorb quietly into search rather than crash on.
+The four decoded values pack into `WmHeads`:
 
-The four heads serve this blend in different ways:
+```python
+@dataclass(slots=True)
+class WmHeads:
+    value_norm: float
+    judge_value_norm: float
+    step_reward_norm: float
+    policy_prior: dict[ToolName, float]
+```
+([`heads.py:16-21`](https://github.com/starling-sh/perseus))
 
-1. **Value** is the primary input. Normalised value is the WM prior in the canonical UCB blend. As of the 2026-05-18 emergency disable, $\alpha = 0.0$ (the live deployment ran at $0.9$ before, anchored on the inflated random-split $R^2$; the disable is staged-not-proven until a clean instance-split checkpoint deploys).
-2. **Judge** is surfaced in telemetry, not blended. Reserved for an alternative weighting strategy with its own $\alpha_j$.
-3. **Step reward** is telemetry only at inference time. Its training-time role is auxiliary loss that regularises the trunk.
-4. **Policy** is used at expansion as the WM-side prior in the per-action blend. The full 17-dim distribution feeds the UCB selection rule directly.
+All three scalar heads are pre-normalised. Policy is the raw 17-dim
+dict. This is what the MCTS planner receives at each expansion.
 
-The whole architecture is gated by an endpoint knob. Empty endpoint means the path is disabled, the WM query returns nothing, and the blend reduces to the unmodified LLM prior. In the canonical research-line codepath the WM is non-optional and an empty endpoint raises; in production the path fails open. The split is intentional: research-line consistency in the ADR-012 codepath, production resilience in the live planner.
+---
 
-### 10.1 Why $\alpha$ is the right control variable
+## How the four heads feed into UCB blending
 
-The blend coefficient $\alpha$ is the only knob exposed to operators. Two alternative parameterisations existed and we rejected both:
+The final step. From
+[`perseus/core/wm/blend.py`](https://github.com/starling-sh/perseus):
 
-1. **Multiplicative blending.** $\text{prior} = \pi_{\text{LLM}}^{1-\alpha} \cdot v_{\text{norm}}^\alpha / Z$ would treat the two priors as log-linear factors, which has the appeal of probabilistic interpretability (treat both as independent evidence on the same hypothesis). But it requires renormalisation and is unstable when either prior is near zero — a single confident-wrong WM near zero kills the entire blend. Linear is robust.
+```python
+def blend_prior(*, llm_prior: float, wm_prior: float, alpha: float) -> float:
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+    llm_prior = max(0.0, min(1.0, llm_prior))
+    wm_prior = max(0.0, min(1.0, wm_prior))
+    return (1.0 - alpha) * llm_prior + alpha * wm_prior
+```
 
-2. **Per-action $\alpha$.** $\text{prior}(a) = (1 - \alpha_a) \cdot \pi_{\text{LLM}}(a) + \alpha_a \cdot v_{\text{norm}}$ would let the operator trust the WM more on actions where it has historically been calibrated and less on others. The data-collection problem is severe — we would need per-action calibration histograms that update online — and the gain over scalar $\alpha$ is unclear when the WM is trained on a corpus spanning all actions jointly. Scalar $\alpha$ is the right starting point and we have not seen evidence it costs us anything.
+Two things to notice. First, both priors are explicitly clamped to
+$[0, 1]$. The contract for `blend_prior` is *strict* — out-of-range
+inputs get clamped silently. This is defensive in service of
+fail-open behaviour: if the WM emits a buggy probability, we don't
+want UCB to blow up; we want a slightly biased but functional
+search. Second, the $\alpha$ assertion is hard — out of $[0, 1]$ is
+a `ValueError`, not a clamp. That asymmetry reflects the
+provenance: $\alpha$ is set by the operator via
+`PERSEUS_WM_PRIOR_WEIGHT`, so a buggy value is a deployment
+mistake we want to surface loudly. The priors are model outputs,
+so a buggy value is a model bug we want to absorb quietly.
 
-The current emergency-disable at $\alpha = 0$ is not an endorsement of disabling the WM. It is a temporary measure pending a clean instance-split checkpoint. The pre-disable value of $\alpha = 0.9$ was anchored on the inflated random-split $R^2$ of the v4 champion; the audit established that random-row splits leak trajectory state between train and val, so the $R^2$ does not reflect generalisation. On production traffic the v4 predictions are roughly noise. At $\alpha = 0$ the WM probes still fire and emit telemetry visible to the dashboard, but contribute zero to UCB. We reverse the moment a clean instance-split checkpoint deploys, at a more conservative initial value (we are anchoring on $0.3$ until we see real evaluation signal).
+The four-head decomposition serves this blend in different ways:
 
-## 11. State serialisation: what the heads see
+- **Value** — the primary input. `value_norm` is the WM prior in
+  the canonical UCB blend. As of the live `wm_v4_random_split`
+  deployment, $\alpha = 0.0$ (the 2026-05-18 emergency disable —
+  see [wm in the loop](/essays/wm-in-the-loop/) for why). Pre-disable
+  default was $0.3$.
+- **Judge** — surfaced in telemetry (`wm_last_judge_value`) for
+  ops/dashboards. Not currently blended into UCB but available for
+  alternative blending strategies (e.g., a separate $\alpha_j$
+  weight for judge-vs-value priors).
+- **Step reward** — telemetry only at inference time. The actual
+  value comes from the training-time signal that fits the head.
+- **Policy** — used at expansion as the WM-side prior in the
+  per-action blend. The full 17-dim dict feeds into the UCB
+  selection rule directly.
 
-Every head conditions on the same state representation. We serialise the state to a single text blob:
+The whole architecture is gated by `PERSEUS_WM_ENDPOINT`. Empty
+endpoint means the path is disabled and `query_wm` returns `None`;
+`blend_prior` then returns the unmodified LLM prior, and the
+planner runs as before. From
+[`Claude.md` WM-in-the-Loop §Fail-open](https://github.com/starling-sh/perseus):
 
-$$s_t = \texttt{query} \,\|\, \texttt{tool}_t \,\|\, \texttt{args}_t \,\|\, \texttt{last\_failed\_tail}_{t-1}$$
+> Empty endpoint, transport error, HTTP non-2xx, decode error →
+> `query_wm` returns `None` and `blend_prior` returns the
+> unmodified LLM prior.
 
-The concatenation is structural rather than token-careful; the encoder is a 256-dimensional pooled output and the heads operate on that pool. Three observations explain why this serialisation is load-bearing:
+But the in-repo `WmClient` constructor is stricter — it raises if
+the endpoint is empty:
 
-1. **Query is shared across all steps in a trajectory.** Including it in $s_t$ means the encoder sees the query at every step, so the heads can condition on the goal. Without it, the value head would have to learn a generic "is this a good intermediate state" signal independent of what the trajectory is actually trying to solve, which is the wrong question.
+```python
+if not self.settings.wm_endpoint:
+    raise PerseusValidationError(
+        "wm_endpoint is empty. Perseus IS MuZero (ADR-012); the WM is non-optional."
+    )
+```
+([`client.py:25-28`](https://github.com/starling-sh/perseus))
 
-2. **Tool and args identify the action that produced the state.** Without them, two states reached by different actions but with the same downstream evidence would be indistinguishable to the heads, so the step-reward head would have no way to attribute shaping reward to the correct action and the policy head's training target would be conditional on information the input does not carry.
+That's the ADR-012 stance: in the canonical research-line Perseus,
+the WM is *non-optional*. Fail-open is a production-perseus
+behaviour, not a research-line behaviour. If you're running the
+ADR-012 codepath and forgot to set `PERSEUS_WM_ENDPOINT`, that's a
+configuration error and we want to surface it loudly. Compare with
+the Rust runtime client at
+`src/search/engine/llm_tree/runtime/wm_client.rs`, which is the
+fail-open path used by the live perseus planner.
 
-3. **The last failed tail carries adversarial counter-hypotheses from confirm-stop rejections.** When the planner proposes stopping a stem and the adversarial critic rejects, the counter-hypotheses feed into the next state. Including the last failed tail in $s_t$ lets the heads condition on what went wrong on the most recent attempt to stop, which is the most informative signal for whether the current state should also be stopped.
+---
 
-The state representation is deliberately structured, not raw token soup. We do not serialise the full branch lineage or the global digest into $s_t$ because the encoder's 256-dim pool cannot reliably encode that much heterogeneous content and the heads do not need it: the LLM planner sees the full context, the WM sees only the local state, and the blend at expansion time fuses the two perspectives.
+## Summary table — the four heads at a glance
 
-### 11.1 Why this is not a token-level model
-
-Several alternative architectures considered during the sweep tokenise $s_t$ and feed a transformer or RNN to produce a sequence-aware representation. We rejected these for the same reason we rejected single-scalar output: the heads do not need sequence-aware representations to do their job, and the cost of training a token-level model on the same data is an order of magnitude higher. The pooled encoder output captures enough state for the four heads to discriminate between successful and failed trajectory steps; we have empirical evidence in the form of 78 named training runs that confirm this.
-
-There is a more principled argument worth making: the heads operate at the level of trajectory steps, not at the level of token spans. A token-level head would have to internally re-pool to step granularity before computing per-step targets, which is just the same pooled encoder we already use with extra layers in front. The savings from skipping the token-level intermediate are real — we get more training iterations per unit GPU-hour, and the inference latency is low enough that the WM blend stays in budget at every expansion.
-
-### 11.2 Token budget and truncation
-
-The encoder context window is finite. We truncate $s_t$ to the encoder's maximum token budget by dropping the oldest content first — `last_failed_tail` survives, `args` survives, `tool` survives, `query` survives; anything that does not fit gets dropped from the middle of the args block. This is the right truncation order because the most recent failed-stem context is the most informative for the next stop decision, and the query and tool identity must survive at all costs because the heads condition on them.
-
-In practice truncation rarely triggers because the state representation is structured: tool names are short, args are JSON blobs of moderate size, and the failed tail is bounded by the planner's compaction rules. The encoder's 512-token context is sufficient for nearly all states the planner produces in the field, with rare excursions on extremely long failed-tail accumulations that we treat as out-of-distribution.
-
-## 12. Caching and latency
-
-The WM is queried once per expansion. With a 25-node MCTS tree per planner call and 5-10 planner calls per query, that is 125-250 WM calls per query. On a V100 the codet5p forward pass plus head MLPs runs about 30 ms uncached and 0.04 ms cached against the state-hash LRU. The LRU is 10,000 entries keyed on the SHA of the serialised state. Cache hit rate during MCTS expansion is high because the planner often re-expands sibling actions from the same state with different argument shapes that collide on the state hash after normalisation.
-
-The transatlantic call cost dominates when wm-serve runs on cato (US) and perseus runs on engram (Sweden). Round-trip is roughly 130 ms even cached, which dominates the 30 ms forward pass uncached and the 0.04 ms cached. For production training runs we co-locate the WM with perseus; for research-line ADR-012 we accept the latency to run a single canonical checkpoint shared across deployments. The fail-open path keeps the planner functional if the WM is unreachable.
-
-## 13. Failure modes the four-head design absorbs
-
-Some failure modes are specific to scalar-output WMs and disappear under the four-head decomposition:
-
-1. **Mode collapse on bimodal training data.** A scalar-MSE value head minimises loss by predicting the mean. HL-Gauss multi-modal mass-allocation absorbs this. Demonstrated empirically on the p3pp catastrophe.
-
-2. **Confusing exploration uncertainty with outcome uncertainty.** A single scalar cannot distinguish "I think this state has a 0.5 probability of leading to success" from "I have no idea, default uniform". The softmax policy head's entropy directly measures the latter; the value head's expectation measures the former. Operators can read both off the WM response and act differently — high-entropy policy plus mid-value means we should explore more; low-entropy policy plus mid-value means we should commit to the high-probability action.
-
-3. **Conflating per-step credit with terminal outcome.** Without a dedicated step-reward head, the value head must internally decompose a discounted return into per-step contributions. With a step-reward head, that decomposition is supervised directly from the shaping signal, freeing the value head to focus on the *expected* future return rather than the instantaneous one.
-
-4. **Loss of judge-versus-recall provenance.** A unified scalar with a single training target loses the information that some rows have a harness verdict (deterministic) and others only have file recall (heuristic proxy). The judge head's masked loss preserves that provenance: rows without harness labels contribute zero gradient to the judge head, but their file-recall-derived value target still trains the value head.
-
-5. **Inability to fail open at deployment.** A single scalar would have to be either trusted or untrusted as a whole. The four-head design lets the operator selectively trust subsets — currently we trust the policy head's structure but disable the value head's UCB contribution. That partial-trust mode is impossible to express in a single-scalar design.
-
-## 14. Summary
-
-| Head | Question | Output shape | Loss | Normalisation | Target source |
+| Head | Question | Output shape | Loss | Normalization | Target source |
 |---|---|---|---|---|---|
-| Value | $\mathbb{E}[R \mid s]$ | 51-bin softmax over $[V_{\min}, V_{\max}]$ | cross-entropy on kernel-smoothed target | $(v - V_{\min})/(V_{\max} - V_{\min})$ | discounted terminal reward $R$, $\gamma = 0.95$ |
-| Judge | $\Pr[\text{judge accepts} \mid s]$ | tanh scalar in $(-1, +1)$ | MSE, masked | $(j + 1)/2$ | $2 \cdot \text{judge\_label} - 1$ from harness verdict |
-| Step reward | $r_t$ at this state | signed scalar | MSE per step | $\tanh(r)$ | shaping signal from §5 |
-| Policy | $\pi(\cdot \mid s)$ | softmax over 17 tools | cross-entropy | identity (already in simplex) | $\pi^M_t = N(s, a)/N(s)$ from MCTS visits |
+| Value | $E[R \mid s]$ | 51-bin softmax over $[V_\text{min}, V_\text{max}]$ | cross-entropy | $(v - V_\text{min})/(V_\text{max} - V_\text{min})$ | discounted terminal reward $R$, $\gamma = 0.95$ |
+| Judge | $\Pr[\text{judge accepts} \mid s]$ | tanh scalar in $(-1, +1)$ | MSE (masked) | $(j + 1)/2$ | $2 \cdot \text{judge\_label} - 1$ from harness verdict |
+| Step reward | $r_t$ at this state | signed scalar | MSE | $\tanh(r)$ | shaping signal from §3 |
+| Policy | $\pi(\cdot \mid s)$ | softmax over 17 tools | cross-entropy | identity (already in simplex) | $\pi^M_t = N(s, a) / N(s)$ from MCTS visits |
 
-Each row is a different question, a different target, a different normalisation. The trunk is shared, the heads are independent, and the joint loss is what makes it train together. Four heads, one trunk.
+Each row answers a different question. Each loss has a different
+target. Each normalization handles a different range. The trunk is
+shared, the heads are independent, and the joint loss is what makes
+it all train together.
 
-## 15. Open questions
+That's the WM. Four heads, one trunk.
 
-Three things remain unresolved and worth flagging:
+---
 
-1. **Instance-split generalisation.** The headline $R^2$ numbers on the v4 line come from random-row splits that leak trajectory state between train and val. Clean instance-split numbers are an order of magnitude lower (terminal-reward $R^2 = 0.112$, file-recall $R^2 = 0.119$, PRM $R^2 = 0.279$ on v3 chain-DeepSets, the only checkpoint with honest baseline metrics). We do not yet have a v4 checkpoint trained on the clean instance-split. Until we do, the WM blend coefficient stays at zero in production.
+## Cross-links
 
-2. **Loss-weight sweep.** We never ran a clean grid over $\lambda_j, \lambda_r, \lambda_\pi$. The values held in v4 are inherited from v3 mechanical sympathy. A proper sweep would tell us whether the joint loss is balanced or whether we are leaving signal on the floor.
+- [muzero pipeline](/essays/muzero-pipeline/) — how trajectories
+  flow from `multi_bench_runs` + `query_traces` + `planner_events`
+  + `tool_events` + `mcts_step_snapshots` into training parquet.
+- [wm training sweep](/essays/wm-training-sweep/) — the 78+ named
+  runs, architecture ablations, random-split vs instance-split.
+- [wm in the loop](/essays/wm-in-the-loop/) — RL closure at MCTS
+  expansion; the 2026-05-18 $\alpha = 0.0$ emergency disable.
+- [p3pp catastrophe](/essays/p3pp-codet5p-220m/) — the $R^2 = -745$
+  run that started the trail toward T1–T9.
+- [multi-swe-bench wiring](/essays/multi-swe-bench-wiring/) — the
+  harness that emits the judge labels.
+- [nano judge distillation](/essays/nano-judge-distillation/) — the
+  16-dim calibrated targets the judge head was specced against.
+- [pipeline integrity audit](/essays/pipeline-integrity-audit/) —
+  T1–T9 fix set + the 2026-05-05 retraction.
 
-3. **Per-action calibration.** The WM is presumably better-calibrated on some actions than others — high-traffic actions like `search_text` get more training data than low-traffic actions like `give_up`. A per-action calibration histogram could feed a per-action $\alpha_a$ blend. We have not investigated this; scalar $\alpha$ is the right starting point but probably not the steady-state design.
+---
 
-The four-head decomposition is settled. The trunk is settled. What remains is the calibration story, the loss-weight story, and the deployment story. Each is its own essay.
+## Sources
+
+- `perseus/core/wm/heads.py` 1-48 — `WmHeads`, `VMIN`/`VMAX`,
+  `decode_hl_gauss`, `value_to_norm`, `judge_to_norm`,
+  `step_reward_to_norm`.
+- `perseus/core/wm/client.py` 1-100 — `WmClient`, `_serialize_state`,
+  `_decode`, ADR-012 non-optional enforcement.
+- `perseus/core/wm/blend.py` 1-10 — `blend_prior` clamps.
+- `perseus/core/training/rewards.py` 1-59 — `shape_step_reward` +
+  `terminal_reward`.
+- `perseus/core/actions.py` — `ToolName` enum (17 entries).
+- `Claude.md` — WM-in-the-Loop (2026-05-10); T1–T9 audit (2026-05-11);
+  α emergency disable (2026-05-18).
+- `HISTORY/14_wm_training.md` 51-58 (v4 heads), 83 (champion stats),
+  117-124 (single-head ablations).
+- `HISTORY/28_muzero_wm_research.md` 78 (Phase-2 arch), 99-200 (chain
+  sweep), 147-156 (head ablations), 199-289 (v4 grid), 308-315
+  (p3pp catastrophe), 401-446 (T1–T9), 482-498 (bootstrap stats),
+  568-668 (load-bearing insights).
+- `HISTORY/34_reward_modeling.md` 45-90 (Math-Shepherd), 94-145
+  (SWE-bench judge), 147-198 (multi-swe-bench), 202-264 (collisions),
+  267-343 (retracted entry), 347-433 (T1–T9), 437-523 (nano
+  distillation status).

@@ -18,13 +18,7 @@ const TIER_NAMES: Record<Tier, string> = {
 const all = await getCollection("essays", ({ data }) => data.status !== "draft");
 
 const grouped: Record<Tier, typeof all> = {
-  pipeline: [],
-  wm: [],
-  planner: [],
-  reward: [],
-  retrieval: [],
-  audits: [],
-  infra: [],
+  pipeline: [], wm: [], planner: [], reward: [], retrieval: [], audits: [], infra: [],
 };
 
 for (const entry of all) {
@@ -108,9 +102,7 @@ function fmtDate(d: Date): string {
     padding: 3rem var(--page-pad) 6rem;
   }
 
-  .hero {
-    margin-bottom: 3rem;
-  }
+  .hero { margin-bottom: 3rem; }
 
   .hero h1 {
     font-size: 56px;
@@ -137,11 +129,7 @@ function fmtDate(d: Date): string {
     color: var(--text);
   }
 
-  .essay-list {
-    list-style: none;
-    padding: 0;
-    margin: 0.75rem 0 0;
-  }
+  .essay-list { list-style: none; padding: 0; margin: 0.75rem 0 0; }
 
   .essay-row {
     display: grid;
@@ -151,10 +139,7 @@ function fmtDate(d: Date): string {
     border-bottom: 1px solid var(--rule);
     align-items: baseline;
   }
-
-  .essay-row:last-child {
-    border-bottom: 0;
-  }
+  .essay-row:last-child { border-bottom: 0; }
 
   .essay-title {
     font-size: 15.5px;
@@ -162,10 +147,7 @@ function fmtDate(d: Date): string {
     color: var(--text);
     border-bottom: 0;
   }
-
-  .essay-title:hover {
-    color: var(--link-hov);
-  }
+  .essay-title:hover { color: var(--link-hov); }
 
   .essay-meta {
     text-align: right;
@@ -179,14 +161,7 @@ function fmtDate(d: Date): string {
   }
 
   @media (max-width: 640px) {
-    .essay-row {
-      grid-template-columns: 1fr;
-      gap: 0.35rem;
-    }
-    .essay-meta {
-      text-align: left;
-      flex-direction: row;
-      gap: 0.75rem;
-    }
+    .essay-row { grid-template-columns: 1fr; gap: 0.35rem; }
+    .essay-meta { flex-direction: row; gap: 0.75rem; text-align: left; }
   }
 </style>

@@ -8,453 +8,687 @@ related: ["the-reset","pipeline-integrity-audit","reward-modeling","wm-in-the-lo
 readTime: 11
 ---
 
-We claim that the four contamination incidents that landed in perseus's training pipeline between 2026-04-23 and 2026-05-18 are not four bugs. They are four instances of one bug: a pipeline node silently substitutes a *labeled* value for an *unknown* one, and a downstream consumer treats the substituted label as ground truth. Fixing each instance produces four patches and a fifth incident next month. Fixing the class — via ADR-004 (no-silent-fallback) and ADR-005 (checkpoint provenance metadata) — closes the family. This essay argues the class.
+> tl;dr: Over 30 days perseus's training pipeline produced four
+> distinct shapes of contaminated data. Each had a one-line proximate
+> fix and a several-hundred-row blast radius. The interesting fact is
+> that they share a generative structure: a node in the pipeline
+> silently produced a *labeled* value where the truth was *unknown*,
+> and a downstream consumer treated the labeled value as ground truth.
+> The fix-the-instance approach yields four patches and a fifth bug
+> next month. The fix-the-class approach is two architectural
+> decisions — ADR-004 (no-silent-fallback) and ADR-005 (checkpoint
+> provenance metadata) — applied uniformly. This essay treats the
+> class.
 
-The generative identity, stated once, holds across all four shapes:
+## 1 Four shapes in one window
 
-$$
-\text{truth} = \mathtt{UNKNOWN} \xrightarrow{\text{silent default}} \text{stored} = \mathtt{LABELED} \xrightarrow{\text{consumer trusts label}} \text{contamination}
-$$
+Between 2026-04-23 and 2026-05-18 — roughly the entire production
+window of perseus v2's training pipeline — four contamination incidents
+landed in `multi_bench_runs` and the WM checkpoints trained from it.
+Each was discovered by a different person on a different day and
+fixed in a different commit. Each was treated as a one-off until the
+2026-05-18 retraction pass forced the comparison.
 
-The four shapes differ only in what `UNKNOWN` got renamed to and which consumer trusted the rename. We will write each shape's identity as a map from the truth state to the stored state, and the contamination follows mechanically. Reading each section is mostly a matter of identifying the substitution arrow and the volume bound it produces.
+The four shapes, ordered by detection date:
 
-A second framing, equivalent in content: each shape is a violation of the rule that the conditional distribution of the stored value $\hat{y}$ given the truth $y$ must preserve the marginal $\Pr[y = \mathtt{UNKNOWN}]$. Silent default substitution sets $\Pr[\hat{y} = \mathtt{UNKNOWN}] = 0$ while $\Pr[y = \mathtt{UNKNOWN}] > 0$. The estimator is no longer unbiased; the bias is structurally toward the substituted value. For perseus, all four substitutions biased toward the *negative* class (zero reward, FAIL verdict, low generalization signal), so the contamination consistently *underestimated* perseus capability — but the direction is incidental to the class.
-
-## 1. Four shapes in a 30-day window
-
-Each shape was discovered by a different engineer on a different day and fixed in a different commit. Each was treated as a one-off until the 2026-05-18 retraction pass forced the side-by-side.
-
-| Shape | Detected | Rows affected | Days live | Proximate fix |
+| Shape | Date detected | Rows affected | Days live | Fix |
 |---|---|---|---|---|
-| A — over-fanned key | 2026-05-11 | 3,314 collided + ~1,730 unfanned twins | ~9 | T6 collision guard |
-| B — silent default | 2026-05-11 | every WM ckpt 2026-04-25 → 2026-05-11 | 17 | T1+T2 plumbing |
-| C — enum collapse | 2026-05-11 | 786 rows | ~9 | T6 distinct enum value |
-| D — train/val leakage | 2026-05-18 | 6,545 perseus rows poisoned by alpha=0.9 | 8 | ADR-005 instance split |
+| A — over-fanned key (collision) | 2026-05-11 | 3,314 collided + ~1,730 unfanned twins | ~9 days | T6 collision guard |
+| B — silent default (NULL → 0.0) | 2026-05-11 | every WM ckpt trained 2026-04-25 → 2026-05-11 | 17 days | T1 + T2 plumbing |
+| C — enum collapse (invocation_failed) | 2026-05-11 | 786 rows | ~9 days | T6 distinct enum value |
+| D — train/val leakage (row split) | 2026-05-18 | 6,545 perseus rows poisoned by α=0.9 ckpt | 8 days | ADR-005 instance split |
 
-We claim the table looks like four unrelated rows and reads like one law. The remainder of this essay defends that reading.
+Four bugs, four fixes, four blast radii. Treat them individually and
+the pattern is invisible. Stack them and the generative model is
+obvious.
 
-## 2. Shape A — over-fanned key
+## 2 Shape A — over-fanned key
 
-The Multi-SWE-bench harness keys each verdict by the triple `(org, repo, pr_n)`. Perseus's multi-bench grid produces $M = 5$ models times $C = 2$ conditions of every upstream PR, giving $M \cdot C = 10$ rows in the runs table per upstream PR. The harness, however, assumes one row per key, so it writes exactly one verdict to its `final_report.json`. The pre-fix demultiplexer was equivalent to a deterministic function
+The Multi-SWE-bench harness keys verdicts by `<org>/<repo>:pr-<N>`.
+Perseus's multi-bench corpus produces five model variants times two
+conditions of every upstream PR, giving ten rows in
+`multi_bench_runs` that map to one harness key. The harness writes
+one `final_report.json` entry per key. Pre-fix, the demultiplexer
+fanned that single verdict to all ten rows.
 
-$$
-\text{label}(r) := \text{verdict}\bigl(\text{key}(r)\bigr)
-$$
-
-which is correct when keys are unique and silently wrong when the fan-out factor exceeds one. The harness picks *whichever patch it happened to score last* per key, non-deterministically, so the broadcast verdict for the other nine siblings is a function of harness scheduling rather than the patch under test. Direction of bias is set by which `prediction.patch` got scored, not by the patch content.
-
-We bound the contamination volume by
-
-$$
-|\text{contaminated}| \le \sum_{k \in \mathcal{K}_{\text{fanned}}} (n_k - 1), \quad n_k = |\{r : \text{key}(r) = k\}|
-$$
-
-On the live table, this sum is 3,314 rows tagged `harness_collided` after the T6 audit, plus an estimated ~1,730 sibling rows whose verdict was correct only by accident. Pre-fix, all of them counted as real harness verdicts in any dashboard or downstream cohort.
-
-The structural fix is to refuse to label the unknowable case. The T6 patch in the multi-swe-bench runtime groups rows by `instance_id` before invoking the harness; any group of size greater than one writes `judge_source = 'harness_collided'` and leaves `judge_label` NULL for every member. Rows are preserved, not deleted, so they can be re-judged later in single-row batches. The generative identity holds: when the harness cannot disambiguate, the truth is *we don't know whose verdict this is*, and the pipeline now stores `NULL` rather than guessing.
-
-The math per shape, stated explicitly. For Shape A the truth state and stored state are
+Mechanically:
 
 $$
-y(r) = \text{true verdict for }r, \qquad \hat{y}(r) = \text{verdict}\bigl(\text{key}(r)\bigr)
+\text{harness\_key}(\text{row}) = (\text{org}, \text{repo}, \text{pr\_n})
 $$
 
-and the substitution is $\hat{y}(r) = \hat{y}(r')$ whenever $\text{key}(r) = \text{key}(r')$, which holds for all $r, r'$ in any group of size greater than one. The bias on the label distribution is computable: if the harness scores patches uniformly at random within a key, the broadcast label is the true verdict with probability $1/n_k$ for each row $r$ in a group of size $n_k$, so expected label accuracy is $1/n_k$. With $n_k = 10$ this is 10%. The substituted label is approximately uniform random over the value the harness happened to score, which destroys most of the signal even when individual rows by accident receive a correct verdict.
-
-## 3. Shape B — silent default
-
-The judge-label columns landed in the schema on 2026-04-23 via migration 008. The Rust row struct did not gain the matching fields. Every `SELECT * FROM multi_bench_runs` silently dropped the four new columns. Compounding this, the terminal-reward extractor read a different column — `result` — that is NULL on every row produced by the modern driver. The matched pattern was `Some("pass")`, which on NULL becomes `None`, which is `false`, which maps to `terminal_reward = 0.0`. The full chain is the trivial composition
-
 $$
-\mathtt{result} = \mathtt{NULL} \;\Rightarrow\; \mathrm{Option::as\_deref} = \mathtt{None} \;\Rightarrow\; \mathrm{matches}(\mathtt{Some("pass")}) = \bot \;\Rightarrow\; r_T = 0
+|\{\text{rows} : \text{key}(r) = k\}| = M \cdot C
 $$
 
-For 17 days every WM checkpoint trained under judge-source rewards saw constant-zero terminal labels. The HL-Gauss head, which discretizes the reward target into 51 bins over $[-10, +2]$, observed only the per-step shaping signal in $[-2.0, +0.285]$. The value head learned to predict $\approx 0 + \text{shaping noise}$. The 2026-05-05 Claude.md entry claimed this exact bug had been fixed; the 2026-05-11 audit found the fix had been *specified but never landed*. The strikethrough'd entry now reads (verbatim, kept as historical record): "~~2026-05-05 — muzero-export value\_target fix~~ — **Retracted 2026-05-11**: this entry described a fix that was specified but NEVER landed in code."
-
-Honest behavior is to raise. The terminal-reward extractor now reads `judge_label`, returns `Ok(label)` when the column is in $[0, 1]$, and returns `Err(Unlabeled)` when the column is NULL. The export binary either filters unlabeled rows or fails loudly. Both options preserve the truth that *we don't have a label*. Returning $0.0$ does not.
-
-Generative model: identical to Shape A. The node returned a labeled value where the truth was *unknown*. The fix is identical in shape: refuse to label the unknown.
-
-The shape math: Shape B substitutes
+where $M = 5$ models and $C = 2$ conditions. The harness assumes
+$|\cdot| = 1$ and writes one verdict per key. The demultiplexer's
+operation was:
 
 $$
-y(r) = \mathtt{NULL} \;\longmapsto\; \hat{y}(r) = 0
+\text{label}(r) := \text{verdict}(\text{key}(r))
 $$
 
-on a fraction of rows that is empirically 100% under the modern driver, because the `result` column is NULL by construction. The distribution of the substituted label is a delta at zero. The HL-Gauss target is a Gaussian smear around zero rather than a one-hot at the correct bin. For the 17-day window, the value-head training loss is
+which is the correct rule when keys are unique and the wrong rule
+when keys are over-fanned. The verdict that wins for a given
+key is *whichever patch the harness happened to score last*, which
+the harness picks non-deterministically. Direction of bias depends
+on which `prediction.patch` the harness grabbed.
 
-$$
-\mathcal{L}_v = \mathbb{E}_{(s, r_T)} \bigl[ D_\text{KL}\bigl(p_\text{HL-Gauss}(r_T) \,\|\, p_\theta(\cdot \mid s)\bigr) \bigr], \quad r_T = 0
-$$
+The post-fix detection rule, landed in T6 (`mswebench_runtime.rs`
+Phase 1.5), groups by instance_id before invoking the harness:
 
-so the value head converges to the zero-bin posterior, which is in $[-2.0, +0.285]$ per the per-step shaping contribution, and zero out-of-trajectory generalization signal is learned. Detection only happened when the audit traced *why* WM checkpoints stopped improving on the validation parquet; the loss curve itself looked monotonically decreasing because the target was a constant.
+```rust
+let groups: HashMap<InstanceId, Vec<Row>> = batch
+    .iter()
+    .fold(HashMap::new(), |mut m, r| {
+        m.entry(r.instance_id.clone()).or_default().push(r.clone());
+        m
+    });
 
-## 4. Shape C — enum collapse
-
-The multi-swe-bench harness occasionally exits non-zero on collision-heavy batches without writing `final_report.json`. Pre-fix, the runtime recovered the partial results, wrote them with `judge_source = 'mswebench_harness'`, and stamped `judge_label = 0.0` on every row in the batch — including rows that had no corresponding entry in the partial report. Two distinct semantic categories collapsed onto one label:
-
-$$
-\{\,\text{harness returned FAIL}\,,\;\text{harness never ran}\,\} \mapsto 0.0
-$$
-
-786 rows on the live table now sit in `harness_invocation_failed` after detection. Pre-fix they were indistinguishable from real FAIL verdicts. The structural bias matters: invocation failures cluster on hard-to-invoke instances (large repos, slow Docker pulls, flaky CI), so the contamination favored *the appearance of failure on exactly the hard instances we most needed to measure*. This is not random label noise; it is adversarial label noise against the difficult tail.
-
-The fix introduces a distinct enum value, `harness_invocation_failed`, and leaves `judge_label` NULL. The downstream terminal-reward gate masks the judge-value gradient for rows in any of `harness_collided`, `harness_invocation_failed`, or `harness_unsupported`. Zeroed rows contribute no signal even when they coincidentally shape-match real fails. The same identity again: distinct truth states must not collapse onto the same label.
-
-The shape math: Shape C substitutes a two-element truth space onto a one-element label space,
-
-$$
-y \in \{\text{FAIL}, \text{NEVER\_RAN}\} \;\longmapsto\; \hat{y} = 0
-$$
-
-with empirical fraction of `NEVER_RAN` rows on the live table at 786 of approximately $n$ rows in the affected window, where the conditional probability $\Pr[\text{NEVER\_RAN} \mid \text{instance is hard}] \gg \Pr[\text{NEVER\_RAN} \mid \text{instance is easy}]$. The contamination is therefore *correlated with instance difficulty*, which means the headline pass rate is biased downward by an amount that depends on the difficulty distribution of the sweep. For perseus this is the adversarial pattern: the harder the instance, the more likely the contamination, the more confident the bias against perseus capability. The class identity holds — the substitution maps an unknown state to a labeled one — but the operational consequence is sharper than for Shape B, because the bias direction is *systematic* rather than uniform.
-
-## 5. Shape D — train/val leakage
-
-The WM v4 ablation `wm_v4_random_split` hit val\_r2 = 0.997. Four sibling configurations reproduced 0.997 ± 10⁻³. The reproducibility looked like architectural strength; it was a corpus property.
-
-The corpus is a sequence of trajectories. Each trajectory is a sequence of steps. Every step in trajectory $\tau$ carries the same terminal reward:
-
-$$
-r_T(s) = R(\tau(s)) \quad \forall s \in \tau
-$$
-
-A uniform-random 80/10/10 row split distributes steps of one trajectory across train, val, and test. Predicting $r_T$ on a val row reduces to retrieving the trajectory ID from the state embedding and looking up any sibling row in train. Generalization is not measured; trajectory-ID memorization is.
-
-The honest measurement is an instance-keyed split: hold out entire instances, not rows. Under that split, the same checkpoint scored val\_r2 $\approx 0.114$. The corpus has 691 passes over 19,881 rows ($\approx 3.5$% pass rate); a constant predictor of "fail with confidence 0.965" trivially scores $\approx 0.997$ R² against the row-leaked distribution.
-
-The production blend deployed `wm_v4_random_split` at $\alpha = 0.9$, meaning the LLM prior contributed 10% and the WM-derived prior contributed 90% of the UCB weight:
-
-$$
-\pi(a \mid s) = (1 - \alpha) \cdot \pi_\text{LLM}(a \mid s) + \alpha \cdot \pi_\text{WM}(a \mid s), \quad \alpha = 0.9
-$$
-
-The pipeline produced a *labeled* generalization measurement where the truth was *we measured memorization*. Same identity.
-
-The shape math: Shape D substitutes the metric
-
-$$
-y = \mathrm{R}^2\bigl(\text{val rows from held-out instances}\bigr) \;\longmapsto\; \hat{y} = \mathrm{R}^2\bigl(\text{val rows leaked from train trajectories}\bigr)
-$$
-
-with $\hat{y} - y \approx 0.997 - 0.114 \approx 0.88$. The bias is enormous and unidirectional. The conditional structure is: given that the row-random split with high probability places sibling rows in train and val, the embedding distance between train and val rows of the same trajectory is bounded by the embedding model's intra-trajectory similarity, which is empirically small. Memorization via embedding retrieval is therefore the optimal strategy under the loss, and the model learns exactly that.
-
-## 5b. Per-shape corruption flow
-
-Before the class identity diagram, the four shapes side-by-side, each as a column showing how truth enters the pipeline, where the silent substitution happens, and what the downstream consumer ends up training on. Reading column by column reveals the substitution arrow is structurally identical across all four; only the names and volumes differ.
-
-```mermaid
-flowchart TB
-    subgraph A [Shape A - fan-out]
-        A1["truth\n10 sibling rows\nshare one key"]
-        A2["harness writes\none verdict per key"]
-        A3["substitution\nlabel(r) = verdict(key(r))\nfor all r in group"]
-        A4["downstream\nWM trains on\n9 wrong + 1 right per group"]
-        A1 --> A2 --> A3 --> A4
-    end
-
-    subgraph B [Shape B - silent default]
-        B1["truth\njudge_label is NULL\nresult column never populated"]
-        B2["Rust struct\ndrops migration-008 columns"]
-        B3["substitution\nNone -> match fails\n-> r_T = 0.0"]
-        B4["downstream\n17 days of WM ckpts\ntrained on constant zero"]
-        B1 --> B2 --> B3 --> B4
-    end
-
-    subgraph C [Shape C - enum collapse]
-        C1["truth\nharness crashed\nbefore writing report"]
-        C2["runtime recovers partial\nstamps judge_label = 0.0"]
-        C3["substitution\nNEVER_RAN and FAIL\ncollapse to same label"]
-        C4["downstream\n786 hard instances\nlook like real fails"]
-        C1 --> C2 --> C3 --> C4
-    end
-
-    subgraph D [Shape D - leakage]
-        D1["truth\nshared y_i across\nall steps of T_i"]
-        D2["random row split\ndistributes sibling rows\nacross train and val"]
-        D3["substitution\nval R-squared measures\nfingerprint lookup"]
-        D4["downstream\nalpha = 0.9 for 8 days\non memorization probe"]
-        D1 --> D2 --> D3 --> D4
-    end
-
-    style A3 fill:#fdd
-    style B3 fill:#fdd
-    style C3 fill:#fdd
-    style D3 fill:#fdd
-    style A4 fill:#fbb
-    style B4 fill:#fbb
-    style C4 fill:#fbb
-    style D4 fill:#fbb
+for (id, rows) in groups {
+    if rows.len() > 1 {
+        for row in rows {
+            store.set_judge_source(row.run_id, JUDGE_SOURCE_COLLIDED);
+            store.set_judge_label(row.run_id, None);
+        }
+        continue;
+    }
+    submit_to_harness(rows[0])
+}
 ```
 
-Each column has the same three-arrow structure: truth state, a substitution node where the silent default is applied, and a downstream consumer that treats the substituted value as ground truth. The substitution nodes (pink) are the load-bearing failure points; the downstream nodes (red) are the visible damage. Erasing any substitution arrow and replacing it with an explicit refusal-to-label (NULL or typed error) breaks the chain at the cheap intervention point.
+Rows are preserved (not deleted) so they can be re-judged later in
+single-row batches. The post-fix count on the live table is **3,314
+rows** in `harness_collided`. Pre-fix, those rows would have been
+counted as real `mswebench_harness` verdicts in any dashboard or
+downstream consumer.
 
-## 6. The class, in one diagram
+Generative model of the bug: the data-pipeline silently produced a
+labeled verdict where the truth was *we don't know which patch this
+verdict belongs to*. The fix is to refuse to label the unknowable
+case, not to guess.
+
+## 3 Shape B — silent default
+
+`MultiBenchRow` is the Rust struct that maps `multi_bench_runs`
+rows. Migration 008 (`migrations/008_judge_labels.sql`, landed
+2026-04-23) added four columns to Postgres: `judge_label`,
+`judge_source`, `judge_detail`, `judge_labeled_at`. The Rust struct
+was never updated. Every `SELECT * FROM multi_bench_runs` silently
+dropped the four new columns.
+
+Combined with two adjacent defaults — `pick_terminal_reward` matched
+on `row.result.as_deref() == Some("pass")`, and `result` is NULL on
+every row produced by the modern driver — every trajectory mapped
+to `terminal_reward = 0.0`.
+
+The chain:
+
+$$
+\text{result} = \text{NULL}
+$$
+$$
+\Rightarrow \text{result.as\_deref()} = \text{None}
+$$
+$$
+\Rightarrow \text{matches(Some("pass"))} = \text{false}
+$$
+$$
+\Rightarrow \text{terminal\_reward} = 0.0
+$$
+
+For 17 days (2026-04-25 to 2026-05-11), every WM checkpoint trained
+under `--reward-source judge` got constant-zero terminal rewards.
+HL-Gauss bins in $[-10, +2]$ saw only `value_target` from per-step
+shaping in $[-2.0, +0.285]$. The value head learned to predict 0
+plus shaping noise. The 2026-05-05 Claude.md entry claimed this was
+fixed; the 2026-05-11 audit found the fix had been *specified but
+never landed*. The Rust struct didn't carry the migration-008
+columns, every `SELECT` silently dropped them, and the export
+still matched on the NULL `result` column.
+
+The Claude.md retraction, kept verbatim as historical record:
+
+> ~~2026-05-05 (Asia/Kolkata) — muzero-export value_target fix~~
+> **Retracted 2026-05-11**: this entry described a fix that was
+> specified but NEVER landed in code.
+
+Source: Claude.md "Last Updated" 2026-05-11 entry.
+
+The correct behavior is to raise:
+
+```rust
+fn pick_terminal_reward(row: &MultiBenchRow) -> Result<f32, RewardError> {
+    match row.judge_label {
+        Some(label) if (0.0..=1.0).contains(&label) => Ok(label),
+        Some(other) => Err(RewardError::OutOfRange(other)),
+        None => Err(RewardError::Unlabeled(row.run_id.clone())),
+    }
+}
+```
+
+The export binary then either filters unlabeled rows or fails
+loudly. Both options are honest. The pre-fix path was to silently
+return 0.0, which is a labeled value when the truth was *unknown*.
+
+Generative model of the bug: same as Shape A. A node returned a
+*labeled* value when the truth was *we don't have a label*. The
+fix is identical in shape: refuse to label the unknown.
+
+## 4 Shape C — enum collapse
+
+The mswebench harness occasionally exits non-zero on collision-heavy
+batches without writing `final_report.json`. Pre-fix, the runtime
+recovered the partial results it had, wrote them with
+`judge_source = 'mswebench_harness'`, and stamped `judge_label = 0.0`
+on every row in the batch — including the ones that had no
+corresponding entry in the partial report.
+
+The label space conflation:
+
+$$
+\{\text{harness\_returned\_FAIL}, \text{harness\_never\_ran}\} \rightarrow 0.0
+$$
+
+786 rows on the live table sit in this bucket post-detection
+(`harness_invocation_failed`). Pre-fix, they were
+`mswebench_harness, judge_label=0.0`, indistinguishable from real
+FAIL verdicts. Headline pass rate was computed against a denominator
+that included 786 phantom zeros, which clustered systematically on
+the hardest-to-invoke instances (large repos, slow Docker pulls,
+flaky CI). The denominator was wrong in a direction that *favored
+the appearance of failure* — not random noise, structural bias
+against challenging instances.
+
+The fix (T6, same file, same audit) adds a distinct enum value:
+
+```rust
+pub const JUDGE_SOURCE_HARNESS: &str = "mswebench_harness";
+pub const JUDGE_SOURCE_COLLIDED: &str = "harness_collided";
+pub const JUDGE_SOURCE_INVOCATION_FAILED: &str = "harness_invocation_failed";
+pub const JUDGE_SOURCE_UNSUPPORTED: &str = "harness_unsupported";
+```
+
+Rows in `harness_invocation_failed` carry `judge_label = NULL`, not
+0.0. The downstream consumer (`terminal_reward_from_judge` in
+`src/muzero/export.rs`) gates all three non-harness tags to 0.0 *and
+masks the judge_value gradient*. Zeroed rows contribute no signal
+even when shape-matching real fails.
+
+Generative model of the bug: distinct categories collapsed into one
+label value. The "truth" for an invocation-failed row is *we ran
+the harness but it crashed, so we don't have a verdict*. Stamping
+0.0 substitutes "no verdict" for "FAIL verdict" — same shape as
+Shapes A and B.
+
+## 5 Shape D — train/val leakage
+
+`wm_v4_random_split` is the WM v4 ablation that hit
+val_r2 = 0.997. Four sibling configurations (`wm_v4_rsplit_prm`,
+`wm_v4_rsplit_wide`, `wm_v4_rsplit_heavyreg`, `wm_v4_random_split`
+itself) reproduced 0.997 ± 10⁻³. The reproducibility looked like
+architectural strength; it was a corpus property.
+
+The corpus shape:
+
+$$
+\text{row} = (\text{instance\_id}, \text{trajectory\_id}, \text{step}, \text{state}, \text{terminal\_reward})
+$$
+
+$$
+\text{terminal\_reward}(r_1) = \text{terminal\_reward}(r_2) \iff \text{trajectory\_id}(r_1) = \text{trajectory\_id}(r_2)
+$$
+
+`terminal_reward` is **constant within a trajectory**. Every row of
+a trajectory carries the same terminal label. A row-random
+80/10/10 split distributes rows of the same trajectory across
+train, val, and test. Predicting `terminal_reward` for a val row is
+trivially solvable by retrieving the trajectory ID from the val
+row's state embedding and looking up the train row from the same
+trajectory.
+
+What the model learned: trajectory-ID memorization through state
+embeddings.
+
+What the validation measured: trajectory-ID memorization.
+
+What the production blend used: a value head with no out-of-
+trajectory signal, blended into MCTS at α = 0.9 (the LLM contributes
+10% of the prior weight; the WM dominates).
+
+Honest instance-split val_r2 for the same checkpoint: approximately
+0.11. The corpus has 691 passes / 19,881 total ≈ 3.5% global pass
+rate. A model that always predicts "fail with confidence 0.965"
+trivially scores ~0.997 R² on the train distribution.
+
+Generative model of the bug: the *split strategy* silently treated
+trajectory-leakage as legitimate signal. The val set contained rows
+that were drawn from the same trajectories as the train set. The
+data pipeline produced a *labeled* generalization measurement where
+the truth was *we measured memorization, not generalization*.
+
+The fix is ADR-005: instance-keyed split. Every WM training run
+emits `metadata.json` recording:
+
+```json
+{
+  "split": {
+    "strategy": "instance",
+    "train_instances": [...],
+    "val_instances": [...],
+    "test_instances": [...],
+    "verified_disjoint": true
+  },
+  "corpus": {
+    "rows": 478400,
+    "trajectories": 12930,
+    "instances": 1632
+  }
+}
+```
+
+A `strategy: "row_random"` field is permitted only with
+`production_use: false` and emits a loud warning to stderr at train
+time. Production WM checkpoints with `strategy != "instance"` are
+refused at `wm-serve` load time.
+
+## 6 The class
+
+Each of the four shapes shares one generative move:
+
+$$
+\text{truth} = \text{UNKNOWN}
+$$
+
+$$
+\xrightarrow{\text{pipeline silently substitutes default}}
+$$
+
+$$
+\text{stored value} = \text{LABELED}
+$$
+
+$$
+\xrightarrow{\text{downstream consumer treats LABELED as ground truth}}
+$$
+
+$$
+\text{contamination}
+$$
+
+The four substitutions:
+
+| Shape | UNKNOWN became | because |
+|---|---|---|
+| A | "this row's verdict is the same as its sibling" | harness key was over-fanned |
+| B | "no judge label means 0.0 reward" | `result` column was NULL by design but read as "not pass" |
+| C | "harness crash means FAIL verdict" | invocation-failed and real-FAIL shared an enum value |
+| D | "row-random val_r2 measures generalization" | split strategy ignored trajectory grouping |
+
+The common defect is **silent default substitution**. None of the
+four substitutions raised. None logged a warning. Each was visible
+only by counting rows after the fact and noticing the count was
+wrong.
 
 ```mermaid
-flowchart TD
+graph TD
     Class[cohort contamination class]
     Class --> Silent[silent default substitution]
-    Silent --> A["Shape A — over-fanned key\n3,314 rows harness_collided"]
-    Silent --> B["Shape B — NULL maps to 0.0\n17 days poisoned WM ckpts"]
-    Silent --> C["Shape C — enum collapse\n786 rows invocation_failed"]
-    Silent --> D["Shape D — row-split leakage\n8 days alpha=0.9 on memorization"]
-    A --> Fix1[T6 — refuse to label colliders]
-    B --> Fix2[T1+T2 — plumb judge_label, raise on NULL]
-    C --> Fix3[T6 — distinct enum, NULL not 0.0]
-    D --> Fix4[ADR-005 — instance split, metadata.json]
-    Fix1 --> S1[ADR-004 no-silent-fallback]
-    Fix2 --> S1
-    Fix3 --> S1
-    Fix4 --> S2[ADR-005 checkpoint provenance]
+    Silent --> A[Shape A: over-fanned key<br/>3,314 rows in harness_collided]
+    Silent --> B[Shape B: NULL → 0.0<br/>17 days of poisoned WM ckpts]
+    Silent --> C[Shape C: enum collapse<br/>786 rows in harness_invocation_failed]
+    Silent --> D[Shape D: row-split leakage<br/>8 days of α=0.9 trained on memorization]
+
+    A --> AFix[T6: refuse to label colliding rows]
+    B --> BFix[T1+T2: plumb judge_label, raise on NULL]
+    C --> CFix[T6: distinct enum, NULL not 0.0]
+    D --> DFix[ADR-005: instance split, metadata.json]
+
+    AFix --> Structural[Structural fix: ADR-004<br/>no-silent-fallback]
+    BFix --> Structural
+    CFix --> Structural
+    DFix --> Provenance[Structural fix: ADR-005<br/>checkpoint provenance]
 ```
 
-The four substitutions, in one column:
+## 7 Why audit-as-class beats whack-a-mole
 
-1. Shape A renamed "this row's verdict is unknown" to "this row's verdict equals its sibling's."
-2. Shape B renamed "this row has no judge label" to "this row's reward is 0.0."
-3. Shape C renamed "the harness crashed before scoring this row" to "this row scored FAIL."
-4. Shape D renamed "we measured memorization" to "we measured generalization."
+This is the load-bearing piece. From MEMORY.md:
 
-The common defect is silent default substitution. None of the four substitutions raised. None logged a warning. Each was visible only by counting rows after the fact and noticing the count was wrong.
+> "Audit comprehensively, don't whack bugs one at a time — when a
+> bug is a class (contract drift, stale spec, missing alias), audit
+> for siblings in one pass."
 
-## 7. Detection latency vs blast radius
+Sam's view, captured after a month of one-line-fix-of-the-week
+patches that never converged. The reason is the asymmetry of
+detection cost vs introduction cost.
 
-We tabulate the per-shape detection economics. The shorthand: $C_\text{detect}$ is the engineering cost between deploy and "wait, those numbers look off"; $C_\text{rework}$ is the cost of retraining everything downstream once the contamination is identified.
+Each new contamination instance arrives at a roughly constant rate
+$\lambda_\text{intro}$ — every code change has some baseline
+probability of introducing a silent-default pattern. The detection
+cost per instance is roughly $C_\text{detect}^{instance}$, dominated
+by the human time to notice "wait, those numbers look off" and
+trace the cause. The fix cost per instance is small — one rust
+line, one SQL backfill — call it $C_\text{fix}^{instance}$.
 
-| Shape | Detection mechanism | Days to detect | Blast radius (rework) |
-|---|---|---|---|
-| A | T6 audit, group-by-instance count | ~9 | 5,044 rows re-labeled, no model rework (rows pre-WM) |
-| B | T1 audit traced WM regression to constant-zero terminal | 17 | 17 days WM training redone |
-| C | T6 audit, rows with `judge_label=0.0` and no `final_report.json` | ~9 | Re-judge 786 instances, partial pass-rate recompute |
-| D | val\_r2 = 0.997 outlier provoked instance-split audit | 8 | alpha=0.9 ckpt rolled back, 8 days WM training redone |
-
-A second per-shape table makes the trigger asymmetry explicit. The "trigger anomaly magnitude" column records *how far from expectation* the downstream number was when the audit fired. A higher magnitude provoked faster detection.
-
-| Shape | Trigger anomaly | Magnitude | Days live |
-|---|---|---|---|
-| A | row count for a key was 10x expected | 10x | ~9 |
-| B | WM loss curve looked normal but val on new instances stagnated | small, easily dismissed | 17 |
-| C | rows with `judge_label=0.0` had no harness output file on disk | binary present/absent | ~9 |
-| D | val\_r2 = 0.997 was 9x the next-best ablation's val\_r2 | 9x | 8 |
-
-The pattern is regression-on-magnitude: detection latency scales inversely with how far the contaminated signal moved the downstream metric from baseline. Shape B's signal moved the metric *toward* the expected pattern (low early reward, slow convergence), which is structurally undetectable without explicit audit.
-
-The structural observation: latency is *inversely* correlated with how anomalous the contaminated number looks downstream. Shape D was caught fastest (8 days) because val\_r2 = 0.997 is *too good* — it provoked a sanity check by being a positive anomaly. Shape B was slowest (17 days) because constant-zero terminal rewards produced loss curves that looked like *normal early training*, exactly the expected pattern. The more plausible the substituted value, the longer the contamination persists.
-
-This is the load-bearing economic claim. The expected detection latency is
+For $N$ instances over time $T$:
 
 $$
-\mathbb{E}[T_\text{detect}] \propto \frac{1}{|\,\text{downstream anomaly}\,|}
+\text{Total cost (whack-a-mole)} = N \cdot (C_\text{detect}^{instance} + C_\text{fix}^{instance}) + N \cdot C_\text{rework}
 $$
 
-so the *most plausible-looking* contamination patterns are the *most expensive* by survival time. Silent default substitution is precisely the pattern that maximizes plausibility — it produces values within the expected range, not outside it. The class is structurally optimized to evade detection.
+where $C_\text{rework}$ is "redo every downstream model trained on
+contaminated data". For perseus, $C_\text{rework}$ is the dominant
+term. The α = 0.9 deployment cost 8 days of contaminated WM
+training. The 2026-05-05 silent-default cost 17 days of WM training
+under `--reward-source judge`. Each instance reset the WM clock by
+2 weeks.
 
-## 8. Detection economics — when class fixes beat instance fixes
-
-Whack-a-mole cost for $N$ instances over time $T$:
-
-$$
-C_\text{instance}^{(N)} = \sum_{i=1}^{N} \bigl(C_\text{detect}^{(i)} + C_\text{fix}^{(i)} + C_\text{rework}^{(i)}\bigr)
-$$
-
-Class-fix cost:
-
-$$
-C_\text{class} = C_\text{ADR-004} + C_\text{ADR-005} + N \cdot \epsilon
-$$
-
-where $\epsilon$ is the residual instance cost after structural enforcement catches new substitutions at introduction time. The class fix pays back when
+The class fix is to *make silent-default substitution structurally
+impossible*. ADR-004 (no-silent-fallback) and ADR-005 (checkpoint
+provenance metadata) are the two structural enforcement points.
 
 $$
-C_\text{ADR-004} + C_\text{ADR-005} \;<\; \sum_{i=1}^{N} C_\text{rework}^{(i)}
+\text{Total cost (class fix)} = C_\text{ADR\_4} + C_\text{ADR\_5} + N \cdot \epsilon
 $$
 
-For perseus at $N = 4$ over 30 days, with $C_\text{rework}$ dominated by 17-day WM training loss per Shape B-class incident, the class fix paid back within the first instance. The four-incident audit (the T1–T9 work) cost ~2 weeks of engineering; the cumulative rework cost from continuing to whack instances would have exceeded that within another 30-day window.
+where $\epsilon$ is the residual instance cost after the structural
+enforcement catches new substitutions at introduction time. As long
+as $C_\text{ADR\_4} + C_\text{ADR\_5} < N \cdot C_\text{rework}$, the
+class fix pays back. For perseus at $N=4$ in 30 days, the class fix
+paid back within the first instance.
 
-```mermaid
-flowchart LR
-    A[New code change] --> B{introduces\nsilent default?}
-    B -->|no| L[live]
-    B -->|yes, caught at\ncode review| R1["cost: 1 hour\n(ADR-004 check)"]
-    B -->|yes, lands| C{produces\nplausible value?}
-    C -->|no| D1["cost: 1-3 days\n(downstream anomaly)"]
-    C -->|yes| D2["cost: 10-20 days\n(detection latency)\n+ rework"]
-    D2 --> E["compounding:\nWM ckpt redo,\ncohort filter, ADR write"]
+## 8 ADR-004 — no-silent-fallback
+
+ADR-004 codifies the rule that *no production code path may
+substitute a default value when the input is unknown without
+emitting an explicit error and either raising or returning a typed
+error variant*. The patterns banned are:
+
+```python
+# BANNED
+try:
+    result = compute(input)
+except SomeError:
+    return []  # silent empty fallback
+
+value = upstream() or DEFAULT  # silent default-on-falsy
+
+ratio = numerator / (denominator + 1e-9)  # silent epsilon
 ```
 
-The diagram is the economic argument. Caught at code review costs hours. Caught downstream costs days. Caught after a model trains on the contamination costs weeks. The structural enforcement at code review is the cheap intervention; the field-detection-and-rework loop is the expensive one.
+```rust
+// BANNED
+let label = row.judge_label.unwrap_or(0.0);
 
-We can state the prevention-vs-detection tradeoff as an explicit cost diagram, where $C_\text{prevent}$ is the cost to enforce a class-level rule at code-review time and $C_\text{detect}$ is the cost to find the same contamination after it has propagated into a trained model. The ratio $C_\text{detect} / C_\text{prevent}$ is the multiplier that justifies the ADR investment.
+let parsed = serde_json::from_str(&body).unwrap_or_default();
 
-```mermaid
-flowchart TB
-    subgraph PreventionRegime [Prevention regime — ADR-004 + ADR-005]
-        P1["code-review gate\nC_prevent ~ 1 engineer-hour/change"]
-        P2["type-system enforcement\ntyped errors, no unwrap_or"]
-        P3["load-time refusal\nwm-serve rejects ckpt without metadata"]
-        P1 --> P2 --> P3
-    end
-    subgraph DetectionRegime [Detection regime — audit after the fact]
-        D1["spot anomaly\n~1-3 engineer-days"]
-        D2["trace causation\n~3-5 engineer-days"]
-        D3["audit cohort\n~5-10 engineer-days"]
-        D4["retrain downstream\n~7-17 calendar-days WM time"]
-        D1 --> D2 --> D3 --> D4
-    end
-    PreventionRegime ===|"C_prevent &lt;&lt; C_detect"| DetectionRegime
+let normalized = compute_score(input).unwrap_or(0.5);
 ```
 
-The diagram is what justifies writing this essay rather than fixing the fifth instance directly. Prevention regime is bounded above by a few engineer-hours per code change. Detection regime is bounded below by roughly 16 engineer-days plus 7–17 days of calendar time for downstream retraining. For perseus's current incident rate of one new contamination every 7.5 days, the prevention regime saves approximately $4 \cdot 23 = 92$ engineer-days over a 30-day window (counting one detection cycle per instance), against an ADR enforcement cost of a few engineer-hours per code change times the number of changes per window, which is far less.
+The permitted patterns:
 
-A further per-shape table separates blast radius along two axes: rows affected (the contamination footprint) and downstream artifacts affected (the rework footprint).
+```rust
+// REQUIRED
+let label = row.judge_label.ok_or(RewardError::Unlabeled)?;
 
-| Shape | Rows affected | Downstream artifacts | Calendar-time rework |
-|---|---|---|---|
-| A | 5,044 | none (caught pre-WM training) | 1 day re-judging |
-| B | 478k training rows × 17 days | every WM ckpt 2026-04-25 to 2026-05-11 | 17 days retraining |
-| C | 786 | partial pass-rate dashboards | 2 days re-judging + recompute |
-| D | 6,545 (perseus condition) | alpha=0.9 production blend | 8 days retraining + 2 days redeploy |
+let parsed: PlannerResponse = serde_json::from_str(&body)
+    .map_err(|e| PlannerError::ParseFailed { body: body.clone(), err: e })?;
 
-The rework footprint is what makes class-fixes payback so fast. Each contamination instance that lands a downstream model requires *that model's training time* as recovery overhead. WM training is 7–17 days per epoch-converged ckpt; planner training is 1–3 days; PRM training is 5–10 days. A pipeline that emits one contaminated downstream artifact per 7.5 days, with rework of 7–17 days per artifact, has loss rate $\rho > 1$ and is in a degenerate regime where contamination outpaces clean training.
-
-## 9. ADR-004 — no-silent-fallback
-
-ADR-004 codifies the rule: no production code path may substitute a default value when the input is unknown, without either raising a typed error or emitting an explicit warning. The banned patterns are the Rust shorthand `unwrap_or(default)` on options whose semantic `None` carries meaning, the Python `except: return []` swallow, the `numerator / (denominator + 1e-9)` silent epsilon, and the falsy-default-on-zero pattern common in JSON parsing. The required patterns are typed-error propagation via the question-mark operator in Rust and explicit raised exceptions in Python, with `tracing::warn!` or equivalent at any fallback point that is permitted by exception.
-
-The discipline reduces to: every code path that could substitute a default must either *raise the substitution as a typed error* or *log it loudly enough that operators see it*. Silent zeros and silent epsilons become syntactically identifiable in code review, which is the cheap intervention point in the cost diagram above.
-
-ADR-004 also generalizes the earlier retraction of the parser-repair-at-higher-temperature retry pattern. The 2026-04-22 LLM API surface entry retracted "+0.2 \* retry" temperature bumps on parse failure because a malformed-JSON failure is rarely fixed by sampling more diversely. The generalization: do not paper over an unparseable response by re-rolling the random seed.
-
-The ADR-004 decision tree at code review is simple. For each branch in a function that could substitute a default for an absent input, ask three questions in order:
-
-1. Is the absent input a valid state of the world, or a corrupted state? If valid (e.g. an unlabeled row), the function must return a typed error variant or NULL; substitution is forbidden.
-2. Is the absent input expected to occur frequently in production? If yes, the typed error must be specifically named (e.g. `RewardError::Unlabeled`) so callers can match on it rather than generic-catch.
-3. Is the call site within a hot path that cannot afford to raise? If yes, the substitution must be logged at warn level with sufficient context (run\_id, input, fallback value) that the audit can reconstruct after the fact.
-
-The decision tree is small enough that code review can apply it by inspection. The class of bugs it eliminates is the entire silent-default family.
-
-## 10. ADR-005 — checkpoint provenance metadata
-
-ADR-005 requires every WM (or planner, or PRM) training run to emit a `metadata.json` next to the checkpoint with required fields: `git_sha`, training-data parquet path with row count and filter SQL, the `policy_fingerprint_shas` of the source cohort, excluded-row count with exclusion reason, full split specification, metrics, and promotion timestamp. The load-bearing field is `split.strategy`, with four permitted values:
-
-1. `"instance"` — held-out by instance ID; the ground truth for generalization claims.
-2. `"time"` — held-out by `claimed_at` cutoff; the second-best truth when instance overlap is unavoidable.
-3. `"paired"` — held-out paired (baseline, perseus) of the same instance; useful for paired-difference statistics.
-4. `"row_random"` — permitted only with explicit `production_use: false` and emits a loud warning at train time.
-
-The pre-flight check at the WM-serve load path refuses any checkpoint whose `metadata.json` is missing, whose `verified_disjoint` is not true, or whose `split.strategy = "row_random"` is missing the `production_use: false` flag. The pre-2026-05-18 deployment of `wm_v4_random_split` at alpha=0.9 would have been refused at load time under ADR-005 — the metadata file either wouldn't exist or would carry `strategy: "row_random"` with default `production_use: true`.
-
-```mermaid
-sequenceDiagram
-    participant Trainer as WM trainer
-    participant Disk as metadata.json
-    participant WMServe as wm-serve load path
-    participant Perseus as perseus MCTS
-
-    Trainer->>Disk: emit ckpt + metadata.json
-    Note over Disk: split.strategy, verified_disjoint,\npolicy_fingerprint_shas, metrics
-    WMServe->>Disk: read metadata.json
-    alt missing or strategy=row_random with production_use=true
-        WMServe-->>Trainer: refuse to load (CkptRefused)
-    else valid metadata
-        WMServe->>WMServe: load ckpt
-        Perseus->>WMServe: POST /wm/value
-        WMServe-->>Perseus: value, judge_value
-    end
+let normalized = match compute_score(input) {
+    Some(score) => score,
+    None => {
+        tracing::warn!(target = "score", input = ?input,
+            "score not computable for input; returning Err");
+        return Err(ScoreError::NotComputable(input));
+    }
+};
 ```
 
-The pre-flight is the structural enforcement; the diagram is the contract.
+The discipline is: every path that could substitute a default must
+either *raise the substitution to the caller as a typed error* or
+*log it loudly enough that operators see it*. Silent epsilons and
+silent zeros are the bug class; ADR-004 makes them syntactically
+identifiable in code review.
 
-A few clarifying observations on the metadata schema. The `excluded_row_count` and `excluded_reason` fields are load-bearing: they document the contamination filter that the training run applied, so a future reader knows that for example rows with `judge_source` in the contamination tags were removed. Without these fields, the question "did this checkpoint train on Shape A or Shape C contaminated rows?" requires SQL archaeology against a snapshot of the rows that existed at training time, which is hard if not impossible after subsequent backfills. With these fields, the question is answered by reading `metadata.json`.
+The parser-repair-at-higher-temperature retry pattern is explicitly
+banned. The 2026-04-22 LLM API surface entry already retracted the
+"+0.2 * retry" temperature bump because a malformed-JSON failure is
+rarely fixed by sampling more diversely. ADR-004 generalizes the
+retraction: don't paper over an unparseable response by re-rolling
+the random seed.
 
-The `policy_fingerprint_shas` field is the cohort identity. Perseus's policy fingerprint captures git SHA, planner and confirm-stop prompt SHAs, UCB-C constant, retrieval endpoint, and a SHA of the sorted environment variables. Different fingerprint means different policy means different behavior distribution means a different training population. Training on a mixture of fingerprints without recording the mixture is a sibling contamination shape: the cohort is not what we think it is. ADR-005's `policy_fingerprint_shas` field forces the mixture to be explicit.
+## 9 ADR-005 — checkpoint provenance metadata
 
-A useful framing for ADR-005 is as a state machine over the lifecycle of a single cohort row, from "harness invoked" through "label written" to "consumed by training."
+ADR-005 requires every WM (or planner, or PRM) training run to emit
+a `metadata.json` next to the checkpoint with these required fields:
 
-```mermaid
-stateDiagram-v2
-    [*] --> Pending
-    Pending --> ClaimedByWorker : worker calls claim_next
-    ClaimedByWorker --> Running
-    Running --> HarnessInvoked
-    HarnessInvoked --> HarnessCollided : group size > 1
-    HarnessInvoked --> HarnessInvocationFailed : harness crashed
-    HarnessInvoked --> HarnessUnsupported : dataset mismatch
-    HarnessInvoked --> HarnessLabeled : final_report.json written
-    HarnessCollided --> [*] : judge_label NULL
-    HarnessInvocationFailed --> [*] : judge_label NULL
-    HarnessUnsupported --> [*] : judge_label NULL
-    HarnessLabeled --> ExportedToParquet : included in cohort
-    ExportedToParquet --> [*] : training reads
+```json
+{
+  "ckpt_path": "wm/wm_v4_seed1/best_val_r2.pt",
+  "git_sha": "75500de6...",
+  "training_data": {
+    "parquet": "sweep-augmented-vt4.parquet",
+    "rows": 978874,
+    "filter": "judge_source IN ('swebench_harness','mswebench_harness') AND judge_label IS NOT NULL",
+    "policy_fingerprint_shas": ["648ee6521cd9", "54b583142777"],
+    "excluded_row_count": 7842,
+    "excluded_reason": "harness_collided OR harness_invocation_failed OR harness_unsupported"
+  },
+  "split": {
+    "strategy": "instance",
+    "train_instances": ["catchorg__Catch2-1422", ...],
+    "val_instances": ["BurntSushi__ripgrep-1294", ...],
+    "test_instances": ["facebook__zstd-3014", ...],
+    "verified_disjoint": true,
+    "trajectory_leakage_test": "passed"
+  },
+  "metrics": {
+    "best_val_r2": 0.114,
+    "best_val_r2_epoch": 5,
+    "test_r2": 0.108
+  },
+  "loaded_by": ["wm-serve@cato:19100"],
+  "promoted_at": "2026-05-19T08:00:00Z"
+}
 ```
 
-The four contamination tags are distinct terminal states. Pre-fix, all four collapsed onto a single state "HarnessLabeled with `judge_label = 0.0`." The fix is to make the diagram's distinct states distinct in the database, which is the data-side analog of ADR-004's typed-error rule at the function-call level.
+The `split.strategy` field is the load-bearing one. Permitted
+values:
 
-## 11. Provenance columns are the prerequisite, not the audit
+- `"instance"` — held-out instances; the ground truth for
+  generalization claims.
+- `"time"` — held-out by `claimed_at` cutoff; the second-best truth
+  for generalization when instance overlap is unavoidable.
+- `"paired"` — held-out paired (baseline, perseus) of same
+  instance; useful for paired-difference statistics.
+- `"row_random"` — permitted only with `production_use: false`.
+  `wm-serve` refuses to load a checkpoint with `strategy:
+  "row_random"` and `production_use: true` is missing or set to
+  true.
 
-Each shape was caught only because a forensic column on the row let us run a one-line audit query. For Shape B, the audit is to group `multi_bench_runs` by `judge_source` and count. For Shape A, the audit is to filter on `judge_source = 'harness_collided'` and read the `judge_detail.error` peer-set list. For Shape D, the audit is to read `split.strategy` from `metadata.json`. The detection cost collapses from "human notices numbers look wrong, traces back through git history, reads three days of session logs" to "one query against a forensic column." The provenance column is the prerequisite that makes the audit feasible at all.
+The pre-flight check at `wm-serve` load time:
 
-The generalization: every cohort row, every checkpoint, every artifact must carry forensic provenance such that *when a downstream number looks wrong, the audit is a single query against the provenance*. ADR-005 makes this explicit for checkpoints. The `judge_source`, `judge_detail`, and `policy_fingerprint_sha` columns make it explicit for rows. The structural cost saver is forensic plurality, not retrospective archaeology.
+```python
+def load_ckpt(path: Path) -> WMSession:
+    meta_path = path.parent / "metadata.json"
+    if not meta_path.exists():
+        raise CkptRefused(f"no metadata.json next to {path}; ADR-005")
+    meta = json.loads(meta_path.read_text())
+    if meta["split"]["strategy"] == "row_random":
+        if meta["split"].get("production_use", True):
+            raise CkptRefused(
+                f"{path}: split.strategy='row_random' is not "
+                "valid for production; explicit production_use=false required"
+            )
+    if not meta["split"].get("verified_disjoint"):
+        raise CkptRefused(f"{path}: split.verified_disjoint missing or false")
+    return WMSession.from_ckpt(path, meta)
+```
 
-## 12. The audit-as-class pass found the same pattern in the docs
+A WM checkpoint that doesn't pass these checks doesn't serve
+traffic. The α = 0.9 deployment of `wm_v4_random_split` would have
+been refused at load time under ADR-005 because the metadata.json
+either wouldn't exist or would carry `strategy: "row_random"`.
 
-The 2026-05-18 retraction pass audited Claude.md itself against the actual code and flagged three stale claims that fell into the same generative shape:
+## 10 The detection economics
 
-1. The temperature-retry-bump claim ("+0.2 \* retry, clamped at 0.6") was strikethrough'd; the actual code is constant-temperature.
-2. The planner-call timeout default of 90 000 ms was strikethrough'd; the actual default is 0.
-3. The 17-column parquet schema claim was updated inline; the actual schema is 23 columns.
+The per-instance detection cost $C_\text{detect}^{instance}$ varies
+wildly by shape. Two of the four shapes were noticed by humans
+spotting that downstream numbers looked wrong; two were noticed by
+audit explicitly designed to look for the contamination class.
 
-Each was a doc-level instance of silent default substitution. Documentation stored a *labeled* value (the stated default) where the truth was *the default had changed and the doc hadn't*. The retraction template — strikethrough plus inline note — is the doc-level analog of `metadata.json`: preserve the original text so future readers can grep for `~~strike~~` and discover the discrepancy.
+| Shape | Detection mechanism | Days between deploy and detect |
+|---|---|---|
+| A — over-fanned key | T6 audit + collision count `GROUP BY instance_id HAVING COUNT(*) > 1` | ~9 days |
+| B — silent default | 2026-05-11 audit traced WM ckpt regression to terminal_reward distribution | 17 days |
+| C — enum collapse | T6 audit found rows with `judge_label=0.0` whose harness invocation never wrote `final_report.json` | ~9 days |
+| D — train/val leakage | 2026-05-17/18 audit pulled on val_r2=0.997 outlier; honest instance-split exposed memorization | 8 days |
 
-We claim the audit found the same class in the docs that it found in the data. ADR-004's analog at the doc layer is: don't substitute a stale default for ground truth; raise the discrepancy (strikethrough plus inline note) so future readers see both.
+The shortest detection latency was 8 days (Shape D, where the
+0.997 number was so anomalously high it provoked audit by being
+*too good*). The longest was 17 days (Shape B, where the
+contamination silently produced the *expected* "WM is converging,
+look at the loss curve" pattern with no audit trigger).
 
-## 13. The cost of doing this honestly
+The asymmetry is structural: silent-default contamination tends to
+produce *plausible* outputs (a `terminal_reward = 0` is not weird in
+isolation; a verdict for an instance is not weird in isolation; a
+val_r2 = 0.997 is suspicious *only because we expected lower*). The
+anomaly that triggers detection is downstream of the contamination,
+and the more "plausible" the substituted value, the longer the
+detection latency.
 
-The 2026-05-11 audit (T1–T9) cost ~2 weeks of engineering. The 2026-05-18 retraction pass cost a day. ADR-004 and ADR-005 are landing piecewise.
+The structural cost saver is: **make every row carry its provenance
+forensically, so when a number looks wrong, the audit can grep for
+the substitution**.
 
-The alternative cost structure compounds. Each new instance resets the WM training clock by 1–3 weeks; four instances in 30 days is one new instance every 7.5 days; at 17 days of WM training lost per Shape-B-class incident, the project loses $\approx$ 2.3 weeks of effective training time per week of wall-clock time:
+For Shape B: every row in `multi_bench_runs` now carries
+`judge_source` as a categorical. The audit query is one SQL line:
 
-$$
-\mathrm{loss\_rate} = \frac{17 \text{ days WM lost}}{7.5 \text{ days/incident}} \approx 2.3 \text{ weeks lost / week elapsed}
-$$
+```sql
+SELECT judge_source, COUNT(*) FROM multi_bench_runs GROUP BY judge_source;
+```
 
-A pipeline that introduces contamination faster than it produces ground truth is not a pipeline; it is a noise generator. That math is the reason audit-as-class is the load-bearing discipline rather than the optional cleanup pass.
+For Shape A: every collided row's `judge_detail.error` records the
+peer set. Audit can reconstruct which rows blocked which:
 
-The same logic, restated for the final time: silent default substitution is structurally optimized to evade detection, which means it must be structurally optimized *against* at code review. ADR-004 and ADR-005 are the two enforcement points. Every additional contamination shape we identify in the next 30 days should fit the same identity or expose a new generative move; if a new move is found, the ADR set extends. We do not whack the next bug; we extend the structural enforcement.
+```sql
+SELECT judge_detail->>'error' FROM multi_bench_runs WHERE judge_source = 'harness_collided';
+```
 
-## 14. What is still open
+For Shape D: every WM ckpt's `metadata.json` records the split
+strategy and verified-disjoint flag. Audit is `jq`:
 
-Four candidate retractions from HISTORY/36 have not been resolved:
+```bash
+jq '.split.strategy' metadata.json
+```
 
-1. The default-feature drop in the build manifest never landed.
-2. The confirm-stop livelock cap is operationally working but the prompt that triggers the cap is unfixed.
-3. The unsafe pattern for killing the perseus process is rebanned in one doc but the safe pattern is not propagated to the others.
-4. A planner-prompt production-readiness claim is contradicted three paragraphs down in the same status report.
+The detection cost collapses from "human notices numbers look wrong
++ traces back through git history + reads three days of session
+logs + finds the substitution" to "one query against the forensic
+column". The forensic column is the prerequisite, not the audit.
 
-Each is a candidate Shape-E-or-later. The discipline says: catalog them, run the audit pass, extend the ADRs if a new generative move is found, and update the table at the top of this essay when they resolve.
+## 11 What the audit-as-class pass found
 
-We close on the table that opened. Four shapes, one identity, two ADRs. The class is not done — the next instance is a falsifying test of whether ADR-004 and ADR-005 are sufficient. If a fifth shape lands in the next 30 days that fits the existing identity, the ADRs are insufficient at code-review enforcement. If a fifth shape lands and introduces a new generative move, the identity itself extends. Either outcome is informative; only the *absence* of a fifth shape would be evidence that the class is fully bounded.
+The 2026-05-18 retraction pass (Claude.md "doc-vs-code retraction
+pass") audited Claude.md itself for the same class. The pass
+checked every "Last Updated" entry against the actual code and
+flagged three stale claims that fell into the same shape:
 
-## 15. A note on the LessWrong-style asymmetry
+1. The temperature-retry-bump claim ("+0.2 * retry, clamped ≤ 0.6")
+   was strikethrough'd; the actual code is constant-temperature.
+2. The `PERSEUS_LLM_TREE_TIMEOUT_MS=90000` default claim was
+   strikethrough'd; the actual default is 0.
+3. The muzero-export "17-col parquet schema" claim was updated
+   inline; the actual schema is 23 columns.
 
-Most engineering writeups of incidents are post-mortems: they explain a single bug, name a remediation, and stop. The argument of this essay is that single-bug post-mortems are misallocated effort relative to class-level audits, *for the specific category of bugs where the generative mechanism repeats*. Silent-default substitution is one such category. There may be others — contract drift, stale specifications, missing serialization aliases, race-condition broadcast — and the discipline carries.
+Each was a doc-level instance of the same pattern: documentation
+silently substituted a *labeled value* (the stated default) where
+the truth was *the default had changed and the doc hadn't*. The
+retraction template is the doc-level analog of the
+`metadata.json` provenance file — preserve the original text
+strikethrough'd so future readers can grep for the `~~strike~~`
+pattern.
 
-The general principle: when a bug class is generative rather than incidental, the post-mortem effort goes to the class identity and the structural enforcement. The instance fixes are bookkeeping. Sam's framing in MEMORY.md: "Audit comprehensively, don't whack bugs one at a time — when a bug is a class, audit for siblings in one pass." We claim every word of that is load-bearing, especially "comprehensively" and "one pass." The audit-as-class discipline pays back in the same window because the rework footprint of any single instance exceeds the audit cost of the whole class.
+The pass also identified four candidates for future retraction that
+have not yet been resolved (see HISTORY/36 §1.2 through §1.7): the
+Cargo `semantic` default-feature drop never landed, the
+`confirm_stop` livelock cap is operationally working but the prompt
+that triggers the cap is unfixed, the `pkill -f 'perseus serve'`
+foot-gun is rebanned in one doc but the safe pattern isn't
+propagated to the others, and the `gemma_plan_v3` production-
+readiness claim is contradicted three paragraphs down in the same
+status report.
 
-We also claim the discipline is rare. Most engineering organizations whack each bug as it surfaces, accept the rework, and rebuild downstream artifacts. The pattern is sustained only by under-counting the rework time, which in perseus's case is recoverable from the WM training calendar. The honest accounting — once we did it — was a 2.3-weeks-lost-per-week-elapsed regime, which is degenerate. Class-fixing is the only sustainable response to a contamination-class bug. Instance-fixing is the response that produces the fifth instance.
+The audit found the same class in the docs that it found in the
+data. The structural fix at the doc level is the same shape as
+ADR-004: don't substitute a stale default for ground truth; raise
+the discrepancy (strikethrough + inline note) so future readers
+see both.
 
-The structural fixes (ADR-004 no-silent-fallback and ADR-005 checkpoint provenance metadata) are not a panacea. They are a specific, narrow set of code-review rules and load-time refusals. Their scope is precisely the silent-default substitution class. New classes will arrive — we expect at least one in the next 60 days, given perseus's surface area — and the discipline will repeat: identify the generative move, name the class, write the ADR. The output of this essay is one of those ADR pairs. Future essays will be the same shape for the next class.
+## 12 The cost of doing this honestly
 
-## 16. Predictions
+The 2026-05-11 audit's nine tasks (T1–T9) took roughly two weeks of
+engineering time. The 2026-05-18 retraction pass took a day. The
+structural enforcements (ADR-004, ADR-005) are still being landed
+piecewise.
 
-We commit to four predictions as falsifying tests of the framing above:
+The alternative — letting the four instances stand as four bugs and
+fixing the fifth and sixth as they arrive — has a cost structure
+that compounds. Every additional instance resets the WM training
+clock by 1–3 weeks, because the contaminated ckpt has to be
+retrained from a clean cohort. Four instances in 30 days is
+roughly one new instance every 7.5 days. At 17 days of WM training
+lost per instance (the Shape B latency), the project loses ~2.3
+weeks of effective training time per week of wall-clock time.
 
-1. If ADR-004 is enforced uniformly, no Shape-A-or-Shape-B-or-Shape-C class incident will land in the next 30 days. A landing instance falsifies the claim that the ADR's three-question decision tree is sufficient at code review.
-2. If ADR-005 is enforced at the WM-serve load path, no checkpoint with `split.strategy = "row_random"` will reach production. A landing instance falsifies the claim that load-time refusal is sufficient.
-3. The next contamination shape that lands will fit the silent-default-substitution identity with probability greater than 0.7, conditioned on the surface-area distribution of perseus's pipeline. A landing shape that does *not* fit the identity is informative — it means a new generative move exists and the class extends.
-4. The detection latency for the next instance will be inversely proportional to the magnitude of its trigger anomaly, per the table in section 7. A counter-example — a low-anomaly shape detected quickly — would indicate that audit infrastructure (provenance columns, forensic queries) has improved beyond the trigger-anomaly bottleneck.
+That math is the reason audit-as-class is the load-bearing
+discipline rather than the optional cleanup pass. A pipeline that
+introduces contamination faster than it produces ground truth is
+not a pipeline; it is a noise generator.
 
-Each prediction is structured to fail loudly. If any falsifies, the framing above is wrong in a specific place, and the next essay will say exactly where.
+Related: [the reset](/essays/the-reset/),
+[pipeline integrity audit](/essays/pipeline-integrity-audit/),
+[reward modeling](/essays/reward-modeling/),
+[wm in the loop](/essays/wm-in-the-loop/),
+[multi-swe-bench wiring](/essays/multi-swe-bench-wiring/).
 
-We end where we started: cohort contamination is a class, not an incident. The four shapes are four instances of one bug. The fix is structural, not instance-by-instance. The cost of doing this honestly is the cost of the audit that produced this essay, against the cost of continuing to whack instances at one per 7.5 days while losing 17 days of WM training per Shape B-class incident. The arithmetic does not work for the whack-a-mole strategy. The class-fix strategy is the only one that converges.
+## Sources
+
+- `Claude.md` "Last Updated" 2026-05-11 entry (T1–T9 pipeline-
+  integrity audit), 2026-05-18 entry (doc-vs-code retraction pass).
+- `parking_lot/v2_archive_2026-05-18/HISTORY/33_multibench_detail.md`
+  §"Pipeline-integrity audit (T1–T9, 2026-05-11)", lines 246–356;
+  §"Cohort contamination & rollback (policy_fingerprint_sha)",
+  lines 359–395; §"Patch production — the load-bearing finding",
+  lines 179–202.
+- `parking_lot/v2_archive_2026-05-18/HISTORY/34_reward_modeling.md`
+  §4 "Harness collisions (the contamination bug)", lines 202–264;
+  §5 "The 2026-05-05 retracted entry", lines 265–344; §6
+  "Pipeline-integrity audit (T1–T9, 2026-05-11)", lines 347+.
+- `parking_lot/v2_archive_2026-05-18/HISTORY/36_audit_handoff_docs.md`
+  §1 "Retracted / contradicted claims (TOP SIGNAL)", lines 44–200.
+- `parking_lot/v2_archive_2026-05-18/HISTORY/28_muzero_wm_research.md`
+  §4 "Phase-3++ v4 ablation grid", lines 199–289; §4.1 "Champion
+  (deployed)", lines 211–223; §4.2 "Instance-split sweep (true
+  generalization)", lines 224–248.
+- `~/.claude/projects/-Users-sam-code-mantle/memory/MEMORY.md`,
+  entry `feedback_audit_dont_whack_bugs`: "Audit comprehensively,
+  don't whack bugs one at a time — when a bug is a class (contract
+  drift, stale spec, missing alias), audit for siblings in one
+  pass."
+- `~/.claude/projects/-Users-sam-code-mantle/memory/MEMORY.md`,
+  entry `feedback_dont_overpromise_underverify`: "Sam lost a month
+  to confident half-fixes; measure before declaring outcomes."
+- `migrations/008_judge_labels.sql` — schema for the four judge
+  columns added 2026-04-23 (Shape B Postgres side).
+- `src/judge_bootstrap/mswebench_runtime.rs:43-66`, `:106-152` —
+  T6 collision guard and `JUDGE_SOURCE_COLLIDED` /
+  `JUDGE_SOURCE_INVOCATION_FAILED` constants.
+- `src/muzero/export.rs:36-49` — `terminal_reward_from_judge`
+  gating logic for `harness_{unsupported,collided,invocation_failed}`.
+- `scripts/pipeline_integrity_backfill.sql` — T7 backfill,
+  `DO-NOT-RUN-BLINDLY` audit-write-verify three-block structure.
+- `scripts/judge_audit.py` — T8 read-only reporter with separated
+  denominators by `(dataset, condition, model, policy_fingerprint)`.

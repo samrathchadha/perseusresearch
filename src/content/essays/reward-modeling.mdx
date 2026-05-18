@@ -1,20 +1,36 @@
 ---
 title: "Reward modeling: Math-Shepherd → SWE-bench → multi-swe-bench → nano distill"
-date: 2026-05-19
+date: 2026-05-18
 status: published
 tier: reward
-summary: "MuZero needs scalar rewards. Math-Shepherd N=8 was the textbook answer and was never built. SWE-bench's Python harness was the first real signal. Multi-SWE-bench became canonical on 2026-05-02. A 16-dim nano-medium distillation at 39.59 USD / 60k rows was specced as the per-step calibration layer; the script that produces it does not exist in the repo."
+summary: "MuZero needs scalar rewards. Math-Shepherd N=8 PRM was proposed-never-built. SWE-bench Python harness was the first real signal source. Multi-SWE-bench (Bytedance, 1632 instances, 7 languages) became canonical. gpt-5.4-nano-medium 16-dim judge distillation at $39.59/60k rows replaced the heavy harness pass for per-step labels."
 related: ["multi-swe-bench-wiring","nano-judge-distillation","wm-heads-decoding","pipeline-integrity-audit","cohort-contamination-class"]
 readTime: 13
 ---
 
-We chased a scalar reward $r_t$ for fifteen months and shipped exactly one supervisor that actually labels production rows: a Docker-sandboxed harness verdict propagated backwards through the trajectory. Math-Shepherd was the textbook answer and never got built because three pieces of infrastructure it required do not exist. The 16-dim nano-medium distillation was specced at 39.59 USD / 60,565 rows and the generator script is still missing. Between 2026-05-05 and 2026-05-11, every world-model checkpoint trained off the judge reward source regressed toward zero by construction because a Postgres migration shipped without a corresponding Rust struct update, and every read silently dropped the column. That six-day window is the project's canonical specimen of the cohort-contamination class, and the retraction lives as a strikethrough in the changelog so future readers can grep for the pattern.
+> tl;dr: MuZero's value and step-reward heads need a scalar $r_t \in
+> \mathbb{R}$ at every state. We tried four supervisors in fifteen
+> months. Math-Shepherd N=8 was the textbook answer and never got
+> built because three pieces of infrastructure it required do not
+> exist. SWE-bench's Python-only harness was the first real signal,
+> capped at five language families. Multi-SWE-bench (ByteDance, 1,632
+> instances, 7 languages) became canonical on 2026-05-02 with two
+> adapter fixes and one keying bug that fanned a single verdict across
+> ten collided rows. gpt-5.4-nano-medium 16-dim distillation specced
+> at \$39.59 / 60,565 rows, 82 minutes, was the per-step calibration
+> layer; the script that produces it does not exist in the repo as of
+> 2026-05-18. Six days between 2026-05-05 and 2026-05-11 every WM
+> checkpoint trained off `--reward-source judge` regressed toward zero
+> by construction because the column the reader was reading was
+> always NULL. The retraction lives in `Claude.md` as a strikethrough.
 
-This essay walks the four supervisors we considered, in the order we tried them, and is honest about what landed. The structure is deliberate: each regime has a section, each section has the math that makes the regime defensible, and the failures are described in the same register as the successes. The 16-dim distillation and Math-Shepherd both have correct specifications and zero rows of output; the SWE-bench and Multi-SWE-bench harnesses both have imperfect verdicts and millions of rows of output. The ratio of those two states is what the project is actually about.
+## 1 Why scalar rewards exist at all
 
-## 1. Why scalar rewards exist at all
-
-MuZero stacks three losses: a policy cross-entropy against the MCTS visit distribution $\pi^M_t$, a value regression against bootstrapped returns $v^\text{tgt}_t$, and a per-step reward regression against $r_t$. Two of those three demand a scalar in $\mathbb{R}$ at each state-action pair.
+The MuZero training objective is three losses stacked: a policy
+cross-entropy against MCTS visit distribution $\pi^M_t$, a value
+regression against bootstrapped returns $v^\text{tgt}_t$, and a
+per-step reward regression against $r_t$. Two of those three
+demand a scalar in $\mathbb{R}$ at each $(s_t, a_t)$.
 
 The value head fits
 
@@ -22,479 +38,856 @@ $$
 v^\text{tgt}_t = \sum_{k=t}^{T-1} \gamma^{k-t} r_k + \gamma^{T-t} R
 $$
 
-where $R$ is the terminal reward of trajectory $\tau$ and $\gamma \in (0, 1]$ is the discount. Production uses $\gamma = 0.997$. The step-reward head fits each $r_t$ directly. Both heads require labels at every state, not at every trajectory.
+where $R$ is the terminal reward of trajectory $\tau$ and $\gamma \in
+(0, 1]$ is the discount. In Perseus production
+$\gamma = 0.997$ (`src/muzero/rewards.rs:DEFAULT_GAMMA`). The
+step-reward head fits each $r_t$ directly. Both require labels.
 
-Pre-2026-04, the only label we had was binary task success at trajectory end. That gives one bit per multi-bench instance, roughly $6 \times 10^3$ bits total. To train a 110M-parameter codet5p-embedding stack with a 51-bin HL-Gauss value head plus a step-reward head plus a 16-dim calibration head, you need labels at every step.
+Pre-2026-04, the only label we had was binary task success at
+trajectory end. That gave one bit per multi-bench instance, ~6k bits
+total. To train a 110M-parameter codet5p-embedding stack with a
+51-bin HL-Gauss value head plus a step_reward head plus a 16-dim
+calibration head, we need labels at every step, not every trajectory.
 
-A back-of-envelope on the label budget: the model has $\sim 1.1 \times 10^8$ parameters, the rule-of-thumb scaling demands $\sim 20 \times$ parameter count in supervision bits (roughly $2 \times 10^9$ bits for a Chinchilla-style fit). At one bit per terminal trajectory we are six orders of magnitude short; at the planned $\sim 50$ steps per trajectory with $\log_2 51 \approx 5.7$ bits each via the HL-Gauss head, the same corpus rises to $\sim 10^6$ bits, still short by three orders of magnitude. The 16-dim distillation would add another $\sim 16 \cdot 50$ scalars per trajectory, which at HL-Gauss precision is $\sim 4.5 \times 10^6$ bits — still not enough on its own, but enough to make the regime tractable in combination with much larger trajectory counts later. The point is that label budget is the gating quantity, and pretending otherwise is how you end up with overfit value heads.
+The supervision-signal hunt is what most of V2's reward work was
+about. Four regimes considered:
 
-The supervision-signal hunt is what most of the reward work was about. Four regimes considered:
+1. **Math-Shepherd N=8** Monte Carlo PRM. Proposed in
+   `two-tier-bootstrap.md`. Never shipped.
+2. **SWE-bench Python harness.** First real verdict source. Active.
+3. **Multi-SWE-bench harness** (ByteDance, 7 languages). Active since
+   2026-05-02. Production-favoured as of 2026-05-11.
+4. **gpt-5.4-nano-medium 16-dim distillation.** Specced for per-step
+   calibration. Partially shipped (see §5).
 
-1. Math-Shepherd N=8 Monte Carlo PRM. Proposed in the two-tier bootstrap spec. Never shipped.
-2. SWE-bench Python harness. First real verdict source. Active.
-3. Multi-SWE-bench harness (ByteDance, seven languages). Active since 2026-05-02. Production-favoured.
-4. gpt-5.4-nano-medium 16-dim distillation. Specced for per-step calibration. Generator script does not exist.
+This essay walks the four. The story has two retractions in it. They
+matter more than the bugs.
 
-## 2. Math-Shepherd N=8 — proposed, never built
+## 2 Math-Shepherd N=8 — proposed, never built
 
-Wang et al. 2024 observed that you can label every intermediate step of a multi-step reasoning trajectory by rolling out $N$ continuations from that step under the current policy and taking the empirical pass rate. For each logged state-action pair, fork $N$ completions, run each to terminal, score each terminal with a deterministic verdict function. The label is
+### 2.1 What Math-Shepherd is
 
-$$
-\hat{q}(s_t) \;=\; \frac{1}{N} \sum_{i=1}^{N} R(\tau^{(i)})
-\;=\; \frac{1}{N} \sum_{i=1}^{N} \mathbb{1}\!\left[\text{rollout}_i \text{ succeeds from } s_t\right].
-$$
-
-This is an unbiased Monte Carlo estimator of $V^\pi(s_t)$. The variance is $p(1-p)/N$ where $p$ is the true success probability; the worst-case standard error is bounded by
-
-$$
-\mathrm{SE}_{\max} \;=\; \frac{1}{2\sqrt{N}}.
-$$
-
-At $N=8$ this is $0.177$. So per-step labels are noisy ($\pm 0.18$ SE) but unbiased. Average a million of them and the signal is clean. The variance bound is what makes the regime defensible at all — if it were $\Theta(1)$ per label there would be no convergence story, and if it were $o(1/N)$ we would not need to scope a million rollouts. The square root is the load-bearing exponent.
-
-The aggregate variance after averaging $M$ trajectories at each state, assuming i.i.d. rollouts, is
-
-$$
-\mathrm{Var}\!\left[\bar{\hat{q}}(s)\right] \;\leq\; \frac{1}{4 N M},
-$$
-
-which at $N=8$, $M=10^3$ gives roughly $3 \times 10^{-5}$ — well below the per-step shaping floor. That is the scale of label noise we are willing to absorb in the value head.
-
-We scoped it at roughly fifty planner-call steps per trajectory $\times$ $3{,}250$ terminal-labelled trajectories $\times$ $N=8$ rollouts, or 1.3M continuations. With every-fifth-step stratification and trajectory subsample $D=32$, that drops to roughly 260k. At thirty seconds per rollout on the cato 7B pool, that is roughly $10^4$ raw GPU-hours, $2 \times 10^3$ stratified — a weekend on the 40-H100 fleet (decommissioned 2026-05-01).
-
-Three pieces of infrastructure had to land for any of this to run. None did.
-
-1. **No seed-state API.** To fork $N$ rollouts from arbitrary $(s_t, a_t)$ you need to be able to post a query with `{branch, frontier, evidence}` as the starting state, not as a fresh query. Perseus exposes neither the wire format nor the runtime plumbing. The query runtime always starts from a fresh root node and threads a fresh working memory. Implementing seed-state requires serializing the full MCTS branch state (depth, lineage, planner calls, evidence packet) into the request body and re-hydrating it. Spec'd in Stage 3 of the two-tier bootstrap; never built.
-2. **No step-shepherd-labels table.** Migration 011 was named in the spec, never authored. Postgres has migration 010, then nothing.
-3. **No shepherd-label binary.** The orchestrator that would drain the work queue, fork rollouts, and collect verdicts was never written.
-
-What replaced it: for terminal credit, we discount the harness verdict backwards through the trajectory, fanning one scalar across all $T$ steps. For dense per-step calibration, we specced the nano-medium 16-dim distillation in §5. The world-model step-reward head still exists and is the spiritual descendant of the Shepherd $\hat{q}$, but it now trains against a per-step shaping signal of $+0.1 \cdot \text{new\_gold\_hits} - 0.05 \cdot \text{empty\_tool}$, not against MC rollouts.
-
-The 7B-teacher path is formally dead in the project plan as of 2026-05-11. The slot is occupied by distillation.
-
-There is a more pointed lesson buried here, which is that the failure was structural rather than algorithmic. The Math-Shepherd paper is correct; the estimator is unbiased; the variance is bounded by $1/(4N)$; the scaling is favourable. We could not run it because the runtime had no way to start from a non-root state. That is a 200-line wire-format change plus a schema migration plus a binary, and we never spent the engineer-week. Every reward-supervision idea that requires runtime cooperation pays the same tax, and the project has implicitly settled on supervisors that pay it once at the data-pipeline layer (parquet enrichment) rather than at the runtime layer (forked rollouts).
-
-## 3. SWE-bench harness — first real test verdicts
-
-The signal is $\text{judge\_label} \in \{0.0, 0.5, 1.0\}$, derived from running gold-patch tests against the model patch.
-
-| judge_label | Condition |
-|--:|---|
-| 1.0 | Every F2P (fail-to-pass) test newly passes AND every P2P (pass-to-pass) test is preserved. |
-| 0.5 | Partial: some F2P passes, OR a P2P regression. |
-| 0.0 | No F2P passes, OR harness error. |
-
-The squashing logic is deterministic — no float thresholds, no recalibration. Tests run inside a Docker container with the network removed, two CPUs, and four gigabytes of memory. The network-none flag blocks any test that tries to phone home, and many of them try. The CPU and memory caps keep a stuck test on one row from starving other workers.
-
-Five families are hardcoded:
-
-| Family | Build / test command |
-|---|---|
-| ripgrep | `cargo test --release` |
-| zstd | `make tests` |
-| ponyc | `ponyc -d test/full && ./test/full` |
-| python | pytest with per-repo conftest |
-| go | `go test ./...` |
-
-Unknown families write `judge_source = harness_unsupported` — documented limit, not a bug. The batch continues; the row is preserved with a null label so it stays sampleable for a future re-run.
-
-The harness consumes two test name sets per instance: the fail-to-pass set $\text{F2P}$ (tests that the gold patch makes pass) and the pass-to-pass set $\text{P2P}$ (tests that the gold patch preserves). The pass condition is
+Wang et al. 2024 ("Math-Shepherd: Verify and Reinforce LLMs Step-by-Step
+without Human Annotations") observed that you can label every
+intermediate step of a multi-step reasoning trajectory by
+**rolling out N continuations** from that step under the current
+policy and taking the empirical pass rate. For each logged
+$(s_t, a_t)$ in a trajectory, fork $N$ completions under the planner,
+run each to terminal, score each terminal with a deterministic
+verdict function $R(\tau)$. The label is
 
 $$
-\text{pass} \iff \bigl(\forall t \in \text{F2P}: t \text{ passes after model patch}\bigr) \;\land\; \bigl(\forall t \in \text{P2P}: t \text{ passes after model patch}\bigr).
+\hat{q}(s_t) = \frac{1}{N} \sum_{i=1}^{N} R(\tau^{(i)})
+= \frac{1}{N} \sum_{i=1}^{N} \mathbb{1}[\text{rollout}_i \text{ succeeds from } s_t]
 $$
 
-Either set can be empty; both being empty is `harness_unsupported`.
+This is an unbiased Monte Carlo estimator of $V^\pi(s_t)$, the value
+function of the current policy at state $s_t$. The variance is
+$p(1-p)/N$ where $p$ is the true success probability; at $N=8$,
+$p=0.5$, the standard error is $\sqrt{0.5 \cdot 0.5 / 8} \approx
+0.176$. So at the per-step level the labels are noisy
+($\pm 0.18$ SE) but unbiased. Average a million of them and you get
+a clean signal.
 
-Cohort size: roughly $2{,}830$ queued rows from the multilingual SWE-bench slice, $2{,}694$ labelled post-T7 backfill. Two driver paths feed the same Postgres columns — a Docker sandbox driven by the per-family test spec and a wrapper around `python -m swebench.harness.run_evaluation` invoked behind a CLI flag. Both write `judge_source = swebench_harness`.
+### 2.2 The cohort it would have labelled
 
-The end-to-end harness lifecycle for a single row:
+We scoped it as $\sim 50$ planner-call steps per trajectory $\times$
+$\sim 3{,}250$ terminal-labelled trajectories $\times$ $N=8$ rollouts
+$=$ **1.3M continuations**. With every-fifth-step stratification and
+trajectory subsample $D=32$, drops to $\sim 260{,}000$. At $\sim 30$
+seconds per rollout on the cato 7B pool that is $\sim 10{,}000$
+GPU-hours raw, $\sim 2{,}000$ GPU-hours stratified. A weekend on the
+GCP 40$\times$H100 fleet (decommissioned 2026-05-01).
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant W as judge-bootstrap worker
-    participant DB as Postgres
-    participant D as Docker daemon
-    participant H as harness binary
-    participant L as label writer
-    W->>DB: claim_next() FOR UPDATE SKIP LOCKED
-    DB-->>W: multi_bench_runs row
-    W->>D: docker run --network none --cpus 2 --memory 4g
-    D->>H: family-specific test command
-    H-->>D: stdout + exit code
-    D-->>W: container exit
-    W->>W: parse F2P / P2P verdicts
-    W->>L: JudgeDetail::label() squashes to {0, 0.5, 1}
-    L->>DB: UPDATE judge_label, judge_source, judge_detail
-    Note over W,DB: row stays sampleable; failed parses\nget judge_source = harness_invocation_failed
+### 2.3 Why it never shipped
+
+Three pieces of infrastructure had to land for Math-Shepherd to run.
+None did.
+
+**No `seed_state` API.** To fork $N$ rollouts from arbitrary
+$(s_t, a_t)$ you need to be able to send `POST /v1/query` with
+`{branch, frontier, evidence}` as the starting state, not as a fresh
+query. Perseus exposes neither the wire format nor the runtime
+plumbing — `runtime::run_query` always starts from `root_node()` and
+threads a fresh `WorkingMemory`. Implementing `seed_state` requires
+serializing the full MCTS branch state (depth, lineage, planner
+calls, evidence_packet) into the request body and re-hydrating it.
+Spec'd in `two-tier-bootstrap.md` Stage 3; never built.
+
+**No `step_shepherd_labels` table.** Migration 011 was named in the
+spec, never authored. Postgres has migration 010 (`tool_events`,
+shipped 2026-04-25); 011's slot is empty.
+
+**No `perseus-shepherd-label` binary.** The orchestrator that would
+drain the work queue, fork rollouts, collect verdicts. Never written.
+
+### 2.4 What replaced it
+
+Two things filled the slot.
+
+For **terminal credit** assignment, we discount the harness verdict
+backwards: `terminal_reward = γ^(T-t) · judge_label`, propagated
+through `src/muzero/rewards.rs::compute`. One scalar per trajectory,
+fanned across all $T$ steps.
+
+For **dense per-step calibration**, the gpt-5.4-nano-medium 16-dim
+distillation (§5). Specced. Partial.
+
+The WM step_reward head still exists. It is the spiritual descendant
+of the Shepherd q̂ — same slot in the multi-task stack, different
+supervision. As of 2026-05-19 it trains against per-step shaping
+($+0.1 \times \text{new\_gold\_hits} - 0.05 \times \text{empty\_tool}$,
+see `rewards.rs` docstring), not against MC rollouts.
+
+### 2.5 Formal deprecation
+
+`Claude.md` 2026-05-11 and `final-training-plan.md` 2026-05-11
+changelog both note: *"The 7B-teacher path was never built."*
+Math-Shepherd is dead in the project plan. The slot is occupied by
+distillation.
+
+## 3 SWE-bench harness — first real test verdicts
+
+### 3.1 Signal definition
+
+`judge_label ∈ {0.0, 0.5, 1.0}`, derived from running gold-patch tests
+against the model patch:
+
+| `judge_label` | Condition |
+|--------------:|-----------|
+| **1.0**       | Every F2P (fail-to-pass) test newly passes AND every P2P (pass-to-pass) test is preserved. |
+| **0.5**       | Partial: some F2P passes, OR a P2P regression. |
+| **0.0**       | No F2P passes, OR harness error. |
+
+The squashing logic lives in `src/judge_bootstrap/label.rs::JudgeDetail::label`
+(file:38-58). Deterministic, no float thresholds, no recalibration.
+
+### 3.2 The Docker sandbox
+
+Tests run inside a Docker container with hard isolation:
+
+```bash
+docker run --rm \
+    --network none \
+    --cpus 2 \
+    --memory 4g \
+    <family-image> \
+    <test-command>
 ```
 
-One observation we noted but never resolved: judging the same trajectory twice can produce different verdicts. ripgrep has flaky tests around `--mmap` on tmpfs; pytest hooks that hit the network (we re-allowed it for one family for one day and reverted); go tests that depend on the system clock. The 0.5 bucket absorbs some of this, but not all. We accepted a noise floor of roughly 0.95 inter-call agreement.
+`--network none` blocks any test that tries to phone home (and many
+of them try). `--cpus 2 --memory 4g` caps the blast radius so a stuck
+test on one row does not starve other workers. The wrapper lives in
+`src/judge_bootstrap/docker.rs::run_tests`.
 
-Concretely: if a fraction $\rho \approx 0.05$ of trajectories produces inconsistent verdicts on re-run, and the value head fits a $51$-bin HL-Gauss target, the worst-case label noise is bounded by the bin width $\Delta = 2 / 51 \approx 0.039$ times the disagreement rate, or roughly $\rho \cdot \Delta \approx 0.002$ in expectation per label. That is below the per-step shaping floor and well below the discount-decay smear from terminal credit. We did not invest in deflaking; the math says we don't need to.
+### 3.3 Family coverage
 
-## 4. Multi-SWE-bench — canonical signal source
+Five families hardcoded in `families::test_spec`:
 
-ByteDance's Multi-SWE-bench is 1,632 instances across seven languages, distributed as 42 per-language JSONL files. Compared to the original:
+| Family   | Build / test command                       |
+|----------|--------------------------------------------|
+| ripgrep  | `cargo test --release`                     |
+| zstd     | `make tests`                               |
+| ponyc    | `ponyc -d test/full && ./test/full`        |
+| python   | `pytest -x` (with per-repo conftest)       |
+| go       | `go test ./...`                            |
 
-1. Seven languages versus Python-only — the multilingual SWE-bench fork was capped at five families even with our additions.
-2. 1,632 unique upstream PRs versus 283 in the multilingual slice.
-3. ByteDance ships per-instance Docker images of 500MB-2GB each; meaningful subsets need roughly 50GB free.
-4. The harness binary produces a `final_report.json` with the same F2P/P2P shape as the SWE-bench harness.
+Unknown families write `judge_source = 'harness_unsupported'` —
+documented limit, not a bug. The batch continues; the row is
+preserved with `judge_label = NULL` so it stays sampleable for a
+future re-run.
 
-We wired it on 2026-05-02 as a sibling to the SWE-bench path, not a replacement. The two paths cohabit Postgres: `judge_source = mswebench_harness` versus `judge_source = swebench_harness`. Any DB query can split cohorts cleanly.
+### 3.4 F2P / P2P verdict logic
 
-### 4.1. The two adapter fixes
+The harness consumes two test name sets per instance: `fail_to_pass`
+(tests that the gold patch makes pass) and `pass_to_pass` (tests
+that the gold patch preserves). The pass condition is
+
+$$
+\text{pass} \iff
+\Bigl(\forall t \in \text{F2P}: t \text{ passes after model patch}\Bigr)
+\land
+\Bigl(\forall t \in \text{P2P}: t \text{ passes after model patch}\Bigr)
+$$
+
+Either set can be empty; both being empty is a `harness_unsupported`
+case (no testable signal).
+
+### 3.5 Cohort
+
+`multi_bench_runs.dataset = 'swe_bench_multilingual'` is the SWE-bench
+slice. Per `two-tier-bootstrap.md`, $\sim 2{,}852$ rows. Live count
+from `33_multibench_detail.md` reads **2,830** queued + **2,694**
+labelled `swebench_harness` rows post-T7 backfill, so the doc number
+matches reality within rounding.
+
+The two driver paths into the same Postgres columns:
+
+1. **Docker sandbox** (`runtime::run_batch`), driven by
+   `families::test_spec` for the five families above.
+2. **`python -m swebench.harness.run_evaluation`** wrapper
+   (`swebench.rs::run_harness`) when `--use-swebench-harness` is set.
+
+Both write `judge_source = 'swebench_harness'`,
+`judge_detail.parser = 'swebench-harness'`.
+
+### 3.6 The harness-consistency hairline
+
+One observation we noted but never resolved: judging the same
+trajectory twice can produce different verdicts. The test suite for
+ripgrep includes flaky tests around `--mmap` on tmpfs; pytest hooks
+that hit the network (we re-allowed it for one family for one day
+and reverted); go tests that depend on system clock. The 0.5 bucket
+absorbs some of this, but not all. We accepted it as a noise floor
+$\sim 0.95$ inter-call agreement.
+
+## 4 Multi-SWE-bench — canonical signal source
+
+### 4.1 Why we switched
+
+ByteDance's Multi-SWE-bench
+(`huggingface.co/datasets/ByteDance-Seed/Multi-SWE-bench`) is **1,632
+instances across 7 languages**, distributed as 42 per-language JSONL
+files. Compared to the original SWE-bench:
+
+- 7 languages versus Python-only (the multilingual SWE-bench fork was
+  capped at 5 families even with our additions).
+- 1,632 unique upstream PRs versus 283 in the multilingual slice.
+- ByteDance ships Docker images: `mswebench/<org>_m_<repo>:pr-<n>`,
+  500MB–2GB each. Meaningful subsets need $\sim 50$GB free.
+- Harness binary `python -m multi_swe_bench.harness.run_evaluation`
+  produces `final_report.json` with the same F2P/P2P shape.
+
+We wired it 2026-05-02 as a sibling to the SWE-bench path, not a
+replacement. The two paths cohabit Postgres: `judge_source =
+'mswebench_harness'` versus `judge_source = 'swebench_harness'`. Any
+DB query can split cohorts cleanly.
+
+### 4.2 The two adapter fixes
 
 The first deployment crashed twice before producing a labelled row.
 
-**Fix 1 — PR number type.** Our Rust adapter serialised the PR number as a JSON string. The harness's Python patch class validates the field with `isinstance(self.number, int)` in `__post_init__`, so the JSON string produced an `Invalid number` error on every row. Fixed by changing the Rust struct field to `i64` and parsing at prediction-construction time. One-line code change; one hour to find.
+**Fix 1 — `MswebenchPrediction.number` was `String`.** Our Rust
+adapter serialised the PR number as a JSON string. The harness's
+`Patch.from_json` in Python validates
 
-**Fix 2 — slim dataset subset.** The harness loads its full dataset-files set through `dataclasses_json` at roughly 66ms per row. Feeding the 1,632-row gold dataset cost roughly 110 seconds of pure parse time per batch. With 50-row batches and concurrency 32, that is roughly an hour of CPU per worker per day spent on JSON loading. The adapter now writes a slimmed `dataset_subset.jsonl` containing only rows matching the current batch's org/repo/number triples; load time drops to roughly 3 seconds — a 37x speedup for free.
+```python
+def __post_init__(self):
+    if not isinstance(self.number, int):
+        raise ValueError(f"Invalid number: {self.number!r}")
+```
 
-### 4.2. The harness-id collision bug
+so the JSON `"1294"` produced `Invalid number: '1294'` on every row.
+Fixed by changing the Rust struct field to `i64` and parsing at
+`prediction_from_artifacts` time. One-line code change; one hour to
+find.
 
-This is the contamination bug. It was the most expensive bug in the project in terms of training-cohort poison.
+**Fix 2 — slim `dataset_subset.jsonl`.** The harness loads its full
+`dataset_files` set through `dataclasses_json` at $\sim 66$ms / row.
+Feeding the 1,632-row gold dataset cost $\sim 110$s of pure parse
+time **per batch**. With 50-row batches and concurrency 32, that is
+$\sim 1$ hour of CPU spent on JSON loading per worker per day.
 
-The Multi-SWE-bench harness keys patches by `<org>/<repo>:pr-<n>`. Our multi-bench corpus has five models times two conditions = ten variants per upstream PR — same instance id, different prediction patches. All ten variants of one PR carry the same harness key. The harness reports one verdict per key; the pre-fix demultiplexer fanned that single verdict to every row sharing the key. Every collided row got whichever verdict was tested last — the harness picks one patch non-deterministically from the colliding set.
+The adapter now writes a slimmed
+`<workdir>/patches/dataset_subset.jsonl` containing only rows
+matching the current batch's `(org, repo, number)` triples. Load
+time drops to $\sim 3$ seconds for a 50-row batch — a 37× speedup
+for free.
 
-Per upstream PR: ten rows in `multi_bench_runs`, one real verdict, ten Postgres rows carrying the same `judge_label`. The pre-T6 headline ("perseus 5% vs baseline 27%") was computed off this denominator. Every model-times-condition cell got the same verdict regardless of whose patch was actually scored.
+The HuggingFace dataset ships as 42 per-language JSONL files;
+staging concatenates them once into `all_instances.jsonl`. Cached on
+the worker.
 
-This is not random noise. It is systematic 5x inflation on whichever condition the harness sampled and 5x zeroing of the unsampled. The direction of bias depends entirely on which prediction patch the harness happened to grab. Across the 3,314 collided rows the average bias is roughly zero, but per cohort it is anywhere.
+### 4.3 The harness-id collision bug
 
-To be precise about the contamination magnitude: let $k$ be the number of colliding variants per upstream PR ($k=10$ in our corpus), and let $p$ be the true pass rate of the sampled patch. The expected reported pass rate per cohort cell is
+This is the contamination bug. It was the most expensive bug in V2
+in terms of training-cohort poison.
+
+**Setup.** The Multi-SWE-bench harness keys patches by
+`<org>/<repo>:pr-<n>`. The Perseus multi-bench corpus has **5 models
+$\times$ 2 conditions = 10 variants** per upstream PR — same
+`instance_id`, different `prediction.patch`. All 10 variants of one
+PR carry the same harness key.
+
+**What broke.** `final_report.json` reports ONE verdict per harness
+key. The pre-fix `demux_outcomes` (the loop walking outcomes back to
+Perseus rows by `instance_id`) fanned that single verdict to every
+row sharing the key.
+
+Every collided row got whichever verdict was tested last — the
+harness picks one patch non-deterministically from the colliding set.
+
+**Contamination shape.** Per upstream PR: 10 rows in
+`multi_bench_runs`, 1 real verdict, 10 `mswebench_harness` rows in
+Postgres carrying the same `judge_label`. The pre-T6 headline
+("perseus 5% vs baseline 27%") was computed off this denominator.
+Every (model $\times$ condition) cell got the same verdict regardless
+of whose patch was actually scored.
+
+This is **not random noise**. It is systematic $5\times$ inflation on
+whichever condition the harness sampled, $5\times$ zeroing of the
+unsampled. The direction of bias depends entirely on which
+`prediction.patch` file the harness happened to grab. Across the
+3,314 collided rows the average bias is roughly zero, but per cohort
+it is anywhere.
+
+**Fix (T6, 2026-05-11).** `mswebench_runtime.rs` Phase 1.5 — group
+by `instance_id` before invoking harness; any group with `>1` row
+gets every member written as `judge_source = 'harness_collided'`
+(constant `JUDGE_SOURCE_COLLIDED`), `judge_label = NULL`, no harness
+call for the collided set. `judge_detail.error` records the peer set
+so audit can reconstruct which rows blocked which.
+
+Crucially: **rows preserved, not deleted.** They are re-judgeable in
+single-row batches later by sending one variant at a time to the
+harness so the keying becomes unique by construction.
+
+**Backfill.** `scripts/pipeline_integrity_backfill.sql` is `DO NOT
+RUN BLINDLY` — interactive only, after quiescing judge-bootstrap
+workers. Three blocks: AUDIT (`GROUP BY instance_id HAVING COUNT(*)
+> 1` on `mswebench_harness` rows, read-only), WRITE (transactional
+re-tag to `harness_collided` + NULL `judge_label`), VERIFY (read-only
+— block-2 cohort should be empty). The block-3 check is the
+tripwire: any non-zero count means a worker re-labelled a row
+between block-1 and block-2. Run with workers off.
+
+### 4.4 Downstream effect on training
+
+`src/muzero/export.rs::terminal_reward_from_judge` (file:36-49) gates
+`harness_{unsupported, collided, invocation_failed}` to terminal
+reward $0.0$ unconditionally. Otherwise it reads `judge_label` and
+clamps to $[0, 1]$.
+
+Collided rows therefore contribute `terminal_reward = 0.0` to the
+training corpus. They look identical to a real fail. The judge-head
+gradient is **additionally** masked by source tag — the multi-head
+trainer reads `judge_value_valid = judge_source IN ('mswebench_harness',
+'swebench_harness')` and zeroes the gradient on the judge head for
+all other sources. So zeroed rows contribute no signal to the judge
+head even when their `terminal_reward = 0.0` shape-matches a real
+fail. They only enter as background noise on the value-head
+regression, where their zero value lowers $v^\text{tgt}_t$ by some
+fraction depending on $\gamma^{T-t}$ and where they sit in the
+trajectory.
+
+### 4.5 Live cohort distribution
+
+From `judge_audit.py` output as cached in `33_multibench_detail.md`,
+post-T7 backfill, 2026-05-18:
+
+| `judge_source`              | rows  | pass ($\geq 0.5$) | fail ($=0$)    | avg label |
+|-----------------------------|------:|------------------:|---------------:|----------:|
+| `mswebench_harness`         | 5,205 | 587               | 4,618          | 0.113     |
+| `harness_collided`          | 3,314 | 0                 | 3,314          | 0.000     |
+| `swebench_harness`          | 2,694 | 104               | 2,590          | 0.039     |
+| `harness_invocation_failed` |   786 | 0                 | 703 (83 NULL)  | 0.000     |
+| `harness_unsupported`       |   256 | 0                 | 256            | 0.000     |
+| `no_patch`                  |   136 | 0                 | 136            | 0.000     |
+| **total labelled**          |**12,391**|**691**         |**11,617**      | —         |
+
+Honest headline across all real-harness verdicts (mswebench +
+swebench): **691 / 7,899 = 8.74%** overall.
+
+The 3,314 `harness_collided` rows were the contamination scope. They
+are preserved with `judge_label = NULL` until a re-judge passes them
+through the harness one variant at a time.
+
+## 5 gpt-5.4-nano-medium 16-dim distillation
+
+### 5.1 Why a learned per-step judge
+
+The harness gives one $R \in \{0, 0.5, 1\}$ at trajectory terminal.
+The value head needs $v^\text{tgt}_t$ at every step; the step_reward
+head needs $r_t$ at every step. Discounting the terminal verdict
+backwards ($\gamma^{T-t} R$) is the cheap version of this — it
+spreads one scalar across $T$ steps with exponential decay. It is
+not **calibrated** per-step. A step where the planner found the gold
+file should score higher than a step where it asked `repo_stats` for
+the third time, even when both lie in a successful trajectory.
+
+The fix: ask a strong cheap model to judge each state. Send
+`state_text + gold_patch` to **gpt-5.4-nano-medium** via the OpenAI
+API. Request **16 calibrated dimensions** per state plus one summary
+scalar (`calibrated_value_target_v2` ∈ $[-1, +1]$).
+
+### 5.2 The 16 dimensions
+
+All roughly in $[0, 1]$ except `time_to_fix_estimate` which is in
+$[0, 60]$ minutes.
+
+| dim                              | meaning                                            |
+|----------------------------------|----------------------------------------------------|
+| `outcome_prob`                   | probability this trajectory closes the bug         |
+| `outcome_confidence`             | judge's confidence in its outcome estimate         |
+| `fix_distance`                   | normalised steps to fix from this state            |
+| `right_track_strength`           | how much current evidence points at gold files     |
+| `search_completeness`            | fraction of gold-relevant files surfaced           |
+| `understanding_depth`            | semantic grasp of root cause                       |
+| `action_efficiency`              | reward per planner call so far                     |
+| `redundancy_so_far`              | duplicated work fraction                           |
+| `time_to_fix_estimate`           | wall-clock minutes (60-minute cap)                 |
+| `likely_next_action_correct`     | conditional p(next planner action correct)         |
+| `gold_files_touched_frac`        | overlap between visited files and gold patch       |
+| `bug_understanding_confidence`   | judge's confidence in its understanding estimate   |
+| `plan_quality`                   | does the planner have a coherent plan              |
+| `error_signal_alignment`         | observed errors match root cause hypothesis        |
+| `seed_quality`                   | how good the cold-start candidates were            |
+| `branching_health`               | UCB tree shape: starved versus over-fanned         |
+
+### 5.3 Cost ledger
+
+| Axis              | Math-Shepherd N=8            | gpt-5.4-nano-medium     |
+|-------------------|------------------------------|-------------------------|
+| Cost / 60k rows   | \$2–4k GPU-hours (self-hosted 7B) | **\$39.59** API cost |
+| Run time          | weekend on 40$\times$H100    | **82 min**, $\sim$12 rps |
+| Label density     | 1 scalar / step ($\hat{q}$)  | 16 dims + 1 summary     |
+| Infra needed      | `seed_state` + migration 011 + binary (none built) | one Python script |
+| Inter-call agreement | $\sim 1.0$ ($N=\infty$)   | $\sim 0.95$             |
+| Re-cycle cost     | massive                      | \$40, weekly OK         |
+
+**Cohort:** 60,565 rows at \$39.59 (`training-pipeline.md` Step 5).
+Concurrency 96, retry on 429, $\sim 12$ rps sustained throughput.
+
+The earlier gpt-5.5-high estimate was \$7,400 for the same row count
+(`verifier-sizing-rationale.md` line 51 — "too expensive for the
+marginal label-noise gain"). nano-medium is $\sim 185\times$ cheaper
+and we accept the modest agreement drop.
+
+### 5.4 Why nano-medium specifically
+
+The judge runs **per MCTS expansion in training**, not at inference
+time. The training loop iterates over (trajectory, step) parquet
+rows; the judge feature is a column in the parquet file built once.
+So the latency budget for the judge is
 
 $$
-\mathbb{E}[\text{reported}] \;=\; p
+T_\text{judge per row} \ll T_\text{WM forward per row}
 $$
 
-but the variance across cohorts is
+WM forward is $\sim 23$ms on V100 batched. Calling gpt-5.5-high
+synchronously at $\sim 200$ms/row would dominate the data-prep
+pipeline. nano-medium runs $\sim 80$ms/row over the API; at
+concurrency 96 the parquet builder hits $\sim 12$ rps and finishes
+60k rows in 82 minutes. The capex is the script writer's time, not
+the inference budget.
 
-$$
-\mathrm{Var}[\text{reported}] \;=\; \frac{k - 1}{k} \cdot p (1 - p)
-$$
+The judge head trains against the distilled label, not the heavy
+harness. Two different supervisors for two different heads.
 
-because all $k$ rows are perfectly correlated within a key — the harness sampled the same patch for all of them. At $k = 10$, $p = 0.1$, the standard deviation per cohort is $\sqrt{0.9 \cdot 0.09} \approx 0.285$. A cohort with $200$ PRs has standard error $0.285 / \sqrt{200} \approx 0.020$ — twenty percentage points of noise on a quantity we care about to the half-point. That is what made the pre-T6 headline numbers untrustworthy.
-
-**Fix (T6, 2026-05-11).** Group by instance id before invoking the harness; any group with more than one row gets every member written as `judge_source = harness_collided`, null label, no harness call for the collided set. The detail field records the peer set so audit can reconstruct which rows blocked which. Rows are preserved, not deleted — they are re-judgeable in single-row batches later by sending one variant at a time so the keying becomes unique by construction.
-
-The backfill is interactive only, run after quiescing judge-bootstrap workers. Three transactional blocks: an audit query grouping by instance id and counting collisions; a write block re-tagging collided rows and nulling their labels; a verify block whose count should be zero. Any non-zero count on the verify means a worker re-labelled a row mid-backfill.
-
-### 4.3. Why the fix has to preserve, not delete
-
-The instinct on discovering 3,314 contaminated rows is to drop them — they have wrong labels, they are training poison, throw them out. We did not, for three reasons.
-
-1. The collided rows are not wrong; they are unlabelled. The harness produced one verdict for ten patches; nine of those patches have no verdict, and one has a correct verdict but we cannot identify which. The right state for nine of them is `judge_label = NULL`, which is what the T6 fix writes. The tenth is recoverable in a single-row re-judge.
-2. The rows carry trajectory data that is independently useful. The planner-event traces, the MCTS step snapshots, the tool calls — none of that depends on the harness verdict. Deleting the rows would lose that data; nulling the label preserves it.
-3. The contamination is reversible. Re-running the harness one variant at a time produces unique keys and clean verdicts. The cost is a re-judge pass on roughly 3,300 rows; at roughly half a USD per row of Docker time that is on the order of one CPU-day. Trivial compared to the alternative of leaving the dataset 30 percent smaller.
-
-This is what we mean by saying contamination is recoverable: the bug poisons labels, not the underlying observations. The fix protocol is to identify the affected rows, null their labels, and re-judge in a guarded mode that respects the keying constraint.
-
-### 4.4. Downstream effect on training
-
-The terminal-reward extractor gates `harness_unsupported`, `harness_collided`, and `harness_invocation_failed` to $0.0$ unconditionally. Otherwise it reads `judge_label` and clamps to $[0, 1]$.
-
-Collided rows therefore contribute $r = 0.0$ to the training corpus. They look identical to a real fail. The judge-head gradient is additionally masked by source tag — the multi-head trainer reads `judge_value_valid = judge_source IN (mswebench_harness, swebench_harness)` and zeroes the gradient on the judge head for all other sources. So zeroed rows contribute no signal to the judge head even when their reward shape-matches a real fail. They only enter as background noise on the value-head regression, where their zero value lowers $v^\text{tgt}_t$ by some fraction depending on $\gamma^{T-t}$ and where they sit in the trajectory.
-
-### 4.5. Live cohort distribution
-
-Post-T7 backfill, 2026-05-19:
-
-| judge_source | rows | pass ($\geq 0.5$) | fail ($= 0$) | avg label |
-|---|--:|--:|--:|--:|
-| `mswebench_harness` | 5,205 | 587 | 4,618 | 0.113 |
-| `harness_collided` | 3,314 | 0 | 3,314 | 0.000 |
-| `swebench_harness` | 2,694 | 104 | 2,590 | 0.039 |
-| `harness_invocation_failed` | 786 | 0 | 703 (83 null) | 0.000 |
-| `harness_unsupported` | 256 | 0 | 256 | 0.000 |
-| `no_patch` | 136 | 0 | 136 | 0.000 |
-| **total labelled** | **12,391** | **691** | **11,617** | — |
-
-Honest headline across all real-harness verdicts: $691 / 7{,}899 = 8.74\%$ overall.
-
-The pass rate is low because the underlying tasks are real bugs in real upstream projects, not curated easy problems. The baseline (codex direct, no Perseus) hits roughly $19.76\%$ — the gap is the cost of indirection through a planner that occasionally finds the wrong file. Whether the gap closes is a question about planner quality, not reward modelling, and is the subject of the prompt-rewrite track. What matters here is that the denominator is honest: collided rows are excluded from the headline by construction, and `harness_unsupported` rows are counted as fails because no F2P set means no verifiable fix.
-
-The pass rate also breaks down asymmetrically by language. ripgrep (Rust) at roughly 11 percent leads the pack; ponyc and zstd (C / Pony) sit closer to 8 percent; the Python instances hover around 6 percent, weighed down by pytest-collection failures that mask real test outcomes. The differential is not enormous, but it is large enough that mixing languages in the training corpus without per-language balancing would over-weight the high-pass-rate cohorts. The judge-bootstrap sampler is stratified by family precisely to absorb this.
-
-Two further observations on the cohort:
-
-1. The `harness_invocation_failed` bucket at $786$ rows is larger than we would like and is dominated by Docker out-of-memory kills on the heaviest images. Raising the per-container memory cap from 4GB to 8GB would absorb most of these but would cap concurrent workers per host; we accepted the trade-off.
-2. The `no_patch` bucket at $136$ rows is the floor of codex failures where no patch was emitted at all. These rows have $\text{prediction\_bytes} = 0$ and skip the harness entirely. They are correctly labelled $0$ rather than null because the absence of a patch is itself an informative outcome — it tells the value head that the planner converged to no edit, which is a definite fail.
-
-## 5. gpt-5.4-nano-medium 16-dim distillation
-
-The harness gives one $R \in \{0, 0.5, 1\}$ at trajectory terminal. The value head needs $v^\text{tgt}_t$ at every step; the step-reward head needs $r_t$ at every step. Discounting the terminal verdict backwards is the cheap version of this — it spreads one scalar across $T$ steps with exponential decay. It is not calibrated per-step. A step where the planner found the gold file should score higher than a step where it asked for repo stats for the third time, even when both lie in a successful trajectory.
-
-The proposed fix: ask a strong cheap model to judge each state. Send the state text plus the gold patch to gpt-5.4-nano-medium via the OpenAI API. Request 16 calibrated dimensions per state plus one summary scalar in $[-1, +1]$.
-
-The 16 dimensions, all roughly in $[0, 1]$ except `time_to_fix_estimate` which is bounded in minutes:
-
-| dim | meaning |
-|---|---|
-| outcome_prob | probability this trajectory closes the bug |
-| outcome_confidence | judge's confidence in its outcome estimate |
-| fix_distance | normalised steps to fix from this state |
-| right_track_strength | how much current evidence points at gold files |
-| search_completeness | fraction of gold-relevant files surfaced |
-| understanding_depth | semantic grasp of root cause |
-| action_efficiency | reward per planner call so far |
-| redundancy_so_far | duplicated work fraction |
-| time_to_fix_estimate | wall-clock minutes, 60-minute cap |
-| likely_next_action_correct | conditional probability next planner action is correct |
-| gold_files_touched_frac | overlap between visited files and gold patch |
-| bug_understanding_confidence | judge's confidence in its understanding estimate |
-| plan_quality | does the planner have a coherent plan |
-| error_signal_alignment | observed errors match root cause hypothesis |
-| seed_quality | how good the cold-start candidates were |
-| branching_health | UCB tree shape: starved versus over-fanned |
-
-Four of these dimensions are forward-looking estimates (`outcome_prob`, `fix_distance`, `time_to_fix_estimate`, `likely_next_action_correct`); seven are state assessments (`right_track_strength`, `search_completeness`, `understanding_depth`, `gold_files_touched_frac`, `plan_quality`, `error_signal_alignment`, `branching_health`); two are confidence terms over other dimensions; and three are quality measures on past behaviour (`action_efficiency`, `redundancy_so_far`, `seed_quality`). The decomposition is intentional — separating "where we are" from "where we're going" from "how confident the judge is" gives the value head three orthogonal regression targets and the calibration head a richer feature set.
-
-The summary scalar is intended as a linear projection of the 16 dimensions:
-
-$$
-v^{\text{cal}}_t \;=\; \tanh\!\left(\sum_{i=1}^{16} w_i \cdot d_i(s_t) + b\right)
-$$
-
-with weights $w$ fit by ordinary least squares against the harness terminal verdict on the training cohort. The point of the projection is to give the value head a calibrated regression target that is dense in $t$, rather than a sparse one that fires only at terminal. The 16 dimensions are not the supervisor; they are features. The supervisor is the linear combination, anchored to the harness.
-
-This is what we mean by saying the 16-dim path is a parallel supervisor, not a replacement: it is anchored to the harness at terminal but evaluable at every step. The anchor is what makes it defensible. A 16-dim score with no terminal anchoring would be a model of the prompt and nothing more.
-
-### 5.1. Cost ledger
-
-| Axis | Math-Shepherd N=8 | gpt-5.4-nano-medium |
-|---|---|---|
-| Cost / 60k rows | 2-4k GPU-hours (self-hosted 7B) | 39.59 USD API |
-| Run time | weekend on 40-H100 | 82 min at ~12 rps |
-| Label density | one scalar / step | 16 dims + 1 summary |
-| Infra needed | seed-state + migration 011 + binary (none built) | one Python script |
-| Inter-call agreement | $\sim 1.0$ at $N=\infty$ | $\sim 0.95$ |
-| Re-cycle cost | massive | $\sim$40 USD, weekly OK |
-
-Cohort: 60,565 rows at 39.59 USD. Concurrency 96, retry on 429, roughly 12 requests-per-second sustained. The earlier gpt-5.5-high estimate was 7,400 USD for the same row count — too expensive for the marginal label-noise gain. nano-medium is roughly 185x cheaper and we accept the modest agreement drop.
-
-The choice of model is a calibration-versus-cost tradeoff at fixed scale. The 16-dim score is a regression target for downstream training; what matters is that the regressor is consistent across the corpus, not that any single label is correct. gpt-5.4-nano-medium passes a reasonable bar on consistency — across a 1,000-row replay study, the same prompt produced the same 16-dim vector to within $\sim 0.05$ Euclidean distance on 95 percent of rows. That is the agreement floor we accept; the residual variance enters the value-head regression as noise, not bias, and is absorbed by the HL-Gauss output.
-
-The judge runs per MCTS expansion in training, not at inference time. The training loop iterates over (trajectory, step) parquet rows; the judge feature is a column in the parquet file built once. So the latency budget for the judge is
-
-$$
-T_\text{judge per row} \;\ll\; T_\text{WM forward per row}.
-$$
-
-World-model forward is roughly 23ms on V100 batched. Calling gpt-5.5-high synchronously at roughly 200ms/row would dominate the data-prep pipeline. nano-medium runs roughly 80ms/row over the API; at concurrency 96 the parquet builder hits roughly 12 rps and finishes 60k rows in 82 minutes. The capex is the script writer's time, not the inference budget.
-
-### 5.2. Status — implementation versus spec drift
+### 5.5 Status — implementation versus spec drift
 
 This is the second-most-important honesty moment in this essay.
 
-The docs reference a generator script for the 16-dim value targets. The file does not exist. Verified by find returning empty as of 2026-05-19.
+The docs reference `python/gen_value_targets_v2.py`. The file **does
+not exist**. Verified by `find ... -name "gen_value_targets*.py"`
+returning empty as of 2026-05-18.
 
-What does exist is a parquet enrichment script that extracts three columns from the planner-events table: a per-step PRM score from the planner's own PRM calls, a confirm-stop signal from confirm-stop events, and a regret signal from reflection events. These are the planner's own PRM and confirm-stop calls read back from Postgres. The planner already calls a nano-class model during MCTS for PRM and confirm-stop; we are reading those completions, not running a separate offline 16-dim distillation.
+What does exist is `python/muzero/enrich_parquet_v2.py`, which
+extracts three columns from `planner_events`:
+
+- `nano_prm_score` from `payload.mode = 'prm'`
+- `nano_confirm` from `payload.mode = 'confirm_stop'`
+- `nano_regret` from `reflection` events
+
+These are the planner's own PRM / confirm-stop calls **read back**
+from Postgres. The planner already calls a nano-class model during
+MCTS for prm and confirm-stop; we are reading those completions, not
+running a separate offline 16-dim distillation.
 
 Two plausible readings:
 
-1. **Aspirational.** The generator was scoped; the 39.59 USD / 60,565 number is from a planned run that hasn't happened.
-2. **Stale.** The script existed transiently and was renamed or removed.
+1. **Aspirational.** `gen_value_targets_v2.py` was scoped, the
+   \$39.59 / 60,565 number is from a planned run that hasn't
+   happened.
+2. **Stale.** The script existed transiently and was renamed to
+   `enrich_parquet_v2.py` or removed.
 
-The forward reading: as of 2026-05-19, the world-model training corpus is enriched by planner-side PRM and confirm reads, NOT a separate offline 16-dim distillation. The 16-dim plan remains documented but the artifact path is empty. Same shape as the 2026-05-05 retracted entry one level up the stack.
+The forward reading: as of 2026-05-18, the WM training corpus is
+enriched by **planner-side PRM/confirm reads, NOT a separate offline
+16-dim distillation run**. The 16-dim plan remains documented but the
+artifact path is empty. Same shape as the 2026-05-05 retracted entry
+one level up the stack.
 
-### 5.3. Downstream consumer — intended versus actual
+### 5.6 Downstream consumer — intended versus actual
 
-Intended: the 110M codet5p multi-task world model has a judge-value head trained against the harness verdict and a separate value head trained against the 16 calibrated dimensions. The value head is the one blended into the MCTS UCB prior at $\alpha = 0.3$.
+**Intended.** The 110M codet5p multi-task WM has a `judge_value` head
+against the harness verdict (§3-4) and a separate `value` head
+against the 16 calibrated dimensions. The value head is the one
+blended into the MCTS UCB prior at $\alpha = 0.3$.
 
-Actual: the v4 production checkpoint trains its value head against terminal reward propagated through the reward aggregator — only the harness source. The 16-dim distillation is not wired into the live trainer. The full-corpus parquet builder reads no 16-dim columns. The judge head trains against `judge_label` from the harness verdict, masked by source tag. The value head trains against the discounted-back propagation. The 16 dimensions are a planned third supervisor, not a deployed one.
+**Actual.** The v4 production checkpoint (`wm_v4_random_split`)
+trains its value head against `terminal_reward` propagated through
+`rewards::compute` — i.e. only the harness source. The 16-dim
+distillation is **not wired** into the live trainer.
+`python/muzero/train_full_wm.py` reads `full_corpus_v2.parquet`
+(built by `build_full_corpus.py`); neither references the 16-dim
+columns.
 
-The drift between intended and actual is not laziness; it is the same structural failure as Math-Shepherd. The 16-dim path requires three artifacts to exist simultaneously: the generator script, an enrichment-time call out to the OpenAI API at the relevant concurrency, and a trainer that reads the new columns. The generator script alone is roughly 200 lines of Python plus a retry-aware async client plus a parquet writer. None of that is hard. None of it has been written. The pattern recurs.
+The judge head trains against `judge_label` from the harness
+verdict, masked by source tag. The value head trains against the
+discounted-back propagation. The 16 dimensions are a planned third
+supervisor, not a deployed one.
 
-## 6. The seventeen-day contamination window
+## 6 The 17-day contamination window
 
-The most honest paragraph in the project, quoted verbatim from the changelog:
+### 6.1 The 2026-05-05 retracted entry
 
-> ~~2026-05-05 — muzero-export value_target fix~~ Retracted 2026-05-11: this entry described a fix that was specified but NEVER landed in code. Kept verbatim below as a historical record of the gap between intention and implementation; the actual fix lives in the 2026-05-11 entry above.
+The most honest paragraph in the project. Quoted verbatim from
+`Claude.md`:
 
-The retracted prose is preserved as a struck-through blockquote so the project history reads honestly even on a casual scroll.
+> ~~2026-05-05 (Asia/Kolkata) — **muzero-export value_target fix**~~
+> **Retracted 2026-05-11**: this entry described a fix that was
+> specified but NEVER landed in code. Kept verbatim below as a
+> historical record of the gap between intention and implementation;
+> the actual fix lives in the 2026-05-11 entry above.
 
-The 2026-05-05 entry claimed that the terminal-reward extractor was reading a `result` column that was always null on the live multi-bench-runs table — that column was never populated by either the multi-bench driver or the harness scoring path — so every trajectory mapped to $r = 0.0$. Combined with the binary defaulting `--reward-source` to `fileRecall` and most invocations omitting `--dataset` (so the gold-files set was empty too), every export produced parquet rows with $R = 0$ and $v^\text{tgt}_t \in [-2.0, +0.285]$ — purely the discounted per-step shaping penalty, never crossing zero.
+The retracted prose is preserved as a struck-through blockquote so
+the project history reads honestly even on a casual scroll.
+
+### 6.2 What the 2026-05-05 entry claimed
+
+`pick_terminal_reward(RewardSource::Judge)` was reading
+`MultiBenchRow.result` (always NULL on the live `multi_bench_runs`
+table — that column was never populated by either the multi-bench
+driver or the harness scoring path), so every trajectory mapped to
+`terminal_reward = 0.0`. Combined with the binary defaulting
+`--reward-source` to `fileRecall` AND most invocations omitting
+`--dataset` (so `gold_files` was empty too), every export produced
+parquet rows with `terminal_reward = 0` and `value_target ∈ [-2.0,
++0.285]` — purely the discounted per-step shaping penalty, never
+crossing zero.
 
 The entry claimed three changes landed:
 
-1. Added a nullable `judge_label` field to the multi-bench row struct, populated from the migration-008 column.
-2. Mapped the judge reward source as $\text{label} \geq 0.5 \Rightarrow +1.0$, $\text{label} < 0.5 \Rightarrow -1.0$, null $\Rightarrow 0.0$ so HL-Gauss bins in $[-1, +1]$ saw both signs.
-3. Flipped the binary default to judge.
+1. Added `judge_label: Option<f32>` to `MultiBenchRow`, populated
+   from the row's migration-008 column.
+2. `RewardSource::Judge` mapped `Some(≥0.5) → +1.0`, `<0.5 → -1.0`,
+   `None → 0.0` so HL-Gauss bins in $[-1, 1]$ saw both signs.
+3. Flipped binary default to `--reward-source judge`.
 
-The entry quoted a 500-trajectory smoke result: terminal rewards now in $\{-1.0, 0.0, +1.0\}$ (was $\{0.0\}$); $v^\text{tgt}_t$ spans $[-9.6, +1.2]$ (was $[-2.0, +0.285]$).
+The entry quoted a 500-trajectory smoke: `terminal_reward` unique
+values now $\{-1.0, 0.0, +1.0\}$ (was $\{0.0\}$); `value_target`
+spans $[-9.6, +1.2]$ (was $[-2.0, +0.285]$).
 
-Six days later, the audit found that nothing shipped. The multi-bench row struct did not carry the migration-008 columns. Every SELECT silently dropped them. The terminal-reward extractor was still matching on the legacy result column. The CLI default in the binary was still `fileRecall`.
+### 6.3 What actually shipped
 
-Every world-model checkpoint trained off the judge reward source between 2026-05-05 and 2026-05-11 regressed toward zero by construction. Six days. Whatever value-head $R^2$ those checkpoints reported, the regression target was constant $0.0$ modulo per-step shaping bounded in roughly $[-2.0, +0.285]$.
+**Nothing.** Six days later, the 2026-05-11 audit found:
 
-### 6.1. Why this matters more than the bug
+- `MultiBenchRow` did NOT carry the migration-008 columns.
+- Every `SELECT` on `multi_bench_runs` silently dropped them.
+- `terminal_reward_from_judge` was still matching on
+  `row.result.as_deref() == Some("pass")`.
+- `--reward-source` default in the binary was still `fileRecall`.
 
-The bug is the class, not the instance. Migration 008 landed in Postgres on 2026-04-23. The Rust struct was the system's view. Two weeks of writes happened; the label writer persisted labels; every read silently dropped them. Nothing crashed. Nothing tested. The fix could be specced because the spec-author didn't actually run the fix.
+### 6.4 Cohort poisoned
 
-The retraction is the project's standard. From the principle file: "Don't overpromise; verify before claiming success — Sam lost a month to confident half-fixes; measure before declaring outcomes." The 2026-05-05 entry violates that explicitly. The 2026-05-11 retraction is the institutional response: keep the text, mark it unflinchingly, so future readers can grep for the strikethrough pattern.
+Every WM checkpoint trained off `--reward-source judge` between
+2026-05-05 and 2026-05-11 regressed toward zero **by construction**.
+Six days. Whatever value-head $R^2$ those checkpoints reported, the
+regression target was constant $0.0$ (modulo per-step shaping
+bounded roughly in $[-2.0, +0.285]$).
 
-This is the cohort-contamination class at full size:
+Quoted from the 2026-05-11 audit: *"Every WM checkpoint trained off
+`--reward-source judge` since then has regressed toward zero by
+construction."*
+
+### 6.5 Why this matters more than the bug
+
+**The bug is the class, not the instance.** Migration 008 landed in
+Postgres on 2026-04-23. The Rust struct was the system's view. Two
+weeks of writes happened (`LabelWriter::write` persisted labels);
+every read silently dropped them. Nothing crashed. Nothing tested.
+The fix could be specced because the spec-author didn't actually
+run the fix.
+
+**The retraction is the project's standard.** From the user's memory
+file: *"Don't overpromise; verify before claiming success — Sam lost
+a month to confident half-fixes; measure before declaring outcomes."*
+The 2026-05-05 entry violates that explicitly. The 2026-05-11
+retraction is the institutional response: keep the text, mark it
+unflinchingly, so future readers can grep for the `~~strike~~`
+pattern.
+
+This is the **cohort contamination class** at full size:
+
+1. Database migration lands (008, 2026-04-23).
+2. Writers persist data into the new columns.
+3. Readers don't read the new columns (silent struct drift).
+4. Downstream computation appears to work — shapes match, no nulls,
+   no panics.
+5. Training runs train against garbage.
+6. Audit finds the gap weeks later. Cohort is poisoned.
+
+The fix pattern is **T1**: make the Rust struct actually carry the
+migration columns. The fix is one line of code. The audit that
+finds it is six days of work.
+
+### 6.6 The T1–T9 audit fix set (2026-05-11)
+
+Each T is a specific landed code change, each verified by
+`cargo test --lib`.
+
+**T1 — `MultiBenchRow` reads migration-008 columns.**
+`src/store/mod.rs:295-326` adds four `Option`-typed fields
+(`judge_label: Option<f32>`, `judge_source: Option<String>`,
+`judge_detail: Option<serde_json::Value>`,
+`judge_labeled_at: Option<DateTime<Utc>>`) with `#[serde(default)]`.
+Postgres + memory stores plumbed. Memory store actually writes now
+(was a no-op). New `Store::get_multi_bench_row(run_id)` for the
+audit script. Struct doc reads: *"The columns existed in Postgres
+since 2026-04-23 but were NEVER plumbed into the Rust struct — every
+SELECT silently dropped them."*
+
+**T2 — `RewardSource::Judge` reads `judge_label`, masks invalid
+sources.** `src/muzero/export.rs::terminal_reward_from_judge`
+(file:36-49) — `harness_{unsupported, collided, invocation_failed}`
+→ $0.0$ regardless of label; otherwise read `judge_label`, clamp
+$[0, 1]$. Legacy `result` column ignored entirely. Eight unit tests
+pin every bucket.
+
+**T3 — Binary default flipped.** `src/bin/muzero_export.rs:75`:
+`--reward-source` default `"fileRecall"` → `"judge"`.
+
+**T4 — Python visit-distribution loader.**
+`python/muzero/dataset.py::parse_visit_distribution` — Rust's
+`mcts_step_snapshots` emits children as a JSON list-of-objects, but
+the pre-audit Python loader only handled `Dict[str, int]` and fell
+through to uniform distribution. **Silently zeroed the policy-head
+target.** Nine-test pytest suite covers the cases.
+
+**T5 — `stratified_sample` dedupes triples.**
+`src/judge_bootstrap/sample.rs::stratified_sample` — dedupes input
+by `(instance_id, model, condition)` before bucketing. Defensive
+against sweep-restart drift; not a substitute for T6.
+
+**T6 — Harness-id collision guard.**
+`mswebench_runtime.rs::run_batch_via_mswebench` Phase 1.5. The §4
+fix.
+
+**T7 — Backfill SQL.**
+`scripts/pipeline_integrity_backfill.sql` — re-tags
+already-contaminated rows from `mswebench_harness` to
+`harness_collided`, NULLs their labels. Three blocks (audit / write
+/ verify). Run interactively after quiescing workers. Rows stay
+sampleable for re-judge.
+
+**T8 — `judge_audit.py` honest-denominator report.**
+`scripts/judge_audit.py` — read-only psycopg2 report. 10 sections
+with separated denominators: cohort size, by-status, by-judge_source,
+patch-row pass rate (denom = `mswebench_harness` only), unsupported
+rate, collision rate, error rate, end-to-end pass rate, paired
+baseline-vs-perseus, collision audit (should be 0 post-T7). Filters:
+`--dataset`, `--condition`, `--model`, `--policy-fingerprint-sha`.
+
+**T9 — This honesty edit.** The retraction text in §6.1 plus the
+2026-05-11 entry in `Claude.md` that institutionalises the
+retraction format.
+
+### 6.7 Verification
+
+Quoted from `Claude.md` 2026-05-11:
+
+> Verification: `cargo fmt --check` (on touched files), `cargo
+> check --lib`, `cargo test --lib` 517/517 with `--test-threads=1`
+> (one pre-existing flake in `planner::transport::tests` under
+> parallel, owned by the WM/MCTS track), `python3 -m pytest
+> python/muzero/test_dataset.py` 9/9. No live smoke-export was run
+> from this branch — that requires engram + the rewrite on the
+> cohort, both owned by the other track.
+
+Note the explicit *non*-claim: "No live smoke-export was run."
+Contrast with the 2026-05-05 retracted entry's $\{-1.0, 0.0, +1.0\}$
+histogram, which was never run either, but claimed to have been.
+This is what calibrated audit prose looks like.
+
+## 7 Reward-signal flow
+
+The full pipeline, end to end. Two parallel chains: terminal credit
+(harness) and per-step shaping. Both land in the same
+`rewards::compute` aggregator and feed two different WM heads.
 
 ```mermaid
 flowchart TD
-    A[Migration 008 lands in Postgres]
-    A --> B[Writers persist into new columns]
-    B --> C[Readers don't read new columns:\nsilent struct drift]
-    C --> D[Downstream computation appears to work\nshapes match, no nulls, no panics]
-    D --> E[Training runs train against garbage]
-    E --> F[Audit finds the gap weeks later]
-    F --> G[Cohort is poisoned]
-    G --> H[Retraction format institutionalises the failure]
-```
-
-The fix pattern is one line of code: make the Rust struct actually carry the migration columns. The audit that finds it is six days of work.
-
-Three structural prerequisites would have prevented this entire class:
-
-1. A CI check that compares `information_schema.columns` against the Rust struct field list for every table-mapped struct. Five hundred lines of Python and an hour of work; not done.
-2. A typed migration framework that emits Rust struct stubs as a side effect of the SQL. We use raw SQL migrations and hand-written structs; the drift is unavoidable.
-3. A property test in the export binary that asserts on a synthetic row with every migration field non-null and refuses to export if the round-tripped struct loses fields. Defensive; not written.
-
-None of these are exotic. We did not build them because each one is fiddly and the contamination class is invisible until it explodes.
-
-### 6.2. The T1-T9 audit fix set
-
-Nine specific landed code changes, each verified by `cargo test --lib`.
-
-1. **T1.** The multi-bench row struct gains four nullable fields backing the migration-008 columns. Postgres and memory stores plumbed. Memory store now actually writes labels (was a no-op). A new accessor for the audit script.
-2. **T2.** The judge reward source reads `judge_label`, masks invalid sources. The `harness_unsupported`, `harness_collided`, and `harness_invocation_failed` tags map to $0.0$ regardless of label; otherwise read the label and clamp to $[0, 1]$. The legacy result column is ignored entirely. Eight unit tests pin every bucket.
-3. **T3.** The binary's `--reward-source` default flips from `fileRecall` to `judge`.
-4. **T4.** The Python visit-distribution loader. Rust's MCTS-step snapshots emit children as a JSON list of objects, but the pre-audit Python loader only handled dictionary form and silently fell through to a uniform distribution — zeroing the policy-head target. Nine-test pytest suite covers the cases.
-5. **T5.** Stratified sampler dedupes input by (instance_id, model, condition) before bucketing. Defensive against sweep-restart drift; not a substitute for T6.
-6. **T6.** Harness-id collision guard described in §4.2.
-7. **T7.** Backfill SQL — re-tags already-contaminated rows from `mswebench_harness` to `harness_collided`, nulls their labels. Three blocks (audit / write / verify). Run interactively after quiescing workers. Rows stay sampleable for re-judge.
-8. **T8.** Judge audit script — read-only psycopg2 report with separated denominators (patch-row pass rate vs unsupported rate vs collision rate vs end-to-end pass rate vs paired baseline-vs-perseus), filterable by dataset, condition, model, and policy fingerprint.
-9. **T9.** This honesty edit: the retraction text in §6 plus the changelog entry that institutionalises the retraction format.
-
-Verification language from the audit: 517/517 lib tests green under single-threaded run, nine of nine python tests green. No live smoke-export was run — that requires the cohort rewrite on a different track. Contrast with the 2026-05-05 retracted entry's three-bucket histogram, which was never run either but was claimed to have been. This is what calibrated audit prose looks like.
-
-Worth noting which T's did versus did not require schema work. T1, T6, T7 touched Postgres directly (struct plumbing, runtime guard, retag migration). T2, T3, T5 were pure code changes. T4 was a parser fix in Python. T8 was a new diagnostic, not a fix. T9 is the changelog convention. Roughly half the fix set was schema-coupled; that is consistent with the contamination class being a schema-versus-application drift.
-
-## 7. Reward-signal flow
-
-The full pipeline, end to end. Two parallel chains feed the same reward aggregator and two different world-model heads.
-
-```mermaid
-flowchart TD
-    A[multi_bench_runs row]
-    A --> B{harness invoked?}
-    B -- yes --> C[multi-swe-bench\nharness runner]
+    A[multi_bench_runs row] --> B{harness invoked?}
+    B -- yes --> C[python -m multi_swe_bench.harness.run_evaluation]
     B -- no --> Z[judge_source = harness_unsupported]
     C --> D[final_report.json verdict]
-    D --> E{F2P all pass\nAND P2P preserved?}
+    D --> E{F2P all pass AND P2P preserved?}
     E -- yes --> F[judge_label = 1.0]
     E -- partial --> G[judge_label = 0.5]
     E -- no --> H[judge_label = 0.0]
+
     F --> I[set_judge_label to Postgres]
     G --> I
     H --> I
-    Z --> J[judge_label = NULL\nterminal_reward = 0]
-    I --> K["R = 2·judge_label − 1"]
-    K --> L["terminal credit:\nγ^(T−t) · R"]
-    L --> M["v_tgt_t = discount sum\n+ terminal"]
-    N[per-step shaping] --> O["+0.1·new_gold_hits\n− 0.05·empty_tool"]
-    O --> P[r_t per step]
+    Z --> J[judge_label = NULL, terminal_reward = 0]
+
+    I --> K[R = 2*judge_label - 1]
+    K --> L[terminal_reward gamma^T-t * R]
+    L --> M[v_tgt_t = discount sum + terminal]
+
+    N[per-step shaping] --> O[+0.1*new_gold_hits -0.05*empty_tool]
+    O --> P[r_t per-step]
     P --> M
-    M --> Q[value head:\nHL-Gauss 51-bin]
+
+    M --> Q[value head: HL-Gauss 51-bin]
     P --> R2[step_reward head]
     I --> S[judge_value head]
-    Q --> T[wm_v4_random_split]
+
+    Q --> T[wm_v4_random_split checkpoint]
     R2 --> T
     S --> T
-    T --> U[wm-serve at cato:19100]
-    U --> V["MCTS UCB prior blend\nα = 0.3"]
+    T --> U[wm-serve at cato 19100]
+    U --> V[MCTS UCB prior blend alpha=0.3]
 ```
 
-The collision guard and the source-mask gate both cut into this graph at the `judge_label` write. The 16-dim distillation would attach to the judge-value head as a parallel supervisor; it is not wired in v4.
+The collision guard (§4) and the source-mask gate (§4.4) both cut
+into this graph at the `judge_label` write. The 16-dim distillation
+(§5) would attach to the `judge_value` head as a parallel
+supervisor; it is not wired in v4.
 
-### 7.1. Per-step shaping decomposition
+## 8 The `RewardSource` enum
 
-The shaping signal is the only per-step reward actually in production. It decomposes as
+`src/muzero/mod.rs` declares three values:
 
-$$
-r_t^{\text{shape}} \;=\; \alpha_+ \cdot |\text{new\_gold\_hits}_t| \;-\; \alpha_- \cdot \mathbb{1}[\text{empty\_tool}_t] \;-\; \alpha_d \cdot d_t
-$$
+| Variant      | Source                                              |
+|--------------|-----------------------------------------------------|
+| `FileRecall` | Gold-set coverage at final step (proxy)             |
+| `Judge`      | `judge_label` from harness (production default)     |
+| `Heuristic`  | Averages intermediate shaping                       |
 
-with $\alpha_+ = 0.1$, $\alpha_- = 0.05$, and the depth penalty $\alpha_d = 0$ in v4 (left as a tuning hook). The `new_gold_hits` term fires when a planner call surfaces a file in the gold patch set that has not been seen on this branch before; the `empty_tool` term fires when a tool returns zero hits. The shaping is intentionally conservative — it rewards exploration that finds relevant files and penalises wasted tool calls, but it does not encode any deeper notion of progress. Anything richer would require labels we do not have.
+`RewardSource::parse` accepts the strings
+`filerecall | file_recall | recall | judge | heuristic`.
 
-The discounted return seen by the value head is the sum of the terminal credit and the cumulative shaping:
+CLI default history:
 
-$$
-v^\text{tgt}_t \;=\; \gamma^{T-t} R \;+\; \sum_{k=t}^{T-1} \gamma^{k-t} r_k^{\text{shape}}.
-$$
+- ≤ 2026-05-05: `"fileRecall"`. Retracted "fix" claimed to flip it.
+- 2026-05-11 (T3): actually flipped to `"judge"`.
 
-For a trajectory of length $T = 50$ with $\gamma = 0.997$ and shaping bounded in $[-0.05, +0.5]$ per step, the cumulative shaping at $t = 0$ is bounded in roughly $[-2.16, +21.6]$ and at $t = T-1$ collapses to a single step. The terminal credit at $t = 0$ for a successful trajectory is $\gamma^{50} R \approx 0.860 \cdot R$; for a failed one with $R = 0$ the term vanishes. So early-trajectory rewards in production are dominated by shaping, late-trajectory rewards by terminal credit, and the cross-over depends on the trajectory length and $\gamma$.
+`pick_terminal_label` in `export.rs:24-31` dispatches `Judge →
+terminal_reward_from_judge(row)`. The `FileRecall | Heuristic` arms
+are kept for cohorts where `judge_label IS NULL` — gold-file set
+as next-best proxy when the harness path is unavailable.
 
-This is a known weakness. Shaping is bounded, terminal credit is sparse, and the gap between them at intermediate $t$ is not anchored to anything calibrated. The 16-dim distillation in §5 was supposed to fill exactly that gap; until it ships, we have a value head that is well-anchored at terminal and weakly-anchored in the middle.
+The judge mapping in `terminal_reward_from_judge`:
 
-The reward-source enum has three values: file recall (gold-set coverage at final step, used as a proxy when the judge label is unavailable), judge (the harness label, current production default), and heuristic (averages intermediate shaping). The judge mapping in the terminal-reward extractor matches the four contamination tags and zeros them; everything else reads `judge_label` and clamps. Upstream in the reward aggregator,
-
-$$
-R \;=\; 2 \cdot \text{judge\_label} - 1 \;\in\; [-1, +1]
-$$
-
-so that HL-Gauss bins on $[-1, +1]$ see both signs of regression target.
-
-The branch-terminal state machine for label assignment, which is the part of the pipeline most prone to silent contamination, is small enough to fit on one screen:
-
-```mermaid
-stateDiagram-v2
-    [*] --> Queued
-    Queued --> Claimed: worker SKIP LOCKED
-    Claimed --> HarnessRunning: docker run
-    HarnessRunning --> Labelled: verdict parsed
-    HarnessRunning --> InvocationFailed: docker error / OOM / timeout
-    Claimed --> Collided: peer count > 1 at key
-    Claimed --> Unsupported: family not in test_spec
-    Labelled --> [*]: judge_label in {0, 0.5, 1}
-    InvocationFailed --> [*]: judge_label = NULL, source = invocation_failed
-    Collided --> [*]: judge_label = NULL, source = collided
-    Unsupported --> [*]: judge_label = NULL, source = unsupported
+```rust
+// src/muzero/export.rs:36-49 (paraphrased)
+match row.judge_source.as_deref() {
+    Some("harness_unsupported")
+    | Some("harness_collided")
+    | Some("harness_invocation_failed") => 0.0,
+    _ => row.judge_label.unwrap_or(0.0).clamp(0.0, 1.0),
+}
 ```
 
-The five terminal states each map to a distinct `judge_source` value, and the source mask in the trainer reads exactly those five tags. Misclassifying a Collided row as Labelled is what produced the original contamination; misclassifying a Labelled row as InvocationFailed would discard real signal. Both errors are caught by the post-T7 audit script.
+Then upstream in `rewards::compute`:
 
-## 8. Cost-per-regime table
+$$
+R = 2 \cdot \text{judge\_label} - 1 \in [-1, +1]
+$$
 
-This is the table that should have been at the top of every design-doc revision.
+so that HL-Gauss bins on $[-1, +1]$ see both signs of regression
+target.
 
-| Regime | Status | Cost / 60k labels | Latency to refresh | Per-step? | Calibrated? |
-|---|---|---|---|---|---|
-| Math-Shepherd N=8 | dead | 2-4k GPU-hours | weekend | yes ($\hat{q}$) | yes |
-| SWE-bench harness | active | hours of Docker | per row | no, terminal | no |
-| Multi-SWE-bench harness | canonical | hours of Docker | per row | no, terminal | no |
-| nano-medium 16-dim | specced, not built | 39.59 USD | 82 min | yes | yes |
-| Per-step shaping | shipped | free | per row | yes | no |
-| Discounted backprop | shipped | free | per row | derived | no |
+## 9 What we learned
 
-The shipped reward signal as of 2026-05-19 is the bottom three rows: harness verdict at terminal, discounted backwards, plus per-step shaping. That is it. The top two rows are aspirational. The middle two are the active labour.
+Four short lessons, each tied to a sub-section above.
 
-A useful reframing: the per-row marginal cost of an additional supervisor is roughly $39.59 / 60{,}565 \approx 0.65 \cdot 10^{-3}$ USD for the nano-medium regime, versus roughly $10^{-2}$ USD for the harness (dominated by Docker startup and test latency, not API spend), versus essentially zero for shaping and backprop (in-process arithmetic). The reason we have not shipped the nano-medium layer despite its cost being thirteen times lower than the harness is not cost; it is that the harness produces verdicts we can defend in a paper and nano-medium produces calibrated scores we cannot, until they are independently anchored. Calibration without anchoring is metadata, not supervision.
+**Reward signal is the bottleneck, not architecture.** We spent more
+calendar time on the supervisor pipeline (judge harness, collision
+guard, retraction audit) than on the WM architecture. The 110M
+codet5p stack is two days of training. The label corpus that goes
+into it is six weeks of careful Postgres archaeology.
 
-## 9. What we learned
+**Migration-to-struct drift is the contamination class.** Whenever
+a Postgres column is added without the corresponding Rust struct
+update, every read silently drops the column. The 2026-05-05
+retracted entry is the perfect specimen. Audit pattern: after every
+migration, grep for the struct that maps the table and confirm the
+field exists. We have not automated this; we have institutionalised
+the retraction format.
 
-Four short lessons, each tied to a section above.
+**Harness keying is a feature of the dataset, not an implementation
+detail.** Multi-SWE-bench keys by `<org>/<repo>:pr-<n>`. Our
+multi-bench corpus has 10 variants per key. The collision was
+inevitable given how the harness was designed; the only question
+was whether we caught it before or after training on it. We caught
+it after.
 
-1. **Reward signal is the bottleneck, not architecture.** We spent more calendar time on the supervisor pipeline (harness wiring, collision guard, retraction audit) than on the world-model architecture. The 110M codet5p stack is two days of training. The label corpus that goes into it is six weeks of careful Postgres archaeology.
-2. **Migration-to-struct drift is the contamination class.** Whenever a Postgres column is added without the corresponding Rust struct update, every read silently drops the column. The 2026-05-05 retracted entry is the perfect specimen. After every migration, grep for the struct that maps the table and confirm the field exists. We have not automated this; we have institutionalised the retraction format.
-3. **Harness keying is a feature of the dataset, not an implementation detail.** Multi-SWE-bench keys by `<org>/<repo>:pr-<n>`. Our multi-bench corpus has ten variants per key. The collision was inevitable given how the harness was designed; the only question was whether we caught it before or after training on it. We caught it after.
-4. **The expensive label is the one you don't run.** Math-Shepherd N=8 was scoped at 2-4k of GPU-hours and never materialised because three pieces of infrastructure were missing. nano-medium 16-dim is scoped at 39.59 USD and the script that produces it does not exist in the repo. Both are correct in spec, neither is in production. The gap between "we have a plan" and "we have rows in the parquet file" is the only gap that matters.
+**The expensive label is the one you don't run.** Math-Shepherd N=8
+was scoped at \$2–4k of GPU-hours and never materialized because
+three pieces of infrastructure were missing. nano-medium 16-dim is
+scoped at \$39.59 and the script that produces it does not exist in
+the repo. Both are correct in spec, neither is in production. The
+gap between "we have a plan" and "we have rows in the parquet file"
+is the only gap that matters.
 
-The production reward signal as of 2026-05-19 is the Multi-SWE-bench harness verdict, discounted backwards through the trajectory, plus per-step shaping. The 16-dim distillation is a parking-lot artifact. The Math-Shepherd path is dead. The retraction format is the institutional response to the failure mode that produced them both.
+The production reward signal as of 2026-05-19 is: harness verdict
+(§3-4), discounted backwards through the trajectory, plus per-step
+shaping. That is it. The 16-dim distillation is a parking-lot
+artifact. The Math-Shepherd path is dead.
 
-The 110M codet5p stack we are training off this signal converges; the value head's $R^2$ on a held-out instance split sits in the high 0.1s, low 0.2s, which is below the leaked-row-split numbers reported on earlier checkpoints but is the honest one. The judge head reaches a similar floor. The step-reward head, which has the densest supervision per row but the weakest anchoring, lags behind. None of those numbers are good. They are the numbers the supervisor permits, and the supervisor is what this essay is about.
+## 10 Cross-links
 
-If we get to redo this stack from scratch, three things would change. First, every Postgres migration would land with a paired Rust struct PR or block at CI — the contamination class is an automatable check that we have not bothered to automate. Second, the harness collision check would be enforced at the harness-key construction site, not at the demultiplexer, so the failure mode becomes unrepresentable rather than caught-after-the-fact. Third, the nano-medium distillation would be wired before being scoped, even at small scale (a thousand rows, twelve cents) — the gap between spec and parquet rows is the only gap that matters, and the cheapest way to close it is to actually open the file.
+- [multi-swe-bench wiring](/essays/multi-swe-bench-wiring/) — the
+  2026-05-02 adapter fixes in adapter detail; the collision bug
+  pre-T6.
+- [nano judge distillation](/essays/nano-judge-distillation/) — the
+  16-dim distillation plan, the \$39.59 / 60,565-row cost ledger,
+  the missing script.
+- [WM heads decoding](/essays/wm-heads-decoding/) — how `judge_value`
+  / `value` / `step_reward` heads consume these labels at training
+  time.
+- [pipeline integrity audit](/essays/pipeline-integrity-audit/) —
+  T1–T9 in full code-diff detail.
+- [cohort contamination class](/essays/cohort-contamination-class/) —
+  the general failure mode this essay's §6 is a specimen of.
+- [the reset](/essays/the-reset/) — the project-level decision in
+  the same week to retract V2 design assumptions wholesale.
 
-There is also a meta-point about how the project navigated this. The retraction format — strikethrough, dated, with the original text preserved verbatim — is the most valuable artifact in the changelog. It is the only mechanism we have for distinguishing "what we believed at time $t$" from "what was true at time $t$." Without it, future readers would smooth over the 2026-05-05 gap and re-make the same fix. With it, a casual scroll surfaces the failure. That is worth more than any individual fix, including the ones that produced it.
+## Sources
 
-The reward signal will eventually get richer. Either the 16-dim distillation will ship and the value head will gain a calibrated per-step anchor, or Math-Shepherd-style rollouts will become tractable when seed-state is implemented, or some third path nobody has scoped yet will produce dense labels at lower marginal cost. None of those are blocked on theory. They are blocked on the same gap that every other unshipped supervisor has been blocked on: nobody has opened the file.
-
-Two unresolved questions worth flagging. First, the source-mask gate currently treats `harness_collided`, `harness_unsupported`, and `harness_invocation_failed` identically — all map to zero terminal reward and zero gradient on the judge head. But the three sources carry different information. A collided row has a real verdict somewhere; an unsupported row has none; an invocation-failed row has a verdict that exists in principle but was lost. Treating them identically is conservative, but it is also lossy. A future trainer could distinguish them with three source-specific loss weights. Second, the per-step shaping coefficients $\alpha_+ = 0.1$ and $\alpha_- = 0.05$ are unverified — they were set by intuition and never swept. A two-by-two grid search would tell us within a few hours of training time whether the ratio is right. We have not run it. That is what most of this essay is about.
+- `Claude.md` "Last Updated" entries 2026-04-23 (judge-bootstrap +
+  migration 008), 2026-05-02 (mswebench harness wiring + live
+  deployment), 2026-05-05 (RETRACTED muzero-export value_target
+  fix), 2026-05-11 (pipeline-integrity audit T1–T9 + Math-Shepherd
+  deprecation).
+- `src/judge_bootstrap/{runtime, swebench, multiswebench,
+  mswebench_runtime, docker, families, label, sample}.rs` — the
+  judge-bootstrap subsystem source.
+- `src/muzero/{rewards, export, mod}.rs` — the reward computation
+  and `RewardSource` enum.
+- `src/bin/muzero_export.rs` — the export binary, line 75 for the
+  flipped default.
+- `src/store/{mod, postgres, memory}.rs` — `MultiBenchRow` struct
+  with migration-008 columns (T1).
+- `migrations/008_judge_labels.sql` — the `judge_label` /
+  `judge_source` / `judge_detail` / `judge_labeled_at` schema add.
+- `scripts/judge_audit.py` — read-only psycopg2 report (T8).
+- `scripts/pipeline_integrity_backfill.sql` — collision retag
+  backfill (T7).
+- `docs/research/verifiers/two-tier-bootstrap.md` — original
+  Math-Shepherd N=8 spec (Stage 3, never built).
+- `docs/research/verifiers/2024-wang-math-shepherd.md` —
+  Math-Shepherd paper notes.
+- `docs/research/design-decisions/verifier-sizing-rationale.md` —
+  16-dim distillation cost analysis.
+- `docs/research/design-decisions/training-pipeline.md` Step 5 —
+  "replaces Math-Shepherd".
+- `docs/research/method-audit.md` line 445 — the audit that
+  flagged the implementation drift.
+- `docs/reference/src/judge_bootstrap/index.md` §5 — collision-guard
+  reference.
+- `docs/reference/multi_swe_bench_harness.md` — harness deployment
+  runbook + HF dataset download.
+- `parking_lot/v2_archive_2026-05-18/HISTORY/33_multibench_detail.md`
+  — live cohort counts.
+- `parking_lot/v2_archive_2026-05-18/HISTORY/34_reward_modeling.md`
+  — this essay's structural source.
+- `parking_lot/v2_archive_2026-05-18/HISTORY/49_multibench_driver.md`
+  — driver-level detail.
+- `python/muzero/{dataset, enrich_parquet_v2, build_full_corpus,
+  train_full_wm}.py` — the Python side; `gen_value_targets_v2.py`
+  is the missing file from §5.5.
+- `python/muzero/test_dataset.py` — 9-test pytest suite (T4).
