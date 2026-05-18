@@ -98,15 +98,15 @@ This is the structural reason codet5p stays in the tree even after qwen3 takes t
 
 ```mermaid
 flowchart LR
-    Q[query / state text] --> CT5[codet5p-110m-embedding<br/>frozen, 256-d output]
+    Q[query / state text] --> CT5[codet5p-110m-embedding\nfrozen, 256-d output]
     CT5 -->|retrieval path| NORM[L2 normalise]
-    NORM --> COS[cosine similarity<br/>vs chunk vectors]
+    NORM --> COS[cosine similarity\nvs chunk vectors]
     COS --> HITS[top-k hits]
-    CT5 -->|WM trunk path| DS[DeepSets pool<br/>over chunks]
-    DS --> V[value head<br/>HL-Gauss 51 bins]
-    DS --> J[judge head<br/>tanh-bounded]
+    CT5 -->|WM trunk path| DS[DeepSets pool\nover chunks]
+    DS --> V[value head\nHL-Gauss 51 bins]
+    DS --> J[judge head\ntanh-bounded]
     DS --> R[step_reward head]
-    DS --> P[policy head<br/>softmax over tools]
+    DS --> P[policy head\nsoftmax over tools]
 ```
 
 The asymmetry between the two paths is sharp. The retrieval consumer takes the raw 256-d output, L2-normalises, and computes cosine similarity against pre-indexed chunk vectors. No further weights are involved; the embedder is the entire model in this path. The WM consumer takes the same 256-d output, pools it across the state's chunks through DeepSets, and feeds the pooled vector into four MLP heads trained on value, judge, step-reward, and policy targets. The embedder is the trunk; downstream heads carry the task-specific weights.
@@ -184,7 +184,7 @@ flowchart TD
     REQ[planner step requests state evaluation]
     REQ --> CACHE{LRU hit?}
     CACHE -->|yes 70%| FAST[0.04 ms return]
-    CACHE -->|no 30%| ENC[codet5p encode<br/>30 ms on V100 fp16]
+    CACHE -->|no 30%| ENC[codet5p encode\n30 ms on V100 fp16]
     ENC --> POOL[DeepSets across chunks]
     POOL --> HEADS[4 MLP heads forward]
     HEADS --> STORE[store in LRU + return]

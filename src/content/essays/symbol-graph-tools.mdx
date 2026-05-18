@@ -95,7 +95,7 @@ sequenceDiagram
     M->>M: UCB select, expand, backprop
     M->>T: emit pi_M_t, v_target, r
     T->>P: cross-entropy gradient on slot a*
-    Note over P: slot for callgraph_neighbors<br/>has prior epsilon; can move<br/>when training data has mass
+    Note over P: slot for callgraph_neighbors\nhas prior epsilon; can move\nwhen training data has mass
 ```
 
 Under keep-anyway, every cohort's training pass has the chance to redistribute mass across all 17 slots. Under pruning, the four slots are gone; the cross-entropy gradient cannot touch them; the only way back is architectural surgery. The cost of preserving the option to redistribute is one softmax over 17 categories instead of 13. The cost of foreclosing the option is a multi-day retrain at the moment the workload shifts.

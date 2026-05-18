@@ -357,7 +357,7 @@ flowchart LR
     A[code change] --> B{cohort clean?}
     B -- no --> C[backfill SQL]
     C --> B
-    B -- yes --> D[judge_audit.py<br/>filtered to policy_fingerprint]
+    B -- yes --> D[judge_audit.py\nfiltered to policy_fingerprint]
     D --> E{paired delta &geq; 0?}
     E -- no --> F[reject promotion]
     E -- yes --> G[promote]

@@ -253,7 +253,7 @@ traffic hits the new endpoint." We diagram the gap.
 ```mermaid
 flowchart LR
     A[sweep launched] --> B[four variants train]
-    B --> C{val_loss<br/>computed}
+    B --> C{val_loss\ncomputed}
     C --> D[r128: exported, merged, deployed :19305]
     C --> E[bigseq: exported, merged, idle]
     C --> F[superclean: not exported]

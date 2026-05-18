@@ -195,10 +195,10 @@ Each column has the same three-arrow structure: truth state, a substitution node
 flowchart TD
     Class[cohort contamination class]
     Class --> Silent[silent default substitution]
-    Silent --> A["Shape A — over-fanned key<br/>3,314 rows harness_collided"]
-    Silent --> B["Shape B — NULL maps to 0.0<br/>17 days poisoned WM ckpts"]
-    Silent --> C["Shape C — enum collapse<br/>786 rows invocation_failed"]
-    Silent --> D["Shape D — row-split leakage<br/>8 days alpha=0.9 on memorization"]
+    Silent --> A["Shape A — over-fanned key\n3,314 rows harness_collided"]
+    Silent --> B["Shape B — NULL maps to 0.0\n17 days poisoned WM ckpts"]
+    Silent --> C["Shape C — enum collapse\n786 rows invocation_failed"]
+    Silent --> D["Shape D — row-split leakage\n8 days alpha=0.9 on memorization"]
     A --> Fix1[T6 — refuse to label colliders]
     B --> Fix2[T1+T2 — plumb judge_label, raise on NULL]
     C --> Fix3[T6 — distinct enum, NULL not 0.0]
@@ -274,13 +274,13 @@ For perseus at $N = 4$ over 30 days, with $C_\text{rework}$ dominated by 17-day 
 
 ```mermaid
 flowchart LR
-    A[New code change] --> B{introduces<br/>silent default?}
+    A[New code change] --> B{introduces\nsilent default?}
     B -->|no| L[live]
-    B -->|yes, caught at<br/>code review| R1["cost: 1 hour<br/>(ADR-004 check)"]
-    B -->|yes, lands| C{produces<br/>plausible value?}
-    C -->|no| D1["cost: 1-3 days<br/>(downstream anomaly)"]
-    C -->|yes| D2["cost: 10-20 days<br/>(detection latency)<br/>+ rework"]
-    D2 --> E["compounding:<br/>WM ckpt redo,<br/>cohort filter, ADR write"]
+    B -->|yes, caught at\ncode review| R1["cost: 1 hour\n(ADR-004 check)"]
+    B -->|yes, lands| C{produces\nplausible value?}
+    C -->|no| D1["cost: 1-3 days\n(downstream anomaly)"]
+    C -->|yes| D2["cost: 10-20 days\n(detection latency)\n+ rework"]
+    D2 --> E["compounding:\nWM ckpt redo,\ncohort filter, ADR write"]
 ```
 
 The diagram is the economic argument. Caught at code review costs hours. Caught downstream costs days. Caught after a model trains on the contamination costs weeks. The structural enforcement at code review is the cheap intervention; the field-detection-and-rework loop is the expensive one.
@@ -290,16 +290,16 @@ We can state the prevention-vs-detection tradeoff as an explicit cost diagram, w
 ```mermaid
 flowchart TB
     subgraph PreventionRegime [Prevention regime — ADR-004 + ADR-005]
-        P1["code-review gate<br/>C_prevent ~ 1 engineer-hour/change"]
-        P2["type-system enforcement<br/>typed errors, no unwrap_or"]
-        P3["load-time refusal<br/>wm-serve rejects ckpt without metadata"]
+        P1["code-review gate\nC_prevent ~ 1 engineer-hour/change"]
+        P2["type-system enforcement\ntyped errors, no unwrap_or"]
+        P3["load-time refusal\nwm-serve rejects ckpt without metadata"]
         P1 --> P2 --> P3
     end
     subgraph DetectionRegime [Detection regime — audit after the fact]
-        D1["spot anomaly<br/>~1-3 engineer-days"]
-        D2["trace causation<br/>~3-5 engineer-days"]
-        D3["audit cohort<br/>~5-10 engineer-days"]
-        D4["retrain downstream<br/>~7-17 calendar-days WM time"]
+        D1["spot anomaly\n~1-3 engineer-days"]
+        D2["trace causation\n~3-5 engineer-days"]
+        D3["audit cohort\n~5-10 engineer-days"]
+        D4["retrain downstream\n~7-17 calendar-days WM time"]
         D1 --> D2 --> D3 --> D4
     end
     PreventionRegime ===|"C_prevent &lt;&lt; C_detect"| DetectionRegime
@@ -353,7 +353,7 @@ sequenceDiagram
     participant Perseus as perseus MCTS
 
     Trainer->>Disk: emit ckpt + metadata.json
-    Note over Disk: split.strategy, verified_disjoint,<br/>policy_fingerprint_shas, metrics
+    Note over Disk: split.strategy, verified_disjoint,\npolicy_fingerprint_shas, metrics
     WMServe->>Disk: read metadata.json
     alt missing or strategy=row_random with production_use=true
         WMServe-->>Trainer: refuse to load (CkptRefused)

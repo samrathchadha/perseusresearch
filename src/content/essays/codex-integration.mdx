@@ -231,15 +231,15 @@ Here is the full forward-and-reverse path on one picture.
 
 ```mermaid
 flowchart TD
-    A["Codex rollout file<br/>~/.codex/sessions/.../rollout-ts-uuid.jsonl"]
-    B["perseus-multi-bench driver<br/>insert multi_bench_runs row<br/>mb_run_id = instance-uuid"]
-    C["spawn_codex<br/>env: PERSEUS_EXTERNAL_SESSION_ID = mb_run_id<br/>PATH: dirname(codex_bin) + scripts/ + inherited"]
-    D["Codex child<br/>function_call: perseus-query bug summary"]
-    E["perseus-query shim<br/>curl POST /v1/query<br/>header: X-External-Session-Id"]
-    F["perseus /v1/query<br/>body or header into req.external_session_id<br/>run MCTS, persist trace"]
-    G["query_traces row<br/>run_id = qry-uuid<br/>external_session_id = mb_run_id"]
-    H["GET /v1/query/by_external_session/mb_run_id<br/>returns list of qry-uuids"]
-    I["codex_trace.py --run-id qry-uuid<br/>trace to rollout to event window"]
+    A["Codex rollout file\n~/.codex/sessions/.../rollout-ts-uuid.jsonl"]
+    B["perseus-multi-bench driver\ninsert multi_bench_runs row\nmb_run_id = instance-uuid"]
+    C["spawn_codex\nenv: PERSEUS_EXTERNAL_SESSION_ID = mb_run_id\nPATH: dirname(codex_bin) + scripts/ + inherited"]
+    D["Codex child\nfunction_call: perseus-query bug summary"]
+    E["perseus-query shim\ncurl POST /v1/query\nheader: X-External-Session-Id"]
+    F["perseus /v1/query\nbody or header into req.external_session_id\nrun MCTS, persist trace"]
+    G["query_traces row\nrun_id = qry-uuid\nexternal_session_id = mb_run_id"]
+    H["GET /v1/query/by_external_session/mb_run_id\nreturns list of qry-uuids"]
+    I["codex_trace.py --run-id qry-uuid\ntrace to rollout to event window"]
 
     A --> B --> C --> D --> E --> F --> G --> H --> I --> A
 ```

@@ -32,12 +32,12 @@ The structural asymmetry matters more. Autoresearch optimizes a discrete, high-d
 
 ```mermaid
 flowchart LR
-    A[v1 untyped hill-climb<br/>6 scenarios, single judge<br/>~USD 3-5, never committed] --> B[v2 MCTS, typed mutations<br/>12 scenarios, panel + tournament<br/>USD 229.94, winner 3c7f945f]
-    B --> C[v3 recall-grounded<br/>plan_system_override unlocks<br/>no-restart scoring, 5 instances]
-    C --> D[v4 composite scoring<br/>100-pool diversity, lift vs rg<br/>rejection rule, no winner committed]
-    B -. same machinery .-> E[WM stop-weights sweep<br/>11 configs, 9 aborted<br/>2 winners that won by zeroing<br/>most of their weights]
-    E --> F[null result:<br/>weight-tuning cannot fix<br/>structurally reward-hackable stop]
-    F --> G[two-vote conjunction stop<br/>structural fix]
+    A[v1 untyped hill-climb\n6 scenarios, single judge\n~USD 3-5, never committed] --> B[v2 MCTS, typed mutations\n12 scenarios, panel + tournament\nUSD 229.94, winner 3c7f945f]
+    B --> C[v3 recall-grounded\nplan_system_override unlocks\nno-restart scoring, 5 instances]
+    C --> D[v4 composite scoring\n100-pool diversity, lift vs rg\nrejection rule, no winner committed]
+    B -. same machinery .-> E[WM stop-weights sweep\n11 configs, 9 aborted\n2 winners that won by zeroing\nmost of their weights]
+    E --> F[null result:\nweight-tuning cannot fix\nstructurally reward-hackable stop]
+    F --> G[two-vote conjunction stop\nstructural fix]
 ```
 
 ## 2. v1: the hill-climb that never shipped
@@ -99,15 +99,15 @@ sequenceDiagram
     participant P as perseus serve
     participant Pl as planner
     participant R as retrieval-service
-    H->>P: POST /v1/query<br/>{plan_system_override: cand}
-    P->>P: resolve override<br/>(body > file > builtin)
-    P->>Pl: start query with override<br/>as SYSTEM message
+    H->>P: POST /v1/query\n{plan_system_override: cand}
+    P->>P: resolve override\n(body > file > builtin)
+    P->>Pl: start query with override\nas SYSTEM message
     Pl->>R: hybrid_search / search_text
     R-->>Pl: hits
     Pl-->>P: final evidence packet
     P-->>H: {hits, run_id}
-    H->>H: compute recall@k,<br/>overlap, lift vs ripgrep
-    H->>H: backprop score<br/>up MCTS tree
+    H->>H: compute recall@k,\noverlap, lift vs ripgrep
+    H->>H: backprop score\nup MCTS tree
 ```
 
 Note that the override applies *only* to the planner's system message. The retrieval-service, the tool registry, the world-model, and every other subsystem see no override at all. This is the right scope: prompt search is about the planner, not about the rest of the stack.
@@ -293,13 +293,13 @@ This costs one extra LLM call per stop proposal, which is the price of structura
 
 ```mermaid
 flowchart TD
-    P[planner emits<br/>status=stop, confidence c] --> Q{c above floor?}
-    Q -->|no| R[reject: status=continue<br/>add counter-hypothesis to failed_tail]
-    Q -->|yes| C[adversarial critic call<br/>different system prompt<br/>looks for missing evidence]
+    P[planner emits\nstatus=stop, confidence c] --> Q{c above floor?}
+    Q -->|no| R[reject: status=continue\nadd counter-hypothesis to failed_tail]
+    Q -->|yes| C[adversarial critic call\ndifferent system prompt\nlooks for missing evidence]
     C --> D{critic confirms?}
     D -->|no| R
-    D -->|yes| S[STOP: emit final hits<br/>terminate this stem]
-    R --> N[next planner iteration<br/>same node, updated context]
+    D -->|yes| S[STOP: emit final hits\nterminate this stem]
+    R --> N[next planner iteration\nsame node, updated context]
 ```
 
 The two cfg000/cfg010 winners can stay where they are, in the sweep summary on cato alongside the nine aborted siblings. They are a useful artifact: a recorded null result that documents *why* the conjunction gate exists.

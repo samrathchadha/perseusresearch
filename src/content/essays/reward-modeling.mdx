@@ -127,7 +127,7 @@ sequenceDiagram
     W->>W: parse F2P / P2P verdicts
     W->>L: JudgeDetail::label() squashes to {0, 0.5, 1}
     L->>DB: UPDATE judge_label, judge_source, judge_detail
-    Note over W,DB: row stays sampleable; failed parses<br/>get judge_source = harness_invocation_failed
+    Note over W,DB: row stays sampleable; failed parses\nget judge_source = harness_invocation_failed
 ```
 
 One observation we noted but never resolved: judging the same trajectory twice can produce different verdicts. ripgrep has flaky tests around `--mmap` on tmpfs; pytest hooks that hit the network (we re-allowed it for one family for one day and reverted); go tests that depend on the system clock. The 0.5 bucket absorbs some of this, but not all. We accepted a noise floor of roughly 0.95 inter-call agreement.
@@ -341,8 +341,8 @@ This is the cohort-contamination class at full size:
 flowchart TD
     A[Migration 008 lands in Postgres]
     A --> B[Writers persist into new columns]
-    B --> C[Readers don't read new columns:<br/>silent struct drift]
-    C --> D[Downstream computation appears to work<br/>shapes match, no nulls, no panics]
+    B --> C[Readers don't read new columns:\nsilent struct drift]
+    C --> D[Downstream computation appears to work\nshapes match, no nulls, no panics]
     D --> E[Training runs train against garbage]
     E --> F[Audit finds the gap weeks later]
     F --> G[Cohort is poisoned]
@@ -385,31 +385,31 @@ The full pipeline, end to end. Two parallel chains feed the same reward aggregat
 flowchart TD
     A[multi_bench_runs row]
     A --> B{harness invoked?}
-    B -- yes --> C[multi-swe-bench<br/>harness runner]
+    B -- yes --> C[multi-swe-bench\nharness runner]
     B -- no --> Z[judge_source = harness_unsupported]
     C --> D[final_report.json verdict]
-    D --> E{F2P all pass<br/>AND P2P preserved?}
+    D --> E{F2P all pass\nAND P2P preserved?}
     E -- yes --> F[judge_label = 1.0]
     E -- partial --> G[judge_label = 0.5]
     E -- no --> H[judge_label = 0.0]
     F --> I[set_judge_label to Postgres]
     G --> I
     H --> I
-    Z --> J[judge_label = NULL<br/>terminal_reward = 0]
+    Z --> J[judge_label = NULL\nterminal_reward = 0]
     I --> K["R = 2·judge_label − 1"]
-    K --> L["terminal credit:<br/>γ^(T−t) · R"]
-    L --> M["v_tgt_t = discount sum<br/>+ terminal"]
-    N[per-step shaping] --> O["+0.1·new_gold_hits<br/>− 0.05·empty_tool"]
+    K --> L["terminal credit:\nγ^(T−t) · R"]
+    L --> M["v_tgt_t = discount sum\n+ terminal"]
+    N[per-step shaping] --> O["+0.1·new_gold_hits\n− 0.05·empty_tool"]
     O --> P[r_t per step]
     P --> M
-    M --> Q[value head:<br/>HL-Gauss 51-bin]
+    M --> Q[value head:\nHL-Gauss 51-bin]
     P --> R2[step_reward head]
     I --> S[judge_value head]
     Q --> T[wm_v4_random_split]
     R2 --> T
     S --> T
     T --> U[wm-serve at cato:19100]
-    U --> V["MCTS UCB prior blend<br/>α = 0.3"]
+    U --> V["MCTS UCB prior blend\nα = 0.3"]
 ```
 
 The collision guard and the source-mask gate both cut into this graph at the `judge_label` write. The 16-dim distillation would attach to the judge-value head as a parallel supervisor; it is not wired in v4.

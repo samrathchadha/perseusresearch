@@ -79,21 +79,21 @@ The empty-patch finding was the visible surface of four layered failures, each o
 
 ```mermaid
 flowchart TD
-    A["2026-04-24<br/>WM alpha 0.3 to 0.9<br/>(on val_r2=0.997 leakage probe)"] -->|"8 days production<br/>blend 90 percent noise"| F["2026-05-18 reset"]
-    B["2026-04-24 to 2026-05-11<br/>Terminal-reward extractor<br/>reads NULL column (17 days)"] -->|"6 WM ckpts trained<br/>against r_hat identically 0"| F
-    C["2026-05-02 to 2026-05-11<br/>Harness collision<br/>plus exit-1 failure (4,100 rows)"] -->|"33 percent of done rows<br/>silently scored as real"| F
-    D["2026-05-12 to 2026-05-13<br/>Perseus condition<br/>485 of 485 empty patches"] -->|"P_pers 0/485<br/>vs P_base 5669/5691"| F
-    E["Pre-2026-05-18<br/>Three env vs code drifts<br/>(timeout, plan temp, schema)"] -->|"Doc not equal code<br/>for 4 to 6 weeks"| F
-    F -->|"'all the code is slop<br/>and monkey patched'"| G["Option a:<br/>full nuke and rewrite"]
-    G --> H["ADR-012:<br/>perseus IS MuZero"]
-    G --> I["Wipe V2 stack<br/>~72k LOC"]
-    G --> J["parking_lot archive<br/>preserves audit and data"]
-    H --> K["perseus/core/<br/>3,993 LOC<br/>Python 3.12 + FastAPI"]
+    A["2026-04-24\nWM alpha 0.3 to 0.9\n(on val_r2=0.997 leakage probe)"] -->|"8 days production\nblend 90 percent noise"| F["2026-05-18 reset"]
+    B["2026-04-24 to 2026-05-11\nTerminal-reward extractor\nreads NULL column (17 days)"] -->|"6 WM ckpts trained\nagainst r_hat identically 0"| F
+    C["2026-05-02 to 2026-05-11\nHarness collision\nplus exit-1 failure (4,100 rows)"] -->|"33 percent of done rows\nsilently scored as real"| F
+    D["2026-05-12 to 2026-05-13\nPerseus condition\n485 of 485 empty patches"] -->|"P_pers 0/485\nvs P_base 5669/5691"| F
+    E["Pre-2026-05-18\nThree env vs code drifts\n(timeout, plan temp, schema)"] -->|"Doc not equal code\nfor 4 to 6 weeks"| F
+    F -->|"'all the code is slop\nand monkey patched'"| G["Option a:\nfull nuke and rewrite"]
+    G --> H["ADR-012:\nperseus IS MuZero"]
+    G --> I["Wipe V2 stack\n~72k LOC"]
+    G --> J["parking_lot archive\npreserves audit and data"]
+    H --> K["perseus/core/\n3,993 LOC\nPython 3.12 + FastAPI"]
     I --> K
-    J --> L["lab/<br/>autoresearch v2 winner<br/>multibench, judge harnesses"]
-    K --> M["Two-vote stop:<br/>WM heads + planner"]
-    K --> N["pgvector replaces qdrant<br/>schema.sql is one file"]
-    K --> O["17-tool registry<br/>survives (ADR-012)"]
+    J --> L["lab/\nautoresearch v2 winner\nmultibench, judge harnesses"]
+    K --> M["Two-vote stop:\nWM heads + planner"]
+    K --> N["pgvector replaces qdrant\nschema.sql is one file"]
+    K --> O["17-tool registry\nsurvives (ADR-012)"]
 
     style A fill:#fdd
     style B fill:#fdd

@@ -113,7 +113,7 @@ sequenceDiagram
     else Rust service (0.5.0)
         Svc-->>P: {indices: [...], scores: [...]}
     end
-    Note over P: custom Deserialize<br/>flattens both shapes
+    Note over P: custom Deserialize\nflattens both shapes
     P->>P: RerankResp { indices, scores }
 ```
 

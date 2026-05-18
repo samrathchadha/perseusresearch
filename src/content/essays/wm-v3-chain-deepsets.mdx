@@ -81,11 +81,11 @@ A worked example makes the per-step flow concrete. Imagine a 5-step MCTS chain t
 ```mermaid
 flowchart LR
     subgraph trajectory["raw trajectory x_1 ... x_T"]
-        X1["x_1<br/>search_text(auth_token)"]
-        X2["x_2<br/>open_file(login.py)"]
-        X3["x_3<br/>snippet_extract(L42-78)"]
-        X4["x_4<br/>references_lookup(verify_jwt)"]
-        X5["x_5<br/>hybrid_search(expired token)"]
+        X1["x_1\nsearch_text(auth_token)"]
+        X2["x_2\nopen_file(login.py)"]
+        X3["x_3\nsnippet_extract(L42-78)"]
+        X4["x_4\nreferences_lookup(verify_jwt)"]
+        X5["x_5\nhybrid_search(expired token)"]
     end
     subgraph encoder["chain encoder (1-layer GRU, order-sensitive)"]
         G1["h_1"]
@@ -108,12 +108,12 @@ flowchart LR
     G3 --> P3["phi(x_3, h_3)"]
     G4 --> P4["phi(x_4, h_4)"]
     G5 --> P5["phi(x_5, h_5)"]
-    P1 --> SUM(("Sigma sum-pool<br/>z = sum_i phi(x_i, h_i)"))
+    P1 --> SUM(("Sigma sum-pool\nz = sum_i phi(x_i, h_i)"))
     P2 --> SUM
     P3 --> SUM
     P4 --> SUM
     P5 --> SUM
-    SUM --> RHO2["rho(z)<br/>trunk vector"]
+    SUM --> RHO2["rho(z)\ntrunk vector"]
 ```
 
 Each raw step $x_i$ is the concatenated codet5p embedding of the tool name plus args plus result snippet. The GRU folds left-context into $h_i$ so $\phi$ sees both the step and what came before. Then sum-pool collapses all $T$ per-step vectors into a single trunk-shaped $z$ regardless of $T$.
@@ -166,7 +166,7 @@ flowchart TB
         A2 --> S2
         B2 --> S2
     end
-    S1 --> Z["z identical<br/>(commutativity of sum)"]
+    S1 --> Z["z identical\n(commutativity of sum)"]
     S2 --> Z
     Z --> RHO3["rho(z)"]
     RHO3 --> Y["same prediction y"]
@@ -192,15 +192,15 @@ The ablation that removes the GRU (`v3_chain_ds_no_gru`, a follow-up not in the 
 
 ```mermaid
 flowchart LR
-    S["state_t<br/>(query, tool, args, snippet)"] --> E["codet5p-110m-embedding<br/>(frozen, 256-d)"]
-    E --> G["GRU chain encoder<br/>per-step hidden h_i"]
-    G --> PHI["per-step φ MLP<br/>256→512→512"]
-    PHI --> POOL["DeepSets sum-pool<br/>z = Σ φ(x_i, h_i)"]
-    POOL --> RHO["ρ readout MLP<br/>512→512"]
-    RHO --> H1["value head<br/>51-bin HL-Gauss"]
-    RHO --> H2["file_recall_t<br/>sigmoid"]
-    RHO --> H3["snippet_recall_t<br/>sigmoid"]
-    RHO --> H4["nano_prm<br/>regression"]
+    S["state_t\n(query, tool, args, snippet)"] --> E["codet5p-110m-embedding\n(frozen, 256-d)"]
+    E --> G["GRU chain encoder\nper-step hidden h_i"]
+    G --> PHI["per-step φ MLP\n256→512→512"]
+    PHI --> POOL["DeepSets sum-pool\nz = Σ φ(x_i, h_i)"]
+    POOL --> RHO["ρ readout MLP\n512→512"]
+    RHO --> H1["value head\n51-bin HL-Gauss"]
+    RHO --> H2["file_recall_t\nsigmoid"]
+    RHO --> H3["snippet_recall_t\nsigmoid"]
+    RHO --> H4["nano_prm\nregression"]
 ```
 
 The encoder is frozen. Embedding inference is amortized once per chain step and cached.
@@ -285,10 +285,10 @@ The gradient picture is straightforward: each head produces its own loss, the fo
 ```mermaid
 flowchart BT
     subgraph heads["four prediction heads"]
-        HV["value head<br/>L_value (w=1.0)"]
-        HP["PRM head<br/>L_prm (w=1.0)"]
-        HF["file_recall head<br/>L_fr (w=0.5)"]
-        HS["snippet_recall head<br/>L_sr (w=0.5)"]
+        HV["value head\nL_value (w=1.0)"]
+        HP["PRM head\nL_prm (w=1.0)"]
+        HF["file_recall head\nL_fr (w=0.5)"]
+        HS["snippet_recall head\nL_sr (w=0.5)"]
     end
     SUM_L["L_joint = sum_k w_k L_k"]
     HV --> SUM_L
@@ -354,7 +354,7 @@ flowchart TB
     EMB --> TRUNK[GRU + pool + ρ + heads]
     TRUNK --> STORE[store in LRU]
     STORE --> RET
-    RET --> BLEND["blend into UCB prior<br/>α · value + (1-α) · LLM_prior"]
+    RET --> BLEND["blend into UCB prior\nα · value + (1-α) · LLM_prior"]
 ```
 
 For the MCTS planner, latency budget is real. Each option expansion fires one WM probe and there can be 25-100 option expansions per planner call. A 50 ms latency tax times 50 expansions is 2.5 seconds per query, which matters when the user-facing latency target is tens of seconds.

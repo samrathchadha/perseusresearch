@@ -33,18 +33,18 @@ The v3 chain sweep ran the ablation directly. Variants that zeroed every loss we
 
 ```mermaid
 flowchart LR
-  S[state_text] --> E[codet5p-110m encoder<br/>frozen, 256-d pooled]
+  S[state_text] --> E[codet5p-110m encoder\nfrozen, 256-d pooled]
   E --> D[MLP / DeepSets trunk]
   D --> V[value MLP &rarr; 51 logits]
   D --> J[judge MLP &rarr; tanh scalar]
   D --> R[step_reward MLP &rarr; signed scalar]
   D --> P[policy MLP &rarr; 17 logits]
-  V --> VD[HL-Gauss decode<br/>v_hat in V_min, V_max]
+  V --> VD[HL-Gauss decode\nv_hat in V_min, V_max]
   J --> JD[tanh-bounded j in -1, +1]
   R --> RD[signed scalar r]
   P --> PD[softmax pi over 17 tools]
-  VD --> NV[value_to_norm<br/>scale to 0, 1]
-  JD --> NJ[judge_to_norm<br/>scale to 0, 1]
+  VD --> NV[value_to_norm\nscale to 0, 1]
+  JD --> NJ[judge_to_norm\nscale to 0, 1]
   RD --> NR[tanh squash]
   NV --> UCB[UCB prior blend]
   PD --> UCB

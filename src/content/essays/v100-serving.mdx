@@ -124,16 +124,16 @@ At HMMA.884 throughput, $T_\mathrm{tile} \approx 4.2 \text{ }\mu\text{s}$. At CU
 
 ```mermaid
 flowchart LR
-  Q[Q tile fp16] --> QKDot["Q·K^T dot<br/>(HMMA.884 fp16→fp16)"]
+  Q[Q tile fp16] --> QKDot["Q·K^T dot\n(HMMA.884 fp16→fp16)"]
   K[K tile fp16] --> QKDot
-  QKDot --> Widen1["Manual cast<br/>fp16 → f32"]
+  QKDot --> Widen1["Manual cast\nfp16 → f32"]
   Widen1 --> Acc1["f32 accumulator"]
   Acc1 --> Scale["·1/√d"]
   Scale --> Mask["causal + paged-block mask"]
-  Mask --> Softmax["online softmax<br/>(running max + sum)"]
-  Softmax --> SVDot["scores · V dot<br/>(HMMA.884 fp16→fp16)"]
+  Mask --> Softmax["online softmax\n(running max + sum)"]
+  Softmax --> SVDot["scores · V dot\n(HMMA.884 fp16→fp16)"]
   V[V tile fp16] --> SVDot
-  SVDot --> Widen2["Manual cast<br/>fp16 → f32"]
+  SVDot --> Widen2["Manual cast\nfp16 → f32"]
   Widen2 --> Out["O tile f32"]
 
   classDef forked fill:#ffd,stroke:#990,color:#000
@@ -149,10 +149,10 @@ The kernel's grid is two-dimensional: one block per (query-tile, head). Each blo
 ```mermaid
 flowchart TB
   subgraph QGrid["Query tiles (M=64 rows each)"]
-    Q0["Q-tile 0<br/>rows 0..63"]
-    Q1["Q-tile 1<br/>rows 64..127"]
+    Q0["Q-tile 0\nrows 0..63"]
+    Q1["Q-tile 1\nrows 64..127"]
     QD["..."]
-    Qn["Q-tile 46<br/>rows 2944..2999"]
+    Qn["Q-tile 46\nrows 2944..2999"]
   end
 
   subgraph TB0["Thread-block 0 (4 warps, 2 stages)"]
@@ -222,18 +222,18 @@ sequenceDiagram
   participant K as Triton prefix-prefill kernel
   participant D as torch.compile decode
 
-  C->>S: POST /chat/completions<br/>X-External-Session-Id: qry-abc123<br/>messages=[SYSTEM, USER_v2]
+  C->>S: POST /chat/completions\nX-External-Session-Id: qry-abc123\nmessages=[SYSTEM, USER_v2]
   S->>S: tokenize → input_ids (3050 toks)
   S->>Cache: lookup(session_id=qry-abc123)
-  Cache-->>S: cached_ids (3000 toks),<br/>cached_kv (DynamicCache)
+  Cache-->>S: cached_ids (3000 toks),\ncached_kv (DynamicCache)
   S->>S: longest_common_prefix(input_ids, cached_ids) = 3000
-  S->>Cache: trim_to_length(3000)<br/>(drop nothing this call)
+  S->>Cache: trim_to_length(3000)\n(drop nothing this call)
   S->>K: prefill(delta_ids[3000:3050], past_kv=cached_kv)
-  K->>K: block-sparse attention<br/>(50 new queries vs 3000 cached keys)
+  K->>K: block-sparse attention\n(50 new queries vs 3000 cached keys)
   K-->>S: new kv blocks appended (3000→3050)
   S->>D: decode(input_ids[-1], past_kv)
   loop ≤ 256 new tokens
-    D->>D: fused RMSNorm + qkv proj<br/>+ rotary + attention + SwiGLU
+    D->>D: fused RMSNorm + qkv proj\n+ rotary + attention + SwiGLU
     D-->>S: next_token
     S->>S: check stop sequences / EOS / max_tokens
   end
@@ -364,23 +364,23 @@ The 1640x ceiling assumes a workload where prefill is 100% of latency AND every 
 flowchart LR
   subgraph Stock["Stock vLLM 0.9.x cold (~7000 ms)"]
     direction TB
-    SP["Prefill 6200 ms<br/>(91%)"]
-    SD["Decode 620 ms<br/>(9%)"]
+    SP["Prefill 6200 ms\n(91%)"]
+    SD["Decode 620 ms\n(9%)"]
   end
   subgraph Kernel["+ Triton kernel (~866 ms)"]
     direction TB
-    KP["Prefill 246 ms<br/>(28%)"]
-    KD["Decode 620 ms<br/>(72%)"]
+    KP["Prefill 246 ms\n(28%)"]
+    KD["Decode 620 ms\n(72%)"]
   end
   subgraph Shim["+ DynamicCache shim (~633 ms)"]
     direction TB
-    HP["Prefill 13.3 ms<br/>(2%)"]
-    HD["Decode 620 ms<br/>(98%)"]
+    HP["Prefill 13.3 ms\n(2%)"]
+    HD["Decode 620 ms\n(98%)"]
   end
   subgraph Full["+ torch.compile decode (~299 ms)"]
     direction TB
-    FP["Prefill 13.3 ms<br/>(4%)"]
-    FD["Decode 286 ms<br/>(96%)"]
+    FP["Prefill 13.3 ms\n(4%)"]
+    FD["Decode 286 ms\n(96%)"]
   end
 
   Stock --> Kernel --> Shim --> Full
