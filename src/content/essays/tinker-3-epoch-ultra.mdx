@@ -87,21 +87,21 @@ is:
 - Bin-packing fill factor (first-fit on `max_seq_len=4096`):
   empirically ~**0.88**
 
-The packed batch consumes roughly $178{,}848 / 16 = 11{,}178$ raw
+The packed batch consumes roughly $178,848 / 16 = 11,178$ raw
 rows worth of training per epoch, except that `train_ultra.py` packs
 multiple short completions into each `max_seq_len` window, so the
 *effective* number of optimizer steps per nominal epoch is
 
 $$
 \text{steps/epoch} \approx \frac{N_{\text{rows}}}{B} \cdot f_{\text{pack}}
-\approx \frac{178{,}848}{16} \cdot 0.88 \approx 9{,}838
+\approx \frac{178,848}{16} \cdot 0.88 \approx 9,838
 $$
 
 A 3-epoch budget at that step rate is roughly 29,500 steps, but the
 run logged ~10,892 total steps before Tinker's job slot drained.
-Backing out: $10{,}892 / 9{,}838 \approx 1.11$ nominal epochs by the
+Backing out: $10,892 / 9,838 \approx 1.11$ nominal epochs by the
 crude divisor; with the more honest "raw rows / batch" denominator
-ignoring packing it's $10{,}892 / 11{,}178 \approx 0.97$ epochs. The
+ignoring packing it's $10,892 / 11,178 \approx 0.97$ epochs. The
 truth is somewhere in $[0.85, 1.1]$ nominal epochs depending on
 which counting convention you privilege. Call it ~0.85 with packing
 overhead and the early-step warmup attributed correctly.

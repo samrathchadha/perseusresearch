@@ -27,7 +27,7 @@ candidate labelers, three prices.
 
 ### 1.1 gpt-5.5-high direct API
 
-Pricing as of May 2026: `$6.00`/M input, `$18.00`/M output. Real
+Pricing as of May 2026: 6.00 USD/M input, 18.00 USD/M output. Real
 state_text after structured JSON of the planner trajectory, tool
 outputs, evidence packet, and gold patch averages ~8k input and 600
 output. Per-row cost:
@@ -36,9 +36,9 @@ $$
 C_\text{gpt-5.5} \;=\; \tfrac{6.00 \cdot 8000}{10^6} + \tfrac{18.00 \cdot 600}{10^6} \;=\; \$0.0588.
 $$
 
-60,565 rows: $\approx \$3{,}561$. Stress-testing with 12k input and
+60,565 rows: $\approx \$3,561$. Stress-testing with 12k input and
 800 output (the long-tail of multi-file patches) gets to the
-**~`$7.4k`** envelope cited by `verifier-sizing-rationale.md` line
+**~7.4k USD** envelope cited by `verifier-sizing-rationale.md` line
 51. That number is the "too expensive for the marginal label-noise
 gain" cutoff that killed this option for the v2 corpus.
 
@@ -47,23 +47,23 @@ gain" cutoff that killed this option for the v2 corpus.
 Spec-out: a Llama-3.1-7B fine-tuned on a chain-of-verdict dataset,
 deployed on a single H100, sampled $N = 8$ times per row, majority-
 voted. ~2.5s/row at $N=1$, ~20s/row at $N=8$, so ~336 GPU-hours
-for 60,565 rows. H100 spot at `$2.50`/hr lands ~`$840`; on-demand at
-`$4.50`/hr lands ~`$1,512`; with calibration-pass re-runs and the
+for 60,565 rows. H100 spot at 2.50 USD/hr lands ~840 USD; on-demand at
+4.50 USD/hr lands ~1,512 USD; with calibration-pass re-runs and the
 seed_state API + migration 011 + binary scaffolding it needs (none
 built), `training-pipeline.md` Step 5 books the whole option as
-"`$2-4k` GPU-hr (self-hosted 7B)".
+"2-4k USD GPU-hr (self-hosted 7B)".
 
 ### 1.3 gpt-5.4-nano-medium
 
-Pricing: `$0.10`/M input, `$0.40`/M output. Same 8k/600 budget:
+Pricing: 0.10 USD/M input, 0.40 USD/M output. Same 8k/600 budget:
 
 $$
 C_\text{nano-medium} \;=\; \tfrac{0.10 \cdot 8000}{10^6} + \tfrac{0.40 \cdot 600}{10^6} \;=\; \$0.00104.
 $$
 
-Actual run cost was **`$39.59`** — lower than spec because the
+Actual run cost was **39.59 USD** — lower than spec because the
 median state_text falls below 8k after JSON schema discipline (~5k
-input, ~480 output). The implied per-row `$0.000653` is **~90×
+input, ~480 output). The implied per-row 0.000653 USD is **~90×
 cheaper than gpt-5.5-high** at the same token profile, on top of
 being the *only* option that hits the §2 latency constraint.
 
@@ -71,10 +71,10 @@ being the *only* option that hits the §2 latency constraint.
 
 | Labeler | Per-row | 60,565-row total | Wall time | Setup |
 |---|---|---|---|---|
-| gpt-5.5-high (8k/600) | `$0.0588` | ~`$3`{,}561 | ~hours | trivial |
-| gpt-5.5-high (12k/800) | `$0.0864` | ~`$5`{,}232 | ~hours | trivial |
+| gpt-5.5-high (8k/600) | 0.0588 USD | ~3 USD,561 | ~hours | trivial |
+| gpt-5.5-high (12k/800) | 0.0864 USD | ~5 USD,232 | ~hours | trivial |
 | Self-hosted 7B, $N=8$ | $0.013-0.07 | \$2-4k GPU-hr | weekend on 40×H100 | seed_state API + migration 011 + new binary |
-| **gpt-5.4-nano-medium** | **`$0.00065`** | **`$39.59`** | **82 min** | one Python script |
+| **gpt-5.4-nano-medium** | **0.00065 USD** | **39.59 USD** | **82 min** | one Python script |
 
 The cost gap is decisive, but the cost gap is also a consequence of
 the latency property in §2, not a free lunch. nano-medium is the
@@ -93,7 +93,7 @@ Training scale:
 - 60,565 trajectories in the v2 corpus
 - ~50 MCTS expansions per trajectory (median; tail to 200 on
   multi-file bugs)
-- One judge query per expansion: $60{,}565 \cdot 50 \approx
+- One judge query per expansion: $60,565 \cdot 50 \approx
   3.03 \times 10^6$ judge calls per training epoch
 - 10 epochs: $3.03 \times 10^7$ calls
 
@@ -103,7 +103,7 @@ through the network. nano-medium's measured API round-trip is
 training-time cost is then:
 
 $$
-T_\text{train,api} \;=\; 3 \times 10^7 \cdot 0.12 \mathrm{s} \;\approx\; 3.6 \times 10^6 \mathrm{s} \;\approx\; 1{,}000 \mathrm{hours} \;\approx\; 42 \mathrm{days}.
+T_\text{train,api} \;=\; 3 \times 10^7 \cdot 0.12 \mathrm{s} \;\approx\; 3.6 \times 10^6 \mathrm{s} \;\approx\; 1,000 \mathrm{hours} \;\approx\; 42 \mathrm{days}.
 $$
 
 Six weeks of wall-clock for a single training run is operationally
@@ -134,7 +134,7 @@ trace.
 ### 2.1 What about full-size for the labeling pass only?
 
 A reasonable counter-proposal: label the corpus once with
-gpt-5.5-high (eating the `$3.5k` cost), then distill that into the
+gpt-5.5-high (eating the 3.5k USD cost), then distill that into the
 WM head. The judge head still gets the 23ms latency at inference.
 
 gpt-5.4-nano-medium's **inter-call agreement** measured at ~0.95 on
@@ -239,7 +239,7 @@ documented in `HISTORY/29_planner_training_research.md`). The
 `enrich_parquet_v2.py` reads recycle those calls into corpus
 columns.
 
-The 16-dim distillation as documented (`$39.59` / 60,565 / 82 min /
+The 16-dim distillation as documented (39.59 USD / 60,565 / 82 min /
 ~12 rps) is **the planned shape**. The realized v4 production WM
 checkpoint (`wm_v4_random_split`, deployed 2026-05-15 to
 `cato-user@66.172.10.101:19100`) trains its value head against
@@ -251,7 +251,7 @@ trainer.
 Two readings of this gap, both honest:
 
 1. **Aspirational** — `gen_value_targets_v2.py` was scoped, the
-   `$39.59` cost / 12 rps / 82 min numbers are from the planned run
+   39.59 USD cost / 12 rps / 82 min numbers are from the planned run
    that has not happened. The training-pipeline.md document was
    written ahead of execution.
 2. **Stale** — the script existed transiently, was used once to
@@ -276,7 +276,7 @@ That last reference is to the muzero-export judge_label fix that
 was specified, documented as landed in Claude.md, then audited two
 weeks later and found to have never been implemented. The honesty
 discipline here is to flag the gap loudly rather than carry the
-`$39.59` number as a closed line item.
+39.59 USD number as a closed line item.
 
 ## 5 Latency at inference
 
@@ -322,27 +322,27 @@ distinct prior values across same-tool nodes, is the operational
 validation that the 23ms forward is real and not a benchmark
 artifact.
 
-## 6 The phase transition at `$0.10` / M input
+## 6 The phase transition at 0.10 USD / M input
 
-nano-medium's API pricing dropped from `$0.30`/M input to `$0.10`/M
+nano-medium's API pricing dropped from 0.30 USD/M input to 0.10 USD/M
 input in May 2026. That cut moved the corpus economics across a
 hard threshold.
 
-| Regime | Per-row | 60,565 total | vs self-hosted 7B (~`$2k`) | vs gpt-5.5-high (~`$3.5k`) |
+| Regime | Per-row | 60,565 total | vs self-hosted 7B (~2k USD) | vs gpt-5.5-high (~3.5k USD) |
 |---|---|---|---|---|
-| `$0.30`/M (pre-cut) | `$0.00264` | ~`$160` | ~12× cheaper | ~22× cheaper |
-| `$0.10`/M (post-cut) | `$0.000653` | **`$39.59`** | ~50× cheaper | ~90× cheaper |
+| 0.30 USD/M (pre-cut) | 0.00264 USD | ~160 USD | ~12× cheaper | ~22× cheaper |
+| 0.10 USD/M (post-cut) | 0.000653 USD | **39.59 USD** | ~50× cheaper | ~90× cheaper |
 
 The threshold question is: *at what API price does it stop being
 worth running your own verifier?* Single-GPU 7B fp16 inference on an
-H100 costs roughly `$0.0008-``$0.0015` per row (depending on $N$ in
-majority voting and the GPU rate). nano-medium at `$0.10`/M input
-lands at `$0.00065` per row — **below the self-hosted floor**. Below
+H100 costs roughly 0.0008- USD0.0015 USD per row (depending on $N$ in
+majority voting and the GPU rate). nano-medium at 0.10 USD/M input
+lands at 0.00065 USD per row — **below the self-hosted floor**. Below
 the floor, self-hosted is strictly dominated.
 
 This is structural, not a coupon. The threshold property persists
 as long as nano-medium pricing stays below the self-hosted GPU
-floor; if pricing reverts to `$0.30`/M+, the calculus flips back and
+floor; if pricing reverts to 0.30 USD/M+, the calculus flips back and
 the corpus team budgets a GPU weekend instead of the API line item.
 
 The operational lesson: **avoid sunk cost in a self-hosted verifier
@@ -421,7 +421,7 @@ load-bearing on a single number — the API per-row cost. That number
 moved past the self-hosted floor in May 2026 and stayed there.
 Designs that depend on a single pricing threshold should bake in a
 revert plan if the threshold inverts. Ours: if nano-medium pricing
-reverts to `$0.30`/M+, retrain on the cached 16-dim labels (no new
+reverts to 0.30 USD/M+, retrain on the cached 16-dim labels (no new
 API spend), pivot the labeling pass to a self-hosted 7B at the next
 corpus refresh.
 
@@ -447,7 +447,7 @@ ckpt does not yet train against the 16-dim distill. The plan is
 documented, the cost is verified, the integration shape is clear;
 the wiring step is open. Same shape as several entries in
 HISTORY/34: the design is correct, the artifact is not yet
-deployed. We flag it loudly rather than carry the `$39.59` number
+deployed. We flag it loudly rather than carry the 39.59 USD number
 as a closed line item.
 
 ## Cross-references
@@ -481,9 +481,9 @@ as a closed line item.
   forward measurement, 24 wm_call smoke. 2026-05-11 entry — the
   pipeline-integrity audit honesty discipline.
 - `docs/research/design-decisions/verifier-sizing-rationale.md` —
-  16-dim axis spec, gpt-5.5-high `$7.4k` disqualification line 51.
+  16-dim axis spec, gpt-5.5-high 7.4k USD disqualification line 51.
 - `docs/research/design-decisions/training-pipeline.md` Step 5 —
-  realized `$39.59` / 60,565 / 82 min / ~12 rps numbers.
+  realized 39.59 USD / 60,565 / 82 min / ~12 rps numbers.
 - `python/muzero/enrich_parquet_v2.py` — actually-implemented
   enrichment script (`nano_prm_score`, `nano_confirm`, `nano_regret`
   from `planner_events`); distinct from the planned
