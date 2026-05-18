@@ -1,6 +1,8 @@
 ---
 import { getCollection, type CollectionEntry } from "astro:content";
 import Essay from "../../layouts/Essay.astro";
+import Figure from "../../components/Figure.astro";
+import Note from "../../components/Note.astro";
 
 export async function getStaticPaths() {
   const entries = await getCollection("essays", ({ data }) => data.status !== "draft");
@@ -30,5 +32,5 @@ const readTime = Math.max(1, Math.round(words / 200));
   headings={headings}
   related={entry.data.related}
 >
-  <Content />
+  <Content components={{ Figure, Note }} />
 </Essay>
