@@ -17,7 +17,7 @@ readTime: 13
 > instances, 7 languages) became canonical on 2026-05-02 with two
 > adapter fixes and one keying bug that fanned a single verdict across
 > ten collided rows. gpt-5.4-nano-medium 16-dim distillation specced
-> at &#36;39.59 / 60,565 rows, 82 minutes, was the per-step calibration
+> at `$39.59` / 60,565 rows, 82 minutes, was the per-step calibration
 > layer; the script that produces it does not exist in the repo as of
 > 2026-05-18. Six days between 2026-05-05 and 2026-05-11 every WM
 > checkpoint trained off `--reward-source judge` regressed toward zero
@@ -438,17 +438,17 @@ $[0, 60]$ minutes.
 
 | Axis              | Math-Shepherd N=8            | gpt-5.4-nano-medium     |
 |-------------------|------------------------------|-------------------------|
-| Cost / 60k rows   | &#36;2–4k GPU-hours (self-hosted 7B) | **&#36;39.59** API cost |
+| Cost / 60k rows   | `$2`–4k GPU-hours (self-hosted 7B) | **`$39.59`** API cost |
 | Run time          | weekend on 40$\times$H100    | **82 min**, $\sim$12 rps |
 | Label density     | 1 scalar / step ($\hat{q}$)  | 16 dims + 1 summary     |
 | Infra needed      | `seed_state` + migration 011 + binary (none built) | one Python script |
 | Inter-call agreement | $\sim 1.0$ ($N=\infty$)   | $\sim 0.95$             |
-| Re-cycle cost     | massive                      | &#36;40, weekly OK         |
+| Re-cycle cost     | massive                      | `$40`, weekly OK         |
 
-**Cohort:** 60,565 rows at &#36;39.59 (`training-pipeline.md` Step 5).
+**Cohort:** 60,565 rows at `$39.59` (`training-pipeline.md` Step 5).
 Concurrency 96, retry on 429, $\sim 12$ rps sustained throughput.
 
-The earlier gpt-5.5-high estimate was &#36;7,400 for the same row count
+The earlier gpt-5.5-high estimate was `$7,400` for the same row count
 (`verifier-sizing-rationale.md` line 51 — "too expensive for the
 marginal label-noise gain"). nano-medium is $\sim 185\times$ cheaper
 and we accept the modest agreement drop.
@@ -497,7 +497,7 @@ running a separate offline 16-dim distillation.
 Two plausible readings:
 
 1. **Aspirational.** `gen_value_targets_v2.py` was scoped, the
-   &#36;39.59 / 60,565 number is from a planned run that hasn't
+   `$39.59` / 60,565 number is from a planned run that hasn't
    happened.
 2. **Stale.** The script existed transiently and was renamed to
    `enrich_parquet_v2.py` or removed.
@@ -816,9 +816,9 @@ was whether we caught it before or after training on it. We caught
 it after.
 
 **The expensive label is the one you don't run.** Math-Shepherd N=8
-was scoped at &#36;2–4k of GPU-hours and never materialized because
+was scoped at `$2`–4k of GPU-hours and never materialized because
 three pieces of infrastructure were missing. nano-medium 16-dim is
-scoped at &#36;39.59 and the script that produces it does not exist in
+scoped at `$39.59` and the script that produces it does not exist in
 the repo. Both are correct in spec, neither is in production. The
 gap between "we have a plan" and "we have rows in the parquet file"
 is the only gap that matters.
@@ -834,7 +834,7 @@ artifact. The Math-Shepherd path is dead.
   2026-05-02 adapter fixes in adapter detail; the collision bug
   pre-T6.
 - [nano judge distillation](/essays/nano-judge-distillation/) — the
-  16-dim distillation plan, the &#36;39.59 / 60,565-row cost ledger,
+  16-dim distillation plan, the `$39.59` / 60,565-row cost ledger,
   the missing script.
 - [WM heads decoding](/essays/wm-heads-decoding/) — how `judge_value`
   / `value` / `step_reward` heads consume these labels at training
