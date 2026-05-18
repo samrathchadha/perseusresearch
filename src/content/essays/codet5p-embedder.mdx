@@ -352,8 +352,7 @@ together, not encoder isolation. The retrieval-quality reference table
 in `HISTORY/30_retrieval_research.md` carries "not measured" honestly in
 ~7 of its rows.
 
-**Semantic-cache stampede.** `SemanticCache: HashMap<String,
-Arc<SemanticIndex>>` had no LRU eviction; the in-process semantic
+**Semantic-cache stampede.** `SemanticCache: HashMap<String, Arc<SemanticIndex>>` had no LRU eviction; the in-process semantic
 feature was leaking memory on long-running perseus instances. Diagnosed
 2026-05-13 in `HISTORY/06_architecture_decisions.md:177`. Production
 multi-bench builds strip the entire semantic feature with

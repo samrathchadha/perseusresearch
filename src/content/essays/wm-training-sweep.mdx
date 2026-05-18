@@ -536,7 +536,7 @@ The parquet schema grew across the four eras. Each generation added columns the 
 | `perseus_py_v3_enriched` | 2026-05-13 | 1.26 GB | 190,995 | + `nano_prm_score`, `nano_confirm`, `nano_regret` (python subset only) |
 | `full_corpus_v2` | 2026-05-14 | — | 478,400 | 12-col, judge-labeled, deduped, post-audit |
 
-The current vt2 schema (`src/muzero/parquet_writer/mod.rs::schema`) is 23 columns: `instance_id`, `model`, `condition`, `run_id`, `trajectory_length`, `step`, `state_json`, `action_name`, `action_args_json`, `reward`, `value_target` (γ=0.95), `visit_distribution`, `chosen_action_index`, `stop_label`, `file_recall`, `gold_file_set`, `terminal_reward` (judge_label), `snippet_bodies`, `tool_history_vec` (FixedSizeList<Int32,30>), `embed_paths`, `leaf_value_target`, `sub_search_name`, `perseus_run_id`.
+The current vt2 schema (`src/muzero/parquet_writer/mod.rs::schema`) is 23 columns: `instance_id`, `model`, `condition`, `run_id`, `trajectory_length`, `step`, `state_json`, `action_name`, `action_args_json`, `reward`, `value_target` (γ=0.95), `visit_distribution`, `chosen_action_index`, `stop_label`, `file_recall`, `gold_file_set`, `terminal_reward` (judge_label), `snippet_bodies`, `tool_history_vec` (`FixedSizeList<Int32,30>`), `embed_paths`, `leaf_value_target`, `sub_search_name`, `perseus_run_id`.
 
 ### How the schema affected training
 

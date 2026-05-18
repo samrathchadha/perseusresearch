@@ -109,7 +109,7 @@ worse on long chains where count signal helps.
 For Perseus's WM, the set $X$ is the sequence of MCTS chain steps inside one
 planner call. Each $x_i$ is the concatenated codet5p embedding of the (tool
 name, tool args, tool result snippet, partial evidence packet) at step $i$.
-We take $T$ up to 30 steps (`tool_history_vec` is a FixedSizeList<Int32, 30>
+We take $T$ up to 30 steps (`tool_history_vec` is a `FixedSizeList<Int32, 30>`
 in the parquet); shorter chains are zero-padded with a mask.
 
 $\phi$ is a 2-layer MLP, 256→512→512, ReLU, dropout 0.25.
