@@ -1,0 +1,34 @@
+---
+import { getCollection, type CollectionEntry } from "astro:content";
+import Essay from "../../layouts/Essay.astro";
+
+export async function getStaticPaths() {
+  const entries = await getCollection("essays", ({ data }) => data.status !== "draft");
+  return entries.map((entry) => ({
+    params: { slug: entry.slug },
+    props: { entry },
+  }));
+}
+
+interface Props {
+  entry: CollectionEntry<"essays">;
+}
+
+const { entry } = Astro.props;
+const { Content, headings } = await entry.render();
+
+const body = (entry.body ?? "").replace(/```[\s\S]*?```/g, " ").replace(/<[^>]+>/g, " ");
+const words = body.split(/\s+/).filter(Boolean).length;
+const readTime = Math.max(1, Math.round(words / 200));
+---
+<Essay
+  title={entry.data.title}
+  date={entry.data.date}
+  summary={entry.data.summary}
+  tier={entry.data.tier}
+  readTime={readTime}
+  headings={headings}
+  related={entry.data.related}
+>
+  <Content />
+</Essay>

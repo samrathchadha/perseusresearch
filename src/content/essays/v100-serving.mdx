@@ -1,0 +1,1356 @@
+---
+title: "Serving on V100 sm_70: every speedup and every regression"
+date: 2026-05-18
+status: published
+tier: infra
+summary: "vLLM V1 hard-refuses sm_70. flash-attn v2 needs sm_80+. bf16 absent. fp16 only. Sixteen V100s at $0 marginal cost justified an in-house serving layer. Triton prefix-prefill (25.2×) + HF DynamicCache shim (30×) + torch.compile decode (2.17×) stacked. bnb-8bit −74%, TP=8 regressed, GPTQ shelved, n-gram specdec parked."
+related: ["llama-32-1b-tinker-planner","muzero-pipeline"]
+readTime: 14
+---
+
+import Figure from "../../components/Figure.astro";
+
+This is the one infra essay. It collapses every V100-serving topic
+that fed the production planner stack — the forked Triton kernel, the
+HF DynamicCache shim, the torch.compile decode bake, the failed TP
+sweeps, the bnb-8bit dead end, the parked n-gram specdec, the
+guided\_json choice that displaced native tool-calling, the vLLM-V1
+refusal, the multi-turn delta-append behavior — into one ledger. The
+hardware is hardcoded; the optimization surface is what fits the
+hardware.
+
+The compact statement: sixteen V100-SXM3-32GB cards at sm\_70, fp16
+only, no bf16, no fp8, no flash-attn v2, no CUDA graphs, no vLLM V1.
+At zero marginal cost they paid for an in-house serving layer that
+multiplies a 25.2× Triton prefix-prefill speedup × a 30× HF cache
+shim × a 2.17× torch.compile decode speedup into a 14× end-to-end win
+versus a stock vLLM 0.9.x baseline. Three regressions sit in the same
+ledger: bnb-8bit at −74%, TP=4 at −23% (TP=8 never reached
+single-stream parity), and the shim's own continuous-batching
+implementation at 0.32× — admission logic correct, actual
+parallelism never wired. Every speedup and every regression in one
+place.
+
+---
+
+## 1. The sm\_70 constraint cascade
+
+The V100 architecture is from 2017. Volta. Compute capability `sm_70`.
+For seven years it was the GPU you wanted; since Ampere (sm\_80, 2020)
+it has been the GPU you have. The cato lease puts us on the late side
+of that arc. Every "modern" inference trick either hard-fails on import
+or silently falls back to a reference path slower than the V100's own
+fp16 baseline.
+
+The cascade is structural. Each row in the table below is a path that
+the rest of the LLM-serving ecosystem assumes is available. We don't
+have it.
+
+| Component | Requirement | sm\_70 outcome |
+|---|---|---|
+| vLLM V1 engine | `compute_capability >= (8, 0)` hardcoded check at startup | Refused at process launch. Pinned to vLLM 0.9.x (last release with V0 default). |
+| flash-attn v2 | sm\_80+ to compile the kernel | Build fails. PyTorch SDPA (cuDNN backend) is the fallback. ~30% slower than FA2 on sm\_80+. |
+| flash-attn v3 | sm\_90 (Hopper) | Not available. |
+| bf16 dtype | sm\_80+ tensor cores for bf16 mma | Absent. fp16 is the only tensor-core dtype. |
+| fp8 dtype | sm\_89+ (Ada) tensor cores | Absent. |
+| CUDA graphs (vLLM cudagraph capture) | works on sm\_70 in principle, but vLLM's PagedAttention graph capture is silently disabled | `--enforce-eager` is the polite flag that stops vLLM from even trying. |
+| bitsandbytes 8-bit | IMMA tensor cores (Turing+) | Falls back to dequant-to-fp16 + HMMA + partial CPU offload. Measured −74% decode. |
+| GPTQ Marlin INT4 | sm\_80+ for Marlin kernels | Falls back to slower paths; whole point of INT4 (Marlin acceleration) doesn't exist. |
+| PyTorch 2.12 | sm\_70 dropped from official wheels | Pinned to torch 2.11 (and effectively 2.6 in our serving env). |
+| `tl.dot(input_precision="ieee")` | Triton lowers to f32-out mma | sm\_70 IR cannot lower f32-output mma. Kernel compilation fails or falls back to a slow reference path. |
+
+The combinatorial product of those failures is the entire serving
+problem. The serving solution lives in the gaps between them.
+
+### 1.1 Why we didn't migrate off
+
+The cato lease is locked in. The marginal cost of running an
+already-leased V100 is zero. The opportunity cost is the engineering
+hours spent making sm\_70 fast, which is exactly the work this essay
+documents. On the other side of the trade, an Ampere-or-newer fleet
+costs real dollars per hour and competes for budget with everything
+else (training compute, judge labeling, autoresearch).
+
+The arithmetic: sixteen V100s × 24 hours × 30 days = 11,520 GPU-hours
+per month at $0 incremental. The same workload on H100 spot pricing
+would be roughly $20k/month. An engineering quarter spent making V100
+fast pays for itself once.
+
+The decision is conditional on the lease running. When cato sunsets,
+the V100 serving code is deleted. Until then, every speedup in this
+essay compounds against the same fixed hardware.
+
+### 1.2 The vLLM V0 pin
+
+vLLM has two engine generations. V0 is the legacy engine that still
+backs every production deployment outside of the very newest hardware.
+V1 is the rewrite — async scheduling, smarter PagedAttention, native
+multi-step decoding. V1 also hardcoded `compute_capability >= (8, 0)`
+at engine startup. On sm\_70 the process exits before the model loads.
+
+We pin `vllm==0.9.x`, the last release where V0 is the default. The
+flag-set this implies, on every cato vLLM worker:
+
+```
+vllm serve <model> \
+  --enforce-eager \             # disable cudagraph capture (silent NOP on sm_70)
+  --dtype float16 \             # no bf16 available
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.85 \
+  --served-model-name <name>
+```
+
+The `--enforce-eager` flag is load-bearing. Without it the engine
+spends ~30s at startup attempting to capture CUDA graphs and emits
+warnings; with it it skips the capture path entirely and starts in
+~10s. The runtime cost of eager mode versus captured graphs would be
+~5% on sm\_80+; on sm\_70 the comparison is moot because the captured
+path doesn't exist.
+
+### 1.3 The PyTorch 2.12 cliff
+
+PyTorch 2.12 dropped Volta from official wheels. The serving env on
+cato is pinned to torch 2.6.0+cu124 (with transformers 4.x and triton
+3.3.0); the planner shim runs the same. The pin is permanent for the
+lifetime of the V100 fleet. Any dependency that requires torch 2.12+
+is structurally incompatible and gets shelved at the requirements
+step — GPTQModel 7.x is the canonical case (it requires torch ≥ 2.8
++ transformers ≥ 5).
+
+---
+
+## 2. The wins — the multiplicative speedup stack
+
+Three speedups stack. Each is independently validated, each operates
+on a different part of the inference loop, and their composition is
+what turns a 1.24B-param Llama on a 2017 GPU into a 175 tok/s decode
+machine that beats vLLM's stock path by 14× on warm planner traffic.
+
+The latency model:
+
+$$
+\mathcal{L}_\mathrm{total} = \mathcal{L}_p(T_p) + T_d \cdot \mathcal{L}_d
+$$
+
+where $\mathcal{L}_p$ is the prefill latency for $T_p$ prompt tokens,
+$T_d$ is the decoded token count, and $\mathcal{L}_d$ is the per-token
+decode latency. The three speedups attack different terms:
+
+1. **Triton prefix-prefill kernel fork** — multiplies $\mathcal{L}_p$
+   by ~25× on cache-warm calls (cached prefix attended only by the
+   new-token delta).
+2. **HF DynamicCache shim** — multiplies the warm-prefill term by
+   another ~30× by detecting that consecutive planner calls share a
+   token prefix and only prefilling the suffix delta.
+3. **torch.compile decode** — multiplies $\mathcal{L}_d$ by ~2.17×
+   by fusing RMSNorm, rotary, and SwiGLU MLP operations into compiled
+   kernels.
+
+The composition is multiplicative because each speedup operates on a
+disjoint segment of the latency budget. End-to-end on a depth-7
+planner prompt (~3,000 prefill tokens, ~50 decode tokens): 17.5s on a
+stock vLLM 0.9.x baseline path collapses to ~4.55s on the shim.
+
+### 2.1 Triton prefix-prefill kernel fork (25.2×)
+
+vLLM ships a `prefix_prefill.py` Triton kernel that handles
+prefix-cached prefill — the case where you have a long shared prefix
+already in the KV cache and a short delta of new tokens to prefill
+on top. The kernel computes attention so that the cached prefix is
+attended to only by the new-token delta, and the prefix-to-prefix
+block is skipped entirely. This is the same workload as
+block-sparse / paged-attention adapted for the streaming case.
+
+The vLLM mainline kernel uses two Triton constructs that fail on
+sm\_70:
+
+```python
+# vLLM mainline (does not work on sm_70):
+tl.dot(q, k, input_precision="ieee")          # widens to f32-output mma
+tl.dot(scores, v, out_dtype=tl.float32)       # widens to f32-output mma
+```
+
+The `input_precision="ieee"` and `out_dtype=tl.float32` arguments
+both ask Triton to emit f32-output matrix-multiply-accumulate
+instructions. On sm\_80+ this lowers to `m16n8k16.F32.F16.F16`
+tensor-core instructions (Ampere `.1688.F32.F16.F16`). On sm\_70 the
+analogous tensor-core instruction is `HMMA.884.F32.F16.F16` — but
+the Triton IR's f32-output mma path doesn't lower to it. Compilation
+either fails outright or falls back to a slow reference dot product
+that doesn't use the tensor cores at all.
+
+The fork at `services/perseus_planner_server/prefix_prefill_v100.py`
+makes five structural changes:
+
+1. **Drop `input_precision="ieee"`.** Default Triton fp16 mma path.
+2. **Explicit Q/K/V cast to fp16 before `tl.dot`.** Triton can't widen
+   what's already fp16.
+3. **`tl.dot(..., out_dtype=tl.float16)` followed by manual
+   `.to(tl.float32)` and add to f32 accumulator.** sm\_70 Triton
+   lowering only supports fp16-output dot; the f32 accumulation
+   happens manually outside the dot.
+4. **BLOCK\_M = BLOCK\_N = 64.** Smaller tiles fit sm\_70 shared
+   memory (96 KB/SM on V100 vs 100 KB/SM on A100, but the inner-loop
+   register pressure is also different).
+5. **`num_warps=4, num_stages=2`.** No `cp.async` instruction on
+   Volta — software pipelining with `num_stages=3+` doesn't help.
+
+The Volta tensor-core instruction is `HMMA.884.F32.F16.F16` — 8×8×4
+fp16 mma with f32 accumulator. Ampere's equivalent is
+`HMMA.1688.F32.F16.F16` (16×8×8). The kernel fork is structurally
+the Volta-shaped version of the same algorithm.
+
+Validated standalone on a synthetic prefix workload:
+
+| Workload | vLLM mainline kernel (sm\_70 fallback) | Forked kernel | Speedup |
+|---|---:|---:|---:|
+| Cold prefill: q=3008, ctx=0 | ~6,200 ms | 245.7 ms | ~25× |
+| Warm prefill: ctx=3000, delta=50 | ~245 ms | 9.73 ms | **25.2×** |
+
+The target had been 10×. The actual 25.2× came from the combination
+of the fp16-output dot (~12× on its own) and the tile-size + warp-stage
+tuning (~2× on top).
+
+The kernel exists in `prefix_prefill_v100.py` as a validated
+standalone function. **Wiring it into `LlamaAttention.forward`
+requires either layer-by-layer projection unrolling (~250 LOC) or
+bypassing HuggingFace entirely.** The shim's `engine.py` has a stub
+hook (`prefill_with_kernel`) that documents the wiring plan but
+raises `NotImplementedError`. The 25× standalone speedup is real;
+the in-engine win is currently 0× because the kernel is not yet
+plugged in.
+
+### 2.2 HF DynamicCache shim (30× warm prefill)
+
+The second multiplicative win is the planner-side observation that
+consecutive planner calls within one MCTS query share a stable token
+prefix. The SYSTEM prompt is byte-identical across iterations (tool
+catalogue + rules + few-shot examples is static across the entire
+query). The USER prompt has a growing append-only structure: query +
+branch metadata first, then branch observations in first-seen lineage
+order, then evidence, then volatile global state and budget at the
+end (per `PERSEUS_LLM_TREE_APPEND_ONLY_PROMPT=1`).
+
+Across two consecutive planner calls on the same stem, the shared
+prefix is typically 95%+ of the total prompt. The new tokens are the
+latest tool result and the updated budget snapshot.
+
+The shim, sitting at `:19340` on cato GPU 10, exploits this:
+
+1. **Session-id keyed cache.** Requests carry an `X-Session-Id`
+   header (the same `X-External-Session-Id` already stamped by perseus
+   for trace stitching).
+2. **Prefix scan on entry.** Compare the incoming `input_ids` against
+   the cached `input_ids` for that session. Find the longest common
+   prefix.
+3. **Trim cache to shared length.** The cached `DynamicCache` is
+   truncated to the shared-prefix length.
+4. **Prefill suffix delta only.** Only the new (non-shared) tail of
+   `input_ids` is run through the model's prefill path. The KV cache
+   for the shared prefix is already in memory and is consumed
+   directly by the decode loop.
+
+Cache-key correctness is a **performance** property, not a safety
+property. If the cache-key check is wrong — if we erroneously decide
+that an incoming prompt shares a prefix it doesn't actually share —
+the worst outcome is wrong output. But `model.forward` is still the
+source of truth for the suffix-delta prefill; the only way to get a
+correctness bug is if the entire `input_ids` is decided to be cached
+when it shouldn't be. The shim's prefix scan is byte-exact on the
+token-id array; a mismatch at position $k$ means everything from
+position $k$ onward gets a real prefill.
+
+Measured on the production planner prompt:
+
+| Phase | Latency | Notes |
+|---|---:|---|
+| Cold first call | 387 ms | Full 3,000-token prompt, no cache. |
+| Warm same-session | 13.3 ms | DynamicCache hit; only 50-token delta prefilled. |
+| Warm same-session (compile recompile) | 30,400 ms | New prompt shape triggers torch.compile bucket; see §3 known issues. |
+| Speedup (cold → warm, compile-cached) | **~29×** | Rounded; "30×" is the headline. |
+
+The compile-recompile case is the dominant operational concern, not
+a steady-state metric. Once the planner's prompt shape stabilizes
+within a query, the warm path holds at ~13ms.
+
+The shim is implemented in 1,455 LOC across seven files under
+`services/perseus_planner_server/`:
+
+| File | LOC | Role |
+|---|---:|---|
+| `server.py` | 165 | FastAPI, OpenAI-compatible `/v1/chat/completions`, `/health`, `/v1/models` |
+| `engine.py` | 326 | Model load, `torch.compile`, per-token forward, session KV cache |
+| `paged_kv.py` | 138 | Block-based KV bookkeeping with free-list + LRU eviction |
+| `scheduler.py` | 198 | Async request queue + scheduler tick loop |
+| `prefix_prefill_v100.py` | 257 | The Triton kernel from §2.1 (validated standalone, NOT wired) |
+| `smoke.py` | 251 | End-to-end cold/warm/concurrent smoke test |
+| `__init__.py` | 10 | Package marker |
+| **Total** | **1345** | (1,455 with whitespace) |
+
+Operational knobs:
+
+| Env | Default | Notes |
+|---|---|---|
+| `PLANNER_MODEL_PATH` | `/home/cato-user/tinker_merged/llama32-1b-epoch3-v3` | Merged Llama-3.2-1B |
+| `PLANNER_DEVICE` | `cuda:10` | V100 GPU 11 is dead, 10 is free |
+| `PLANNER_PORT` | `19340` | Distinct from 19320 (stock vLLM) |
+| `PLANNER_MAX_BATCH` | `8` | Max in-flight requests |
+| `PLANNER_TICK_MS` | `20` | Scheduler tick interval |
+| `PLANNER_KV_BLOCKS` | `4096` | Paged KV pool size |
+| `PLANNER_BLOCK_SIZE` | `16` | Tokens per block |
+| `PLANNER_COMPILE` | `1` | `0` to skip torch.compile |
+| `PLANNER_WARMUP` | `1` | `0` to skip 2-iteration warmup |
+| `PLANNER_CACHE_LRU` | `256` | Max session caches |
+| `PLANNER_MAX_NEW` | `512` | Default `max_tokens` |
+
+### 2.3 torch.compile decode (2.17×)
+
+The third multiplicative win operates on the decode loop. Once
+prefill has filled the KV cache, decode produces one token per
+forward pass. The forward pass touches every layer for one token, so
+its latency is dominated by GPU kernel launch overhead and memory
+bandwidth rather than mma throughput.
+
+`torch.compile(mode="default", fullgraph=False, dynamic=True)` with
+the Inductor backend on sm\_70 fuses three classes of operation:
+
+1. **RMSNorm + matmul-prologue fusion.** The pre-attention RMSNorm
+   feeds directly into the q/k/v projection matmul; Inductor fuses
+   the normalization into the matmul kernel.
+2. **Rotary positional embedding into q/k path.** The rotary embedding
+   was previously a separate kernel applied to q and k. Inductor
+   inlines it into the projection output.
+3. **SwiGLU MLP collapse.** The Llama MLP is gate × up → SwiGLU
+   activation → down projection. Inductor fuses the gate × up element-
+   wise mul into a single kernel and fuses the SwiGLU into the down
+   projection prologue.
+
+The decode loop on a stock SDPA + eager `transformers` path: ~80.6
+tok/s. The same model with `torch.compile`: **175 tok/s**. The 2.17×
+ratio holds across context lengths from 100 to 3,000 tokens; the
+compile is doing kernel fusion, not algorithmic improvement.
+
+The benefit is intrinsic to the architecture. Inductor was designed
+with sm\_80+ in mind but the codegen for sm\_70 works — it just
+emits fp16 mma instead of bf16 mma where applicable. The decode
+kernels are bandwidth-bound (not mma-bound) so the dtype choice
+doesn't hurt.
+
+### 2.4 Multiplicative composition
+
+Combine the three:
+
+$$
+\mathcal{L}_\mathrm{total}^{\text{(shim)}} = \frac{\mathcal{L}_p^{\text{(cold)}}}{25.2 \cdot 30} + T_d \cdot \frac{\mathcal{L}_d^{\text{(eager)}}}{2.17}
+$$
+
+For the production planner shape — $T_p \approx 3000$ tokens, $T_d
+\approx 50$ tokens, cold $\mathcal{L}_p \approx 6{,}200$ ms (stock
+sm\_70 fallback Triton kernel), $\mathcal{L}_d^{\text{(eager)}}
+\approx 12.4$ ms/tok:
+
+| Path | Prefill | Decode | Total |
+|---|---:|---:|---:|
+| stock vLLM 0.9.x baseline | ~6,200 ms | 50 × 12.4 = 620 ms | ~6,820 ms cold; ~12,400 ms decode-heavy |
+| + forked Triton kernel | 246 ms (cold) / 9.73 ms (warm) | 620 ms | 866 ms cold; 630 ms warm |
+| + DynamicCache shim | 387 ms (cold) / 13.3 ms (warm) | 620 ms | 1,007 ms cold; 633 ms warm |
+| + torch.compile decode | 387 / 13.3 ms | 50 / 175 tok/s = 286 ms | 673 ms cold; 299 ms warm |
+
+The composition isn't perfectly clean: the forked Triton kernel and
+the DynamicCache shim partially overlap in what they speed up (both
+make warm prefill fast). In practice the shim is what's deployed
+and the kernel is the on-deck improvement. The "14× end-to-end at
+depth 7" headline assumes the shim is the production warm-path
+multiplier (30× over stock) and the kernel landing would push the
+total higher.
+
+End-to-end at depth 7 prompts (long branch lineage, accumulated
+evidence, ~3,000-token average prompt): $\sim 17.5\text{s} \to 4.55\text{s}$
+across a full MCTS query of ~25 planner calls.
+
+---
+
+## 3. The failures — the regression catalogue
+
+For every speedup that landed, there's an attempted optimization that
+either didn't help or actively hurt. The failures are not
+embarrassments; they're the negative space of the optimization
+surface. Without them the wins look like luck.
+
+### 3.1 TP=8 regressed vs TP=1 on 1B
+
+Tensor parallelism splits the model's matmuls across N GPUs.
+Per-layer activations are reduced via `all_reduce` after attention
+and again after the MLP. The win scales with model size (more matmul
+per layer to share) and against `all_reduce` overhead (~70μs per
+sync on a single NVLink-connected node).
+
+For Llama-3.2-1B the per-layer matmul time at decode (single token,
+batch=1) is roughly:
+
+$$
+T_\mathrm{matmul} \approx \frac{2 \cdot \mathrm{params}_\mathrm{layer}}{\mathrm{FLOPS}}
+= \frac{2 \cdot 12.6\text{M}}{125\text{ TFLOPS}} \approx 0.2 \text{ μs/op}
+$$
+
+With four matmuls per layer (q/k/v/o + MLP gate/up/down) and 16
+layers, total matmul time per forward is ~13 μs. The NVLink
+all-reduce is ~70 μs per sync × 2 syncs/layer × 16 layers = ~2,240
+μs/forward.
+
+The arithmetic explanation: matmul ~4 μs/layer, sync ~70 μs/layer →
+sync dominates by ~17×. The 1B model is too small to amortize the
+sync overhead.
+
+Measured:
+
+| Config | Decode tok/s | Notes |
+|---|---:|---|
+| TP=1 (1 V100) | 104.9 | Baseline |
+| TP=4 | 81.1 | **23% slower** than TP=1 |
+| TP=8 | (never achieved single-stream parity) | NCCL overhead exceeds shard bandwidth |
+
+TP wins for 70B+ models where matmul time ≫ sync time. For 1B-class
+models on V100, **TP=2 if you must, otherwise TP=1 × N replicas**.
+The 1B Llama fits cleanly on a single V100 in fp16 (~2.4 GB weights);
+running 16 replicas of the planner on 16 V100s is strictly faster than
+running 2 TP=8 instances.
+
+The theoretical TP=8 ceiling for 1B at single-stream is ~1,500-3,000
+tok/s if the all-reduce overhead were free. It isn't. We never got
+close.
+
+### 3.2 bitsandbytes 8-bit on V100 (−74%)
+
+`bitsandbytes` (bnb) 8-bit quantization assumes Turing-or-newer
+tensor cores with the IMMA instruction. The fused-int8 kernels target
+that path. On sm\_70 the IMMA instruction is available (Volta has
+INT8 dp4a) but the bnb 8-bit kernel doesn't lower to it; instead bnb
+falls back to dequantize-to-fp16 + HMMA + partial CPU offload of
+outlier columns.
+
+The dequantization is the expensive part. Every forward pass:
+
+1. Read the int8 weight matrix from GPU memory.
+2. Dequantize to fp16 (kernel launch overhead + memory writes).
+3. Run the fp16 mma.
+4. Discard the dequantized fp16 matrix.
+
+The dequantize step roughly doubles the memory bandwidth requirement
+of the layer (read int8 + write fp16 + read fp16 for mma), and the
+CPU-offload path for outlier columns triggers a host transfer per
+forward.
+
+The import-time error path is also unstable on sm\_70:
+
+```
+bitsandbytes/triton/int8_matmul_mixed_dequantize.py: triton import error
+```
+
+When loading does succeed, the measured decode regression:
+
+| Config | Decode tok/s | Δ vs fp16 |
+|---|---:|---:|
+| fp16 baseline | 72.4 | — |
+| bnb 8-bit | 18.89 | **−74%** |
+
+Quantization is architecture-conditional. The lesson is small but
+expensive: don't blindly assume that a "smaller-is-faster" quantization
+scheme works on hardware that wasn't tuned for. The fix is `pip
+uninstall bitsandbytes`; PEFT falls back to fp16 cleanly. Or just
+don't quantize.
+
+### 3.3 GPTQ INT4 shelved (dependency wall)
+
+The natural alternative to bnb is GPTQ INT4 with Marlin kernels.
+Marlin is a custom CUDA kernel that does INT4 matmul with on-the-fly
+dequantization fused into the mma. It is **sm\_80+**. V100 is
+sm\_70. We reach the dependency wall before benchmark.
+
+The dependency triangle:
+
+- GPTQModel 7.x requires torch ≥ 2.8
+- torch ≥ 2.8 dropped sm\_70 wheels
+- transformers ≥ 5 (required by GPTQModel 7.x) also dropped sm\_70
+
+We pin everything to the older versions; GPTQModel falls back to its
+own Triton kernels which are not Marlin and not significantly faster
+than fp16 native on sm\_70. The fp16 kernels on V100 are tuned (cuBLAS
+sm\_70 fp16 gemm is good). For multi-stream we'd need V100-targeted
+INT4 kernels that don't exist.
+
+We did materialize one GPTQ INT4 checkpoint
+(`decode_accel/quantized/llama32_1b_tinker_gptq_int4_g128`, 1.5 GB,
+auto-gptq 0.7.1, `damp_percent=0.01, desc_act=false,
+group_size=128`, 32 calibration examples). Result: **~15% wall-clock
+loss vs FP16 single-stream**. The whole point of INT4 (Marlin
+acceleration) doesn't exist on this hardware. Reserved port 19311
+unused.
+
+The GPTQ copy is retained on `:19311` as a fallback A/B for future
+hardware migration but is not in any production routing config.
+
+### 3.4 n-gram speculative decoding parked
+
+Speculative decoding pre-generates K candidate tokens from a cheap
+draft model (or n-gram lookup) and has the verifier (the 7B target
+model) accept-or-reject all K in a single forward pass. The expected
+speedup:
+
+$$
+S = \frac{E[\text{accepted}] + 1}{1 + \epsilon_\text{verify} + \epsilon_\text{draft}}
+$$
+
+where $E[\text{accepted}]$ is the expected number of draft tokens
+accepted per verifier call, $\epsilon_\text{verify}$ is the verifier
+forward overhead (~1 + small per-token), and $\epsilon_\text{draft}$
+is the draft cost (zero for n-gram).
+
+n-gram speculative decoding (vLLM's built-in) predicts the next K
+tokens by looking up K-gram patterns from the prompt itself. Free
+(no draft model), only helps when output repeats prompt content
+(code copies, JSON keys repeat).
+
+Acceptance rate as a function of prompt copy ratio:
+
+| Workload | $\pi_\text{copy}$ | Theoretical speedup at K=3 |
+|---|---:|---:|
+| HyDE document expansion | ~0.41 | ~1.6× |
+| Production planner with guided\_json | ~0.18 | ~1.1× (not worth) |
+
+The planner is already constrained by `guided_json` at decode time
+(XGrammar masks every token to fit the schema). At trigram
+$\pi_\text{copy} \approx 0.18$, the n-gram acceptance is too low.
+
+Worse, **vLLM rejects the combination outright**: `guided_json`'s
+grammar enforcement is incompatible with the draft/target
+token-acceptance dance. The mutex is explicit in vLLM's source. Pick
+one.
+
+We picked `guided_json`. For the 7B Qwen-coder path (when running
+tool reasoning, not the planner), n-gram K=3 could plausibly help
+~15-25%, but that path is also blocked by the same mutex.
+
+For the small-model planner path (1B Llama), speculative decoding is
+irrelevant: single-shot JSON generation, decode is ~50 tokens, no
+decode loop long enough to amortize the draft cost.
+
+Task #92 in the open-task list is parked.
+
+The other speculative-decoding attempt: small-draft + 7B verifier
+(Falcon-H1-90M, Gemma-3-270M, LFM-2.5-350M, all → Qwen-Coder-7B
+target). **Tokenizer mismatch** killed it. Vocabularies are 32,784 /
+262,144 / 65,536 / 152,064. Speculative decoding requires identical
+tokenizer between draft and target. The only off-the-shelf draft
+matching Qwen-Coder vocab is `Qwen2.5-Coder-0.5B-Instruct`. Not yet
+deployed; the mutex with guided\_json blocks the path anyway.
+
+### 3.5 Continuous batching 0.32× regression
+
+The shim's own continuous-batching implementation is the most
+embarrassing line in this essay. The scheduler logic is correct —
+admission, queueing, request-future plumbing all work. But the
+actual parallelism is a thread-contention regression.
+
+From `scheduler.py`'s docstring:
+
+> Each in-flight call runs to completion inside this tick via
+> `engine.generate()` but in a thread executor so other tasks
+> (admission, future fulfillment) can interleave. Each
+> `engine.generate()` call holds the GIL through its decode loop
+> and contends on the single CUDA stream; thread contention is net
+> negative. The queue/admission plumbing is correct, but the per-
+> call structure must change to true tensor-batched decode (one
+> `model.forward` across N in-flight sequences) to actually win on
+> throughput.
+
+Measured:
+
+| Workload | Latency | Ratio |
+|---|---:|---:|
+| Serial 8 requests | 4.7 s total | baseline |
+| Parallel 8 requests (thread executor) | 14.7 s total | **0.32× (regression)** |
+
+The fix is structural: one `model.forward` call across N in-flight
+sequences with ragged sequence dimensions, instead of N threads each
+calling `generate()`. HF `DynamicCache` doesn't support ragged seq
+dims natively. The path forward is either:
+
+1. **Left-pad + mask.** Pad all in-flight sequences to the longest,
+   mask the padding. Wastes compute on short sequences but simple to
+   wire.
+2. **Paged attention with the block table from `paged_kv.py`.** The
+   shim already has the paged KV layout. The decode kernel takes the
+   block table per sequence and gathers the right cache blocks.
+
+Either path requires wiring the V100 prefix-prefill kernel as the
+prefill primitive — which gets us admitted-sequence batching for
+free as a side effect.
+
+**Status**: the shim is correct for admission/queueing but a
+regression for throughput. We're shipping the cache-reuse win (30×)
+without the batching win. Task #105 pending.
+
+This is the one place where the shim is strictly worse than vLLM
+mainline. Production serving for the multi-bench sweep does NOT use
+the shim; it uses stock vLLM 0.9.x at `:19320` with PagedAttention.
+The shim runs at `:19340` as a parallel experiment endpoint.
+
+### 3.6 The Triton outlines fallback (200s/call cold start)
+
+Pre-XGrammar (vLLM ≤ 0.8.x), vLLM's structured output went through
+the `outlines` library. Outlines JIT-compiles a Triton regex
+automaton per schema, on first use. Cold-start was **200 seconds**.
+
+The planner emits a deeply-nested JSON schema (17 tool variants in a
+`oneOf`, each with its own arg shape). The first call after a vLLM
+restart would compile the automaton, returning the first response
+after a ~3.3-minute pause. Subsequent calls in the same vLLM process
+were fast. But burst traffic — a fresh sweep launching 48 workers
+each issuing a first planner call — would stall every worker for
+~200s in parallel, then complete in ~2s thereafter.
+
+The workaround was to issue a single warmup call after every vLLM
+restart, before any production traffic. That worked but felt fragile.
+
+XGrammar in vLLM ≥ 0.8.5 supplanted outlines (no JIT, GBNF-style
+state machine, ~50ms compile per schema). We track schema-compile
+latency now but it doesn't gate production launches.
+
+### 3.7 vLLM `:latest` tag silent regressions
+
+Pinning by tag is for development. Production pins by digest. The
+recipe lives in `infra/scripts/pin_vllm_image.sh`:
+
+```
+ssh <host> 'sudo docker pull vllm/vllm-openai:latest'
+ssh <host> 'sudo docker inspect vllm/vllm-openai:latest --format "{{index .RepoDigests 0}}"'
+# vllm/vllm-openai@sha256:abc...
+```
+
+After manually proving the latest digest works on one box, the
+compose file gets rewritten with the digest. The `:latest` tag is
+forbidden in production compose files.
+
+Why this matters specifically for sm\_70: vLLM upstream's dropping
+of V0-default releases means future `:latest` images will silently
+refuse to start. The digest pin makes the regression a deploy-time
+failure (`docker pull` 404 on the digest) rather than a runtime
+failure.
+
+### 3.8 jina-reranker-v3 under vllm-openai (1,084 restart loops)
+
+Not strictly an sm\_70 issue but in the same operational dossier:
+attempting to serve `jinaai/jina-reranker-v3` via the standard
+`vllm-openai` container. `JinaForRanking` falls back to
+`TransformersForCausalLM`; the lm\_head init crashes on the reranker
+weight shape; container restarts; init crashes again; 1,084 restart
+loops were logged before the systemd unit's backoff timer caught up.
+
+The fix was a swap to Qwen3-Reranker-4B, which has first-class vLLM
+support (`Qwen3ForClassification` head). Lesson: only use vLLM with
+model classes that have explicit vLLM support; custom heads need
+custom vLLM model classes, not falling back through
+`TransformersForCausalLM`.
+
+The five backends across cato-101/cato-126 now serve
+`qwen3-rerank` (4B) and `qwen3-rerank-premium` (8B). Zero restart
+loops since the swap.
+
+---
+
+## 4. The 4-win multiplicative stack chart
+
+<Figure
+  src="v100-serving-speedup-stack.png"
+  alt="V100 serving stack"
+  caption="V100 sm_70 serving: the multiplicative speedup stack (Triton prefix-prefill 25.2× × KV-cache shim 30× × torch.compile decode 2.17×) versus the regressions (bnb 8-bit −74%, TP=4 −23%, TP=8 never achieved, continuous batching 0.32×). What landed (gold) vs what regressed (red)."
+  n={1}
+/>
+
+The chart has two columns. Gold bars on the left, red bars on the
+right. The gold composition is the end-to-end speedup:
+
+- Triton prefix-prefill (25.2×) — standalone validated, not yet
+  wired into the engine.
+- HF DynamicCache shim (30× warm prefill) — production-deployed at
+  `:19340`.
+- torch.compile decode (2.17×) — production-deployed at `:19340`.
+
+The red side:
+
+- bnb 8-bit (−74% decode) — abandoned.
+- TP=4 (−23% decode vs TP=1) — abandoned; 1× replicas instead.
+- TP=8 (never achieved single-stream parity) — abandoned.
+- Continuous batching (0.32× — i.e., 3× slower than serial) — task
+  #105; shim correct for admission, wrong for throughput.
+
+The composition argument: $25.2 \times 30 \times 2.17 \approx 1640\times$
+in the ideal case where each multiplier is fully realized. The actual
+end-to-end win is closer to 14× because (a) the kernel isn't wired so
+the 25.2× doesn't compound, (b) the shim's 30× is on warm prefill not
+cold, (c) the decode-time multiplier is fully realized but it's a
+smaller term in the total budget for prefill-heavy workloads.
+
+The math:
+
+$$
+\mathcal{L}_\mathrm{total}^{\text{(ideal)}} = \mathcal{L}_p / (25.2 \cdot 30) + T_d \cdot \mathcal{L}_d / 2.17
+$$
+
+vs
+
+$$
+\mathcal{L}_\mathrm{total}^{\text{(actual)}} = \mathcal{L}_p / 30 + T_d \cdot \mathcal{L}_d / 2.17
+$$
+
+The 14× headline is the second expression. Wiring the kernel into the
+engine takes the multiplier into the first expression.
+
+---
+
+## 5. Why this lives in `lab/serving_v100/`
+
+ADR-009 (custom V100 serving) makes the boundary explicit. The
+serving layer is **deployment infrastructure for a specific GPU
+class**, not perseus core. The shim, the kernel, the systemd unit,
+the DynamicCache shim adaptation — all of it is "this works on V100
+sm\_70 because we made it work." Different hardware means different
+`lab/`.
+
+The repo layout, per ADR-009:
+
+```
+lab/serving_v100/
+├── README.md                   what this is, when it ships
+├── kernel/
+│   ├── prefix_prefill.py       Triton kernel from V2 parking_lot (already validated, 25.2x)
+│   └── paged_attn.py           paged KV-cache, 16-token blocks
+├── engine/
+│   ├── shim.py                 KV-cache-reuse Llama shim (DynamicCache + shared-prefix detection)
+│   ├── scheduler.py            REAL continuous batching (the V2 shim faked this)
+│   └── compile.py              torch.compile(mode="default") wrappers (V2 measured 2.17x decode)
+├── serve.py                    FastAPI app, OpenAI-compatible /v1/chat/completions
+├── bench/                      perf comparison against vLLM 0.9.x baseline
+└── tests/
+```
+
+The graduation gate (per ADR-006 + ADR-007) for moving anything from
+`lab/serving_v100/` into the production path:
+
+1. **p50 latency for 256-token completion.** Target ≥1.2× faster
+   than vLLM 0.9.x baseline cold; ≥2× warm.
+2. **Throughput at 8 concurrent requests.** Target ≥1.5× vLLM
+   under the same load.
+3. **p95 stability over a 1-hour sustained run.** Target zero
+   crashes versus vLLM's intermittent triton-pass-manager errors on
+   sm\_70.
+
+Until the lab implementation beats all three gates, production
+planner traffic on cato uses vLLM 0.9.x. The shim at `:19340` is an
+experiment endpoint, not a production endpoint.
+
+The "core" path (`infra/cato/services/vllm-llama.service`) runs
+stock vLLM 0.9.x. The "lab" path (`services/perseus_planner_server/`)
+runs the shim. Two endpoints, two trust levels. The trust level is
+set by which gates have been passed, not by which one is faster on a
+microbenchmark.
+
+When cato sunsets, `lab/serving_v100/` gets deleted. Until then, it
+pays for itself in the throughput delta against the same fixed
+hardware.
+
+---
+
+## 6. Production endpoints inventory
+
+This is the deployment ledger for the cato cluster as of 2026-05-18.
+Verified live via `ss -ltnp` on cato + `fleet_health.sh`.
+
+### 6.1 `66.172.10.101` (primary, 16 GPUs)
+
+| Port | GPU | Service | Model | Notes |
+|---|---:|---|---|---|
+| 18192 | — | perseus serve | — | Rust binary, CPU only |
+| 9001  | — | retrieval-service-rs | — | systemd-managed |
+| 6333/6334 | — | qdrant 1.12.5 | — | Vector store |
+| 8050  | 5 | vLLM | qwen3-embed (Qwen3-Embedding-4B) | fp16, dim 2560 |
+| 8060  | 7 | vLLM | qwen3-rerank (Qwen3-Reranker-4B) | classifier\_from\_token=\[no,yes\] |
+| 19100 | 9 | wm-serve | codet5p-110m | Trained world-model |
+| 19200 | 0 | gemma\_plan\_serve | gemma-3-270m | Planner experiment |
+| 19300 | 1 | vLLM | llama32\_1b\_tinker | max\_num\_seqs=16, fp16 |
+| 19305 | 6 | vLLM | variant\_v3\_r128 | A/B candidate |
+| 19310 | 3 | vLLM | llama32\_1b\_tinker | max\_num\_seqs=8 max\_num\_batched\_tokens=16384 |
+| 19311 | 4 | vLLM | llama32\_1b\_tinker\_gptq | GPTQ int4 g128 — decode-accel A/B (shelved) |
+| 19320 | 2/6 | vLLM | **llama32\_1b\_epoch3 (PRODUCTION PLANNER)** | `max_num_seqs=48 max_num_batched_tokens=24576 --enforce-eager` |
+| 19330 | 8 | llama\_kv\_shim | — | FastAPI HF wrapper (legacy) |
+| 19340 | 10 | **perseus\_planner\_server** | llama32\_1b\_epoch3 | torch.compile, custom batched scheduler |
+
+GPUs 11–15 idle (32 GiB free each). GPU 13 permanently dead. The
+production planner endpoint is `:19320`; the experiment shim is
+`:19340`. The two coexist on different GPUs of the same physical box.
+
+### 6.2 `66.172.10.126` (8 GPUs)
+
+| Port | Use |
+|---|---|
+| 8050 | qwen3-embed backup |
+| 8060 | qwen3-rerank backup |
+| 8000-8013 | Was 32B qwen-coder pool; currently restart-loop |
+
+cato-126's 32B qwen-coder pool is in autoheal-loop on the
+`docker-compose` restart policy. The pool's tagged-dead status in
+the LiteLLM curator means production traffic never lands there; the
+qwen3-embed/qwen3-rerank backups are independent of the chat pool's
+health.
+
+### 6.3 Embedding endpoints (separate from chat)
+
+Embedding endpoints serve different vLLM-internal logic — vLLM's
+`/v1/embeddings` requires `encoding_format: float` (vLLM rejects the
+default null that LiteLLM would otherwise pass). Different model
+class (encoder-only or pooled-encoder), different memory layout
+(no decode loop, just a forward pass).
+
+```
+qwen3-embed:           Qwen3-Embedding-4B  (5 backends across cato-101/126)
+qwen3-embed-premium:   Qwen3-Embedding-8B  (1 backend, cato-101:8054)
+qwen3-rerank:          Qwen3-Reranker-4B   (5 backends)
+qwen3-rerank-premium:  Qwen3-Reranker-8B   (1 backend, cato-101:8064)
+```
+
+### 6.4 Health probing
+
+The canonical health probe is not `/health`. Upstream vLLM issues
+#17972 and #18431 establish that `/health` returns 200 while
+requests hang forever. Every health probe in `fleet_health.sh` does
+a real 1-token `/chat/completions` round-trip:
+
+```
+curl -sS -m 25 -H "Authorization: Bearer $POOL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -X POST http://66.172.10.101:19320/v1/chat/completions \
+  -d '{"model":"llama32_1b_epoch3",
+       "messages":[{"role":"user","content":"ok"}],
+       "max_tokens":1,"temperature":0}' \
+  | jq '.choices[0].finish_reason'
+# "length"
+```
+
+LiteLLM's `background_health_checks: true` + `health_check_interval:
+30` does the same kind of round-trip behind the proxy. Endpoints
+that return 200 on `/health` but 502 on a real round-trip get
+cooled-down by the curator's 3-strike state machine.
+
+### 6.5 vLLM container restart drain time
+
+V100 boxes need ~15s to fully release VRAM after `pkill -9`. The
+deploy script (`infra/scripts/deploy_vllm_cato.sh`) waits:
+
+```bash
+sudo pkill -f 'vllm.entrypoints.openai' || true
+for i in $(seq 1 30); do
+  if ! pgrep -f 'vllm.entrypoints.openai' >/dev/null; then break; fi
+  sleep 2
+done
+sudo pkill -9 -f 'vllm.entrypoints.openai' || true
+sleep 15
+```
+
+Skip the sleep and the new container OOMs on launch. The 15-second
+drain is the empirically-measured value; shorter values cause
+intermittent OOMs in the first ~60s of the new container's life.
+
+---
+
+## 7. JSON output enforcement (three layers)
+
+Tangentially in scope, because the choice of `guided_json` over
+native tool-calling forecloses speculative decoding and shapes how
+the planner USER prompt is laid out for cache friendliness. Three
+structural reinforcements stack on top of the model's training to
+make the planner emit valid JSON.
+
+### 7.1 `response_format: {"type": "json_object"}`
+
+The loose flavor. Constrains the model to emit a JSON value. Structure
+is unconstrained. Supported by: OpenAI, vLLM ≥ 0.6, LiteLLM (passes
+through). Silently ignored by endpoints that don't support it — the
+parser's brace-bounded scan + repair handles those.
+
+### 7.2 `response_format: {"type": "json_schema", strict: true, ...}`
+
+The strict flavor. Available on vLLM ≥ 0.8.5 (XGrammar backend, March
+2026 default in vLLM/SGLang/TensorRT-LLM) and OpenAI structured
+outputs. XGrammar masks tokens at decode time so the model
+physically cannot emit an out-of-enum tool name (`reference_lookup`,
+typo of `references_lookup`) or skip a required arg (`search_text`
+with no `query`). Both were the dominant "planner repair failed"
+causes pre-XGrammar.
+
+Endpoints that 400 on `json_schema` get blacklisted with a 5-min
+TTL; the next call downgrades to `json_object`.
+`PERSEUS_LLM_TREE_DISABLE_SCHEMA=1` is a global kill-switch — added
+after Azure gpt-4.1-mini was observed returning empty completions on
+strict `json_schema` with HTTP 200. The "disable on 400" path can't
+detect HTTP-200-with-empty-body; the kill-switch covers it.
+
+### 7.3 `guided_json` (vLLM-only, schema-constrained decoding)
+
+The vLLM-specific lever. Top-level on the request:
+
+```json
+{
+  "model": "llama32_1b_epoch3",
+  "messages": [...],
+  "guided_json": { /* full JSON Schema */ }
+}
+```
+
+vLLM ≥ 0.8 supports this via XGrammar; strictly stronger than
+`response_format: json_object` and effective even on endpoints that
+silently ignore `response_format`. Gated by
+`PERSEUS_LLM_TREE_GUIDED_JSON=1`. **Default ON since 2026-04-23.**
+
+Constraint: `guided_json` and `response_format` cannot both be set.
+vLLM returns "You can only use one kind of guided decoding". When
+`guided_json` is active, `response_format` is dropped entirely.
+
+The implication for sm\_70: XGrammar's automaton runs on CPU
+(masking the logits before the next-token sample); it doesn't
+require any GPU feature beyond what fp16 sampling already needs.
+**XGrammar works on V100 without modification.** The pre-XGrammar
+`outlines` path (§3.6) was a 200s/call cold-start regression on
+V100; XGrammar's ~50ms compile is invisible.
+
+### 7.4 Native tool-calling is OFF when guided\_json is ON
+
+The discriminator:
+
+```rust
+fn native_tools_enabled() -> bool {
+    match env::var("PERSEUS_LLM_TREE_NATIVE_TOOLS").ok().as_deref() {
+        None => !guided_json_enabled(),
+        Some(v) => !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"),
+    }
+}
+```
+
+The default flipped after we observed that every vLLM endpoint
+without `--enable-auto-tool-choice` returns 400 once on a
+tools-bearing request before our `disable_tools_for(endpoint)` cache
+kicks in. That's one serial call wasted per process per endpoint.
+With `guided_json` giving a strictly-stronger structured-output
+guarantee, native tools became negative-EV — turn them off by
+default.
+
+Override with `PERSEUS_LLM_TREE_NATIVE_TOOLS=1`. In
+`scripts/env.perseus` it's pinned to `0`.
+
+### 7.5 vLLM `maxItems` in JSON schema (silently dropped)
+
+XGrammar's JSON-schema implementation drops `maxItems` silently.
+We can't enforce "options.length ≤ 5" structurally at decode time.
+Enforcement happens in two places: (a) the planner SYSTEM prompt
+(E.4 "1-5 when evidence supports it"), and (b) at parse-time in
+`runtime/step.rs`. The schema mask gets us key names, enum values,
+and required fields; array bounds are post-parse.
+
+---
+
+## 8. The append-only USER prompt for prefix-cache reuse
+
+vLLM ships a block-level KV cache (PagedAttention). Anthropic Claude
+has prompt caching with a 5-min TTL. OpenAI has implicit prefix
+caching. All three reward stable prompt prefixes — same first N
+tokens means same block hash means cache hit means no recompute.
+
+We split the planner prompt:
+
+| Role | Shape | Stability |
+|---|---|---|
+| `system` | Tool catalogue + rules + few-shot examples | Static across the entire query. Identical bytes every call. |
+| `user`  | Query + branch metadata + observations + evidence + global digest + budget | Volatile across calls |
+
+Hash the first N tokens of system + the first M tokens of user; that
+prefix is cacheable. vLLM block-hashes every 16 tokens; the more
+stable prefix you have, the more blocks you hit.
+
+`PERSEUS_LLM_TREE_APPEND_ONLY_PROMPT=1` (default ON in
+`scripts/env.perseus`) reorders the USER prompt for cache-friendliness:
+
+1. Query + branch metadata (stable per stem)
+2. Branch observations, append-only in first-seen lineage order
+3. Branch-local evidence (grows monotonically with calls)
+4. Volatile global digest, tool catalogue summary, failure block
+5. Budget snapshot (most volatile — depth, step count, time remaining)
+
+The legacy layout (`=0`) put volatile state earlier, fragmenting the
+cache. The append-only layout is the difference between vLLM hitting
+~95% of the prompt vs ~40%.
+
+This matters specifically for the DynamicCache shim too (§2.2): the
+shim's prefix-scan finds the longest common token prefix between two
+consecutive calls. The append-only layout maximizes that prefix. The
+volatile suffix (budget, frontier size) is at the end where the
+shared prefix ends.
+
+### 8.1 vLLM PagedAttention + DynamicCache shim composition
+
+The two cache layers compose in the obvious way:
+
+- **PagedAttention** hashes 16-token blocks. Cache hit means the
+  block isn't recomputed inside the engine.
+- **DynamicCache shim** matches whole-sequence prefixes by token-id.
+  Cache hit means the prefill step is skipped at the engine entry
+  point — vLLM (or the HF shim's `model.forward`) doesn't see the
+  shared prefix at all.
+
+The shim's hit-rate is the upper-bound; PagedAttention's hit-rate is
+the rest. On a steady-state planner loop within one MCTS query, the
+shim hits ~95% of the prompt (only the latest tool result + budget
+delta gets re-prefilled). On the first call of a new query,
+PagedAttention may hit some SYSTEM blocks shared with a recently-
+finished query (since the system prompt is identical across all
+queries served by the same planner endpoint).
+
+---
+
+## 9. Stop sequences (the unsexy speedup)
+
+vLLM, OpenAI, and LiteLLM all support `stop: [str]` — when the model
+emits any listed string, generation stops and the stop string itself
+is NOT included in the response. We use this to bound planner output
+WITHOUT capping `max_tokens`:
+
+```rust
+stop: if use_tools {
+    None
+} else {
+    Some(vec!["\n\nuser:", "\n\nUser:", "<|eot_id|>", "<|im_end|>"])
+},
+```
+
+The trained model sometimes fails to emit EOS and keeps appending
+chat-templated tokens after the final `}`. We catch the common
+rambling shapes here.
+
+`PERSEUS_LLM_TREE_MAX_TOKENS=0` (default in `env.perseus`) keeps
+planner output uncapped. The combination — `max_tokens=0` + stop
+sequences + `guided_json` schema — means a valid JSON response of
+any length completes naturally, but a runaway never burns more than
+one EOS-equivalent past the closing brace.
+
+This is the cheapest decode-budget control we have. No model retrain
+needed; no extra forward passes. Just a list of strings the model
+isn't allowed to emit. On a 1B-class model that occasionally rambles
+post-JSON, the stop sequences save ~50-200 tokens per affected call
+which at 175 tok/s decode is ~0.3-1.1 seconds.
+
+---
+
+## 10. The custom production shim layout
+
+The shim at `:19340` is the realization of the DynamicCache reuse +
+torch.compile decode wins. Production planner traffic goes through
+`:19320` (stock vLLM 0.9.x). The shim is the experiment endpoint
+that proves the wins.
+
+The run command:
+
+```bash
+PLANNER_DEVICE=cuda:10 \
+PLANNER_PORT=19340 \
+PLANNER_MAX_BATCH=8 \
+/home/cato-user/vllm-env/bin/python -m services.perseus_planner_server.server
+```
+
+The shim shares the same Python env as cato's other vLLM workers
+(`/home/cato-user/vllm-env`) — torch 2.6.0+cu124, transformers 4.x,
+triton 3.3.0. PyTorch 2.12 dropped sm\_70 entirely; we cannot upgrade.
+
+The smoke harness:
+
+```
+/home/cato-user/vllm-env/bin/python \
+    services/perseus_planner_server/smoke.py --base http://127.0.0.1:19340
+```
+
+Four phases:
+
+1. `/health` probe (5s timeout, 600s wait)
+2. Cold single request (unique session id, expect ~20ms prefill)
+3. Same-session warm (3 follow-up calls, expect growing
+   `shared_prefix_tokens`)
+4. 8 concurrent different-session vs serial-8 (expect ratio > 1.0
+   when batching works; currently 0.32)
+
+The smoke's phase 4 is the canary for task #105 — the day the ratio
+crosses 1.0, the shim is ready for the production graduation gate.
+
+### 10.1 Known Issue: torch.compile recompile thrashing
+
+`torch.compile(mode="default", fullgraph=False, dynamic=True)`.
+Sounds great. In practice: every new prompt shape (token count) hits
+a fresh compile bucket and stalls ~30 s.
+
+The compile bucket is keyed by `input_ids.shape` and a few other
+tensor properties. `dynamic=True` is supposed to make this shape-
+generic but in practice Inductor specializes anyway.
+
+Fix options (none landed):
+
+- Pad `input_ids` to next power-of-2 → fewer buckets, more cache hits
+- `mode="reduce-overhead"` with `dynamic=False`, accept per-shape
+  compile cost amortized once
+- Skip torch.compile on prefill entirely, only compile the decode
+  hot path
+
+The third option is the most-likely fix. Decode is the bandwidth-
+bound hot loop; prefill is mma-bound and benefits less from kernel
+fusion. Splitting the compile budget so only decode is compiled
+sidesteps the prefill-shape-bucket problem.
+
+### 10.2 The unwired V100 prefix-prefill kernel
+
+`prefix_prefill_v100.py` is the V100-friendly Triton port from §2.1.
+Validated standalone at 25.2× speedup. The kernel is copied to
+this directory, has tests, has a clean API. It's not in the engine.
+
+The wiring stub in `engine.py::prefill_with_kernel` documents the
+plan:
+
+```python
+def prefill_with_kernel(self, new_ids, pkv, position_ids):
+    """Placeholder for the v100 prefix-prefill kernel path.
+
+    Wiring plan (next branch):
+      1. For each LlamaDecoderLayer L:
+         a. RMSNorm(hidden) -> q_proj, k_proj, v_proj -> rope(pos_ids)
+         b. Repack k/v into k_cache / v_cache block layout using
+            paged_kv block_table for the session.
+         c. Call context_attention_fwd_v100(q, k, v, o, k_cache,
+            v_cache, b_loc, b_start_loc, b_seq_len, max_input_len).
+         d. o_proj(out), residual, MLP, residual.
+      2. lm_head over final hidden state to get logits[:, -1, :].
+      3. Return (logits, updated_pkv).
+    """
+    raise NotImplementedError("v100 prefill kernel path: TODO")
+```
+
+~250 LOC of layer-by-layer projection unrolling. Not done because
+the HF DynamicCache reuse path already shipped the 30× win — same
+order of magnitude. The kernel becomes the marginal next 25%.
+
+The graduation argument: when the shim is ready for production (i.e.,
+task #105's batched-decode rewrite lands), we wire the kernel at the
+same time. Both improvements come in together as the production-
+quality V0.2 of the shim.
+
+---
+
+## 11. Reachability gotchas
+
+### 11.1 Retrieval-service port 9000 vs 9001
+
+`Claude.md` explicit warning:
+
+> Default endpoint: `http://127.0.0.1:9001` on cato
+> (`retrieval-service-rs`; port `9000` is stale nginx/Python and
+> returns 502).
+
+Engram has a Python-on-9000 retrieval-service container that returned
+502 for embeddings starting late April. The Rust port (`retrieval-
+service-rs`) runs on 9001 on cato. **Always send to 9001.** Live env:
+
+```
+PERSEUS_RETRIEVAL_ENDPOINT=http://127.0.0.1:9001
+```
+
+The engram-side stale 9000 is still up because tearing it down would
+break legacy callers we haven't audited.
+
+### 11.2 LiteLLM port
+
+`127.0.0.1:4000` on engram. Bound to loopback only — perseus and
+retrieval-service-rs are the only callers. If you need to reach
+LiteLLM from another box, ssh-tunnel `-L 4000:127.0.0.1:4000`.
+
+### 11.3 The transatlantic 130ms penalty
+
+cato is US, engram is Azure Sweden. Every cato → engram call
+(perseus → LiteLLM on engram) adds ~130ms even when LiteLLM serves
+from cache. Per `Claude.md`:
+
+> cato is US, engram is Azure Sweden — every transatlantic WM call
+> adds ~130ms even cached.
+
+For the WM-in-the-loop closure this matters per UCB expansion (every
+option pays the RTT). For planner calls it matters once per planner
+iteration but is still measurable on `inference_bench`.
+
+The structural fix is to co-locate the planner runtime with LiteLLM +
+the vLLM workers — i.e. move perseus serve to cato. We have a canary
+at `66.172.10.101:18192`; production migration is in progress. Once
+co-located, the planner-to-vLLM round trip is intra-rack and adds
+roughly the same latency as a thread-context switch (sub-millisecond).
+
+### 11.4 vLLM `/health` lies under deadlock
+
+Upstream vLLM issues #17972, #18431 — `/health` returns 200 while
+requests hang forever. **Never trust /health alone.** Every health
+probe in `fleet_health.sh` does a real 1-token `/chat/completions`
+round-trip. LiteLLM's `background_health_checks: true` +
+`health_check_interval: 30` does the same.
+
+---
+
+## 12. Per-call telemetry
+
+Every planner chat call emits a `planner_call` event into the
+process-global event sink. Schema:
+
+```json
+{
+  "event": "planner_call",
+  "run_id": "qry-...",
+  "step": 12,
+  "ts_ms": 1715953920123,
+  "endpoint": "http://127.0.0.1:4000/v1",
+  "model": "qwen-coder",
+  "prompt_tokens": 9847,
+  "completion_tokens": 412,
+  "latency_ms": 1832,
+  "status_code": 200,
+  "parse_ok": true,
+  "repair_used": false,
+  "mode": "plan"
+}
+```
+
+This is the dual-write: JSONL
+(`artifacts/query-progress/<run_id>.jsonl`) + Postgres `planner_events`
+table (migration 002, extended by 006 for `prompt_body` /
+`completion_body` / `endpoint` / `model` typed columns when
+`PERSEUS_PERSIST_PLANNER_BODIES=1`).
+
+The five training pipelines that consume this:
+
+- `perseus-muzero-export` (planner\_call → trajectory step, with
+  prompt+completion bodies for off-policy RL)
+- `scripts/action_dist.sh` (per-tool call %, latency percentiles)
+- `scripts/perseus_inference_bench.py` (per-config latency
+  comparison)
+- autoresearch v3/v4 recall harness (model × prompt scoring)
+- the dashboard `/v1/ops/status`
+
+Note: `transport.rs::persist_planner_bodies()` defaults ON. The flag
+exists so autoresearch / bench runs that don't feed training can skip
+the JSONB storage cost.
+
+For V100-specific monitoring, the relevant fields are `prompt_tokens`
+(for cache-hit estimation), `latency_ms` (cold vs warm prefill), and
+`endpoint` (which of the cato endpoints actually served the call —
+:19320 stock vLLM vs :19340 shim). The shim's latency is
+distinguishable from vLLM's at the percentile level: the shim's p50
+is ~13ms warm vs vLLM's ~80ms warm.
+
+---
+
+## 13. The lesson
+
+The same compute (1B Llama, 16× V100) can serve at 12 tok/s or 175
+tok/s. The 14× delta is entirely architecture-conditional kernel
+work. Hardware constraints are the optimization surface, not the
+obstacle.
+
+The mistake — the one a lot of teams make — is treating sm\_70 as a
+deprecated platform that should be replaced rather than optimized.
+That's correct on a $/throughput axis if you have the budget. We
+don't. The lease is locked. The marginal cost is zero. Every hour
+spent making sm\_70 fast is an hour of compounding throughput on a
+fixed fleet.
+
+The math, again:
+
+$$
+\frac{\text{tok/s}_\text{after}}{\text{tok/s}_\text{before}} = \prod_i s_i
+$$
+
+where each $s_i$ is a kernel-level or system-level speedup. The
+multipliers compose because they operate on disjoint segments of the
+latency budget. 25.2 × 30 × 2.17 is the ceiling; 14× is the deployed
+floor; the gap is wiring work, not new physics.
+
+The complementary mistake is treating the multipliers as additive.
+"We got a 25.2× kernel and a 30× cache and a 2.17× decode, so the
+total is 57.37×." No. The kernel and the cache partially overlap
+(both speed up prefill). The decode is a separate term. Composition
+is multiplicative across disjoint terms and additive across
+overlapping terms. The end-to-end number you get depends on what
+fraction of the workload each multiplier hits.
+
+The regressions matter too. bnb at −74%, TP=4 at −23%, continuous
+batching at 0.32× — all three are recoverable losses. bnb is just
+not available on sm\_70; the alternative (fp16) is the original
+baseline, not a regression below it. TP is just not useful at 1B
+scale; the alternative is 1× replicas. Continuous batching is a
+wiring task (rewrite the scheduler to use real tensor-batched
+forward).
+
+The lesson sits at the intersection of three axioms:
+
+1. **Hardware is fixed for the duration of the lease.** Optimize what
+   you have, not what you wish you had.
+2. **Multiplicative composition is the engineering target.** Each
+   speedup attacks a different term in the latency equation; the
+   total compounds.
+3. **Every regression has a structural cause.** Don't accept a "this
+   should work" as evidence of "this works." Measure. The shim's
+   continuous batching looked correct in code review and lost 3× in
+   wall-clock; the test caught it.
+
+The math: latency decomposition, FLOPS budget, multiplicative
+speedup composition. All three are first-principles. None of them
+are special to the V100. The choice of which kernel to fork, which
+cache to add, which compile mode to enable — that's special to the
+V100. The reason this works at all is that the three multipliers are
+disjoint enough to compose.
+
+When cato sunsets, this code is deleted. The lesson — that hardware
+constraints are an optimization surface — is permanent.
+
+---
+
+## 14. Cross-links
+
+- [llama-32-1b-tinker-planner](/essays/llama-32-1b-tinker-planner/) —
+  what's running on this stack. The 1.24B planner that the shim was
+  built to serve.
+- [muzero-pipeline](/essays/muzero-pipeline/) — what the planner's
+  output trains. The closed loop.
+- [planner-llm-call](/essays/planner-llm-call/) — the API contract
+  for the planner call. JSON enforcement, stop sequences, schema
+  shape.
+
+---
+
+## Sources
+
+- `parking_lot/v2_archive_2026-05-18/HISTORY/52_litellm_vllm_serving.md`
+  — the full 1,343-line serving-stack reference. Every layer, every
+  config knob, every dead end. This essay is a distillation.
+- `Claude.md` "cato pool" + "decode_accel" + "WM-in-the-Loop" entries
+  — the live operational policy on V100 deployments.
+- `docs/adr/009-custom-v100-serving.md` — the lab/core boundary for
+  the custom V100 serving layer. Graduation gates per ADR-006 +
+  ADR-007.
+- `services/perseus_planner_server/` — the shim implementation
+  (1,455 LOC across 7 files). `prefix_prefill_v100.py` is the
+  validated kernel, not yet wired into the engine.
+- `infra/cato/services/vllm-llama.service` — the production planner
+  endpoint, stock vLLM 0.9.x at `:19320`.
+- vLLM upstream issues #17972, #18431 — the `/health` deadlock
+  bug. The reason every health probe does a real round-trip.
+- ADR-009, ADR-006, ADR-007 — the production / lab boundary, the
+  graduation gates, the V100 custom serving decision.

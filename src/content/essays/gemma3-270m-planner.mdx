@@ -1,0 +1,300 @@
+---
+title: "Gemma3-270m: fast, JSON-compliant on single-shot, schema-leaks in multi-turn"
+date: 2026-05-18
+status: published
+tier: planner
+summary: "Fastest planner base tested at ~3700 tok/s on V100. JSON-format compliance flawless in single-shot but ~10% rate of literal placeholder emission in multi-turn loops (\"...\", {...}) that parse cleanly and crash tool dispatch. Capacity gap on long context > 2k tokens vs Llama-1B."
+related: ["planner-base-bakeoff","planner-llm-call","tinker-lora-bakeoff"]
+readTime: 7
+---
+
+# Gemma3-270m as a planner base
+
+> tl;dr: Gemma3-270m was the fastest base we tested on V100 (~3,700 steps/hr — 6x Falcon-H1-Tiny). Single-shot JSON was flawless. The multi-turn planner loop emitted literal schema placeholders (`"..."`, `{...}`) at roughly a 10% rate. The output parsed cleanly. Tool dispatch crashed downstream. A larger base (Llama-3.2-1B at 4.6x the parameter count) hit val_loss 0.932 with seq=8192; Gemma plateaued near 1.1 at seq=2048. The gap was capacity over context, not policy. REINFORCE was the wrong tool for that failure.
+
+## Motivation
+
+The planner LLM in Perseus is invoked once per MCTS expansion. At sweep concurrency 48 against `gpt-5-nano-2025-08-07` the OpenAI bill scaled directly with rollouts, and the per-call latency floor was ~700-1500ms even on a warm path. The replacement target was a teacher-distilled small LM trained on `distill_corpus/plan_full.jsonl` (180,720 rows of `gpt-5-nano` planner outputs, 8.6 GB). The bake-off ran across three base-model families on cato V100s:
+
+- Falcon-H1-Tiny-Coder-90M (Mamba+attention hybrid)
+- Gemma3-270m (pure attention)
+- LFM2-350M (conv+full hybrid)
+
+Each was small enough to LoRA-tune in under a day. The question was throughput first, then quality at fixed compute.
+
+## Design
+
+LoRA SFT via `python/muzero/main_distill_lora.py`. The loss mask is completion-only — labels = -100 on prompt positions so the model learns only the teacher's planner output, not the input format. The 2026-05-15 pretokenize-v1 bug silently dropped the `completion` field; pretokenize-v2 forks 16 workers over `messages + completion` and writes the masked-label tensors to `pretok_full/gemma/tokens_full.npz` (1.68 GB).
+
+Gemma3-270m specifics:
+
+- 268M parameters, `Gemma3ForCausalLM`
+- hidden=640, 18 layers, 15 sliding-window + 3 full-attention layers, 4 heads
+- target modules `q_proj, k_proj, v_proj, o_proj`
+- rank=32, $\alpha$=64, dropout=0.05
+- batch-size and seq-length defaults from `train_ultra.py`
+
+The completion-only objective is:
+
+$$
+\mathcal{L}_{\text{SFT}}(\theta) = -\frac{1}{|C|} \sum_{t \in C} \log p_\theta(y_t \mid y_{<t}, x)
+$$
+
+where $C$ is the set of positions in the completion (label != -100), $x$ is the messages prefix, and $y$ is the planner output JSON. The prompt $x$ contributes zero gradient.
+
+The 15 sliding + 3 full attention layer split matters here. Gemma3-270m is not a uniform-attention transformer. Most of its layers are local-window attention (5/6 of them). The full-attention layers carry the global context routing burden almost alone. On training rows whose context plus completion fit comfortably below the sliding window, this is invisible. On planner inputs whose lineage already extends past 2k tokens, the full-attention layers are the only path through which a leaf value (e.g. a file path) can be lifted from earlier in the messages into the current generation step. Three layers at hidden=640 is not a lot of bandwidth for a 17-tool planner schema whose argument values must be grounded in upstream observations.
+
+The math of how this constrains generation is straightforward. At a leaf-position decoding step for an `args.path` token, the marginal next-token distribution is:
+
+$$
+p_\theta(y_t \mid y_{<t}, x) = \mathrm{softmax}(W_{\text{lm}} \cdot h_t)
+$$
+
+where $h_t$ is the final hidden state. For $h_t$ to encode a specific path that appears 1800 tokens upstream in $x$, the attention pattern at one of the 3 full-attention layers has to retrieve that span. When 268M params have been distilled across 180,720 rows of teacher output, the model can learn the *shape* of the answer cheaply — schema keys, tool names, nesting — because that information appears in every row. It learns the *content* expensively — specific paths, specific symbols — because those vary per row. Under capacity pressure, the model trades content fidelity for schema fidelity. The placeholder is what that trade-off looks like in tokens.
+
+### Why distillation looked sufficient but wasn't
+
+The 180,720-row corpus was sampled from a `gpt-5-nano` planner running over the production sweep — every row is an `(input, output)` pair where the input is exactly the messages array Perseus would have constructed and the output is the JSON the teacher emitted. The implicit assumption was that a student model trained completion-only on this corpus would learn to act like `gpt-5-nano` at planner positions, modulo capacity.
+
+The flaw in that assumption is that `gpt-5-nano` itself solves the leaf-value grounding problem by leveraging substantial context-encoding capacity. The teacher rows contain the *answers* but not the *mechanism*. A student that mimics the answer distribution can pattern-match when its capacity is large enough to retrieve the relevant input span; when it isn't, it falls back to the highest-probability schema-conforming completion, which is the placeholder.
+
+Distillation does not teach grounding. It teaches output mimicry. Whether mimicry covers grounding depends entirely on whether the student has enough representation capacity to do the underlying retrieval on its own. The teacher's outputs do not encode the retrieval procedure, only its results — and the results don't transfer if the procedure can't be re-derived.
+
+This is a known result in the distillation literature, but it has a specific shape on schema-structured outputs: the easy part of the output (schema) distills cheaply because the supervision signal directly encodes it; the hard part (leaf values dependent on long-range retrieval) does not, because the supervision signal encodes only the value, not the retrieval. A larger student fixes this because the retrieval is recoverable. A smaller student does not.
+
+## Timeline
+
+- **2026-05-13** — Bake-off launches. Falcon-H1-Tiny throughput on V100 immediately surfaces a kernel issue: `selective_state_update / causal_conv1d_fn / causal_conv1d_update` are all `None`, falling back to the naive Mamba path. 600 steps/hr observed, projecting 64-110 hours per epoch at production batch sizes.
+- **2026-05-14** — Gemma3-270m clocks 3,700 steps/hr at the same batch/seq settings. LFM2-350M trains successfully but is never wired to a serving shim (no `distill/lfm2_*` adapter directories produced). Gemma wins the throughput cut cleanly.
+- **2026-05-15 08:25** — `distill/gemma_plan` (rank=16, $\alpha$=32) lands as the first-pass adapter. 12 MB. Establishes the LoRA format.
+- **2026-05-15 14:22** — `distill/gemma_plan_v3` (rank=32, $\alpha$=64, dropout=0.05) finishes. 46 MB. Contains `adapter_best` + e00, e01, e02 (full 3-epoch run).
+- **2026-05-15 22:34** — `peft.merge_and_unload()` produces `training/gemma_plan_v3_merged/` at 545 MB bf16. The intent was to serve via vLLM.
+- **2026-05-15 23:xx** — vLLM rejects the merged weights with `TransformersModel does not support LoRA`. `--enable-lora` does not help; the gemma3 architecture goes through vLLM's `TransformersModel` codepath, which does not accept the LoRA adapters even after merge. (The merge should have made this moot. It did not.)
+- **2026-05-16 00:xx** — Fallback path: FastAPI + uvicorn + `transformers + peft` shim. Lives at cato:19200. Health 200. Latency ~3.6s/call on the planner's typical prompt. `response_format: {"type": "json_object"}` is silently ignored by the shim (no native JSON-mode); brace-bounded parse fallback in `planner/parse.rs` is the only schema guard.
+- **2026-05-16 morning** — First end-to-end planner runs against `:19200`. Single-shot JSON validation: flawless across 200 manual probes.
+- **2026-05-16 afternoon** — Multi-turn sweep starts emitting `give_up` from `planner/parse.rs` at a rate that doesn't match the live action distribution. Inspection: the model is producing valid JSON that contains `"args": {"path": "..."}` and `"args": {"...": "..."}`. The parser accepts these. The tool dispatcher crashes because `"..."` is not a path.
+- **2026-05-17** — Pivot. Tinker LoRA on Llama-3.2-1B (4.6x larger base) ships five variants. `v3_bigseq` (rank=64, seq=8192) reaches val_loss 0.932. `gemma_plan_v3` is left at `:19200` as a probe-only endpoint, removed from `PERSEUS_LLM_TREE_ENDPOINTS`. REINFORCE on the merged gemma is launched as `gemma_reinforce_v3` to test whether the schema-leak is a policy artifact (recoverable via reward) or a capacity artifact (not recoverable).
+
+## The failure mode in shape
+
+The single-shot success vs multi-turn failure was the symptom that mattered. Both modes hit the same model, same tokenizer, same merged weights, same FastAPI shim. The differential was context length and the structure of the running history.
+
+```mermaid
+flowchart TD
+  A[planner state at turn N] --> B[serialize messages]
+  B --> C{context length}
+  C -->|"<= 2k tokens"| D[gemma3-270m emits real path"]
+  C -->|"> 2k tokens"| E[gemma3-270m emits placeholder]
+  E --> F["args: {path: \"...\"}"]
+  F --> G[parse.rs: VALID JSON]
+  G --> H[tool dispatch: open_file]
+  H --> I[fs::read crashes — path is literally '...']
+  I --> J[planner state at turn N+1 with failure_tail]
+  J --> B
+  D --> K[tool runs, evidence flows back, planner advances]
+  K --> A
+```
+
+The loop is not random. The placeholder rate scales with running history length. At a 2-turn depth with short tool outputs it is essentially zero. At depth 4+ with a single oversized `open_file` result in the lineage it climbs past 10%. The model has clearly memorized the schema during distillation — it knows the exact key names, the nesting shape, the field order — but its capacity to fill the leaf values from current context is exhausted once the context distribution drifts past what 268M params can hold attentionally.
+
+### What the model is actually doing
+
+It helps to be precise about the failure rather than hand-waving "placeholder leak". A typical multi-turn failure had the form:
+
+```json
+{
+  "status": "continue",
+  "confidence": 0.6,
+  "reason": "Need to inspect the file that the search hit pointed at.",
+  "options": [
+    {
+      "tool": "open_file",
+      "args": {"path": "..."}
+    }
+  ]
+}
+```
+
+Every key is correct. Every value type is correct. The `confidence` is a sensible float in [0, 1]. The `reason` is a grammatical English sentence that even refers correctly to the prior turn. The `tool` is a real entry from `KNOWN_TOOLS`. Only the leaf `path` value is the literal three-character ASCII ellipsis `"..."` — not a Unicode ellipsis, not a typo, exactly the character that appears in the JSON schema example as a placeholder.
+
+This is not random sampling failure. It is the model copying its own training data's schema-example shape because that shape is the highest-probability completion given (a) the model's representation of "this is where a path goes" and (b) the model's inability to actually anchor a real path from the upstream context in its 640-dim hidden state at this position. The training data contained schema examples with `"..."` placeholders in the few-shot block of the system prompt. Gemma memorized that those positions can hold `"..."`. Under capacity pressure, that memory wins over the harder retrieval-from-context task.
+
+A more uncomfortable observation: the same memorization makes the failure invisible to single-shot eval. In single-shot, the messages contain no prior tool outputs to ground against; the model emits a first-turn action that requires inventing a path from the query alone, and that task it does competently because the few-shot examples in the SYSTEM prompt show exactly how to do it. The model is good at the cold-start move and bad at the warm-state move, in a way that is structurally inverted from what we instinctively measure.
+
+## Why repair retry was useless
+
+Perseus has two layers of JSON discipline upstream:
+
+1. `response_format: {"type": "json_object"}` on every chat call. Silently ignored by the FastAPI shim (the gemma serve does not implement OpenAI's JSON-mode header). Captured only by gpt-5-nano and vLLM with guided JSON.
+2. Repair retry on parse failure. The brace-bounded JSON parser in `planner/parse.rs` extracts the largest balanced-brace substring on raw parse failure. Confirm-stop and repair both run at temperature 0.0.
+
+The repair path is built for the case where the model's output is *malformed* JSON. Gemma3-270m's failure is the opposite. Its output is well-formed JSON. The strings inside the JSON are wrong. There is no parser intervention that can rescue `{"args": {"path": "..."}}` because nothing about the surface form distinguishes it from a legitimate planner response that decided to read a file literally named `...`. The parser does the only thing it can do, which is to pass it downstream, and the downstream tool crashes.
+
+This is structurally different from the malformed-JSON case in another important way: a malformed-JSON failure is rarely fixed by sampling more diversely (per `planner/mock.rs::plan_temperature`, retry temperature stays constant). A placeholder-leak failure has the same property — bumping temperature does not move the model off a memorized schema-shaped output, because the schema is the high-probability region.
+
+### A subtler point about JSON-mode vs schema-leak
+
+Perseus attaches `response_format: {"type": "json_object"}` to every chat completion request. This is the OpenAI-standard JSON-mode flag. It guarantees the output is valid JSON. It guarantees nothing about the *contents* of that JSON. The gemma serve at `:19200` silently ignored the flag (the shim didn't implement it); even if the shim had honored it, the model's output already *was* valid JSON. JSON-mode protects against malformed-JSON failures and is inert against well-formed-but-wrong-content failures.
+
+Constrained decoding (XGrammar, vLLM guided-JSON) goes one level deeper: it can enforce the *schema* — required fields, types, enum values for `tool` names. That would catch a placeholder like `"path": 12345` (wrong type) but not `"path": "..."` (correct type, wrong content). Schema constraints don't model semantic ground-truth.
+
+The only mechanism that could have caught placeholder leaks at decode time is a *content* constraint — e.g., requiring `args.path` to be a substring of the upstream context, or matching a regex of valid filesystem path characters minus the literal placeholder character. None of those are constraints we have a clean way to express in current constrained-decoding frameworks. The cure is to fix the model, not the decoder.
+
+## Results
+
+| metric | gemma3-270m (`gemma_plan_v3`) | llama32-1b (`v3_bigseq`) | ratio |
+|---|---|---|---|
+| params | 268M | 1.24B | 4.6x |
+| LoRA rank | 32 | 64 | 2x |
+| LoRA $\alpha$ | 64 | 128 | 2x |
+| training rows | 180,720 | 178,848 (curated) | ~1x |
+| max seq len | 2,048 | 8,192 | 4x |
+| V100 throughput | ~3,700 steps/hr | n/a (Tinker, H100-class) | n/a |
+| best val_loss | ~1.1 (plateau) | **0.932** | -0.17 |
+| single-shot JSON valid | yes | yes | tied |
+| multi-turn placeholder rate | ~10% | <1% at the time of pivot | 10x |
+| serve path | FastAPI + peft shim, :19200 | vLLM on merged FP16, :19320 | n/a |
+| production traffic | no (probe only) | yes | n/a |
+
+The val_loss column is the load-bearing one. `v3_bigseq` was rank-64 at seq=8192. `v3_r128` was rank-128 at seq=4096 — same compute envelope, more LoRA capacity. `v3_r128` hit val_loss 1.122. `v3_bigseq` hit 0.932. The variable that mattered was sequence length, not rank. The planner's distillation targets contain multi-tool completions that simply do not fit in 2k tokens of context-plus-answer, and a 4x seq budget at the same rank beat a 2x rank budget at the original seq.
+
+Mapped back to gemma3-270m: the 2k context limit hit during distillation is the same wall that hits during inference. The model has not seen enough long-context examples to fill leaf values when the lineage exceeds its training distribution, and it has nowhere to put the extra attention budget even if we had given it the rows — the param count is the bottleneck.
+
+### The val_loss gap is more meaningful than it looks
+
+A val_loss of 1.098 (Llama epoch3-v3) vs ~1.1 (gemma plateau) sounds like a tie. It is not. Cross-entropy loss is the mean over all token positions, and the positions are not equally important. The schema keys (`status`, `confidence`, `reason`, `options`, `tool`, `args`) are predicted at probability close to 1.0 by any model that has seen the corpus twice — they contribute near-zero loss. The leaf values (paths, symbols, free-text reasons) are where the difficulty lives, and they are a minority of tokens. A model that fails on 10% of leaf-value tokens but is perfect everywhere else can still score val_loss 1.1, because that 10% is averaged with the 90% of trivially-easy schema tokens.
+
+The 0.932 number for `v3_bigseq` is structurally different. Crossing below 1.0 on this corpus requires getting the hard leaf-value positions right at a meaningfully higher rate, because the schema-token contribution to the loss is already saturated. The fact that no gemma3-270m configuration crossed 1.0 — across rank=16, rank=32, three epochs, and the full data — is the signal that the model is at its capacity ceiling on this corpus, not that it needs more training.
+
+This also explains why the placeholder rate climbs with context depth in the multi-turn evaluation. The single-shot test pulls a leaf-value distribution close to the easiest part of the corpus; the multi-turn loop pulls from progressively harder sub-distributions as lineage extends. The val_loss already encoded that, but only as a small global delta. The runtime exposes it as a step function.
+
+## Why REINFORCE was the wrong tool
+
+The REINFORCE attempt (`modal_rft/reinforce.py`, launched 2026-05-17 02:25 IST as `gemma_reinforce_v3`) had a reward function with a schema-leak penalty term:
+
+$$
+r(y) = r_{\text{json}}(y) + r_{\text{fields}}(y) + r_{\text{tools}}(y) + r_{\text{rarity}}(y) + r_{\text{calib}}(y) - \lambda_{\text{leak}} \cdot \mathbb{1}[\text{has\_placeholder}(y)]
+$$
+
+with $r_{\text{rarity}}$ adding +2.0 for tools at less than 1% corpus frequency and -1.5 for the search_text/hybrid_search/open_file trio. The schema-leak penalty was meant to drive the policy off the placeholder-emitting mode.
+
+The category error: REINFORCE searches for policy variants that the model can already represent and the gradient can reach. If the failure mode is that the model lacks the capacity to ground leaf values against long context, no reward shaping recovers it. The policy mode that emits `"..."` is not a preference for laziness; it is the highest-likelihood completion given that the model's attention can't anchor to a real path in the lineage. REINFORCE was working on the wrong axis.
+
+This was confirmed by the Llama-3.2-1B numbers landing during the same window. The 1B base, with no RL, at the same SFT objective, hit a placeholder rate under 1%. The cure for a capacity-bound failure is more capacity. The cure for a policy-bound failure is RL. We were applying the latter to the former.
+
+The cross-pollination is documented in the WM track too: every single-task value-only world-model variant collapsed to negative val_r2, and only the multi-head variants generalized. Single-task target plus a tight model is a capacity trap. The lesson generalizes.
+
+### Why the seq=8192 result implies capacity, not data
+
+A reader might object that `v3_bigseq` is confounded with data — longer seqs see more tokens per row. Two countersignals:
+
+1. `v3_superclean` (rank=64, seq=4096, 88,918 rows after `fr>=0.8, tr>=0.5` filter) hit val_loss 1.120 at 5,416 steps — half the training compute of `v3_bigseq`, half the data, and matched `v3_r128` on absolute val. Data quality at fixed seq does not get below ~1.12 on Llama-1B with rank-64. The seq=8192 jump to 0.932 is the discriminator.
+
+2. `v3_r128_short` (rank=128, seq=4096, 50,000 rows capped) hit val_loss 1.283. Cutting data hurts; cutting seq while raising rank does not recover it. The seq budget appears to be doing nontrivial work on top of both rank and rows.
+
+The cleanest framing is per-row attention budget. At seq=4096 a 3,200-token row is truncated; at seq=8192 it fits whole. The planner corpus has multi-tool completions with long tool-output observations; truncating the observation portion at training time leaves the model unable to learn the path `observation -> args.path`. Gemma3-270m at seq=2048 sees an even more truncated version of the same problem.
+
+The implication is grim for the gemma family on this corpus: the path to a competent gemma planner requires either (a) substantially longer effective context (which 268M params at hidden=640 cannot productively use even if we doubled seq), or (b) a curated corpus where the answer fits in the model's natural window. Option (b) means deliberately filtering out the multi-tool deep-lineage cases the planner most needs to handle. That is a trade that loses by construction.
+
+### Cost arithmetic for posterity
+
+The motivating cost calculation was simple. At sweep concurrency 48 over the 1632-instance multi-swe-bench cohort, each instance pulled ~30 planner calls on average. Total calls per sweep: ~2.35M. At `gpt-5-nano-2025-08-07` pricing of roughly $0.05 / 1M input tokens and $0.40 / 1M output tokens, with average prompt size 6k and output size 400, the per-call cost was ~$0.00046. Sweep cost: ~$1,080.
+
+Per call that is small. Per sweep, against a budget that ran sweeps weekly, it added up. A self-hosted small LM serving the same workload at zero marginal token cost (just GPU-hour amortization on cato V100s already owned) would have eliminated the variable cost entirely.
+
+The gemma3-270m FastAPI shim at 3.6s per call could not have served the workload at all — at concurrency 48 the latency floor times the call count exceeds the sweep deadline. Even if quality had been acceptable, the throughput would not have closed the case. The vLLM serve on Llama-3.2-1B at `:19320` does close it — `--max-num-seqs 48 --max-num-batched-tokens 24576 --enforce-eager` sustains the load with sub-second steady-state latency. But that throughput depended on the vLLM path being available, which depends on the architecture being one that vLLM supports for LoRA loading or for which `merge_and_unload` works through. Gemma3 was the architecture where that chain broke.
+
+So the calculus from above: the cost saving was real, the throughput requirement was real, and gemma3 met neither once the placeholder + serving problems were both counted. The pivot to Llama-3.2-1B was not just about quality — it was about the only base in our shelf that simultaneously trained on accessible hardware, served over vLLM cleanly, and held leaf-value fidelity past depth 4.
+
+## Operational gotchas worth remembering
+
+- vLLM's `TransformersModel does not support LoRA` rejection survives the `peft.merge_and_unload()` step on gemma3, because the architecture class falls through to the `TransformersModel` path regardless of whether the weights are merged. The merge is necessary but not sufficient. Tracked upstream; the workaround is the FastAPI shim, which costs throughput.
+- The shim at `:19200` is single-stream by construction. Production sweeps at concurrency 48 would saturate it instantly even if the quality were good. The FP16 vLLM on Llama-3.2-1B at `:19320` runs `--max-num-seqs 48 --max-num-batched-tokens 24576 --enforce-eager` and serves the same workload at higher quality and higher throughput.
+- The Falcon mamba-kernel fallback warning logs on every V100 falcon training run. The 6x throughput delta is real and explains why the falcon adapter directories are sparse (most slots are empty 4.0 KB stubs). A V100 cluster is not the place to evaluate state-space models — the comparison was decided by hardware before it was decided by architecture.
+- LoRA-soup (`tinker_train/soup_lora.py`) exists but every shipped Tinker variant is shard_total=1. The soup path was never tested on real Tinker output. This is a known open item; gemma3-270m would not have been the right base to test it on.
+- The `gemma_quick` per-step checkpoint set (80 MB, `adapter_best + latest + e00, e01 + mid_s000500..002500`) was retained because it fed `gemma_soup_v1`. The soup adapter is 5.7 MB. It was never serving-tested. The naming overlap with `falcon_soup_v2` cost one wasted Modal RFT launch.
+
+### The serving-path tax that nobody mentions in papers
+
+`peft.merge_and_unload()` is supposed to be the escape hatch from LoRA-aware serving. You take your base + adapter, merge the LoRA $\Delta W = BA$ into the base $W$ in place, save the result as a normal HF model directory, and serve it like any other dense checkpoint. That works for most architectures. For gemma3-specifically through vLLM, it does not — vLLM's gemma3 path goes through `TransformersModel`, which has a hardcoded LoRA-incompatibility branch, and the branch fires on the merged-but-architecturally-gemma3 weights regardless of whether the LoRA delta is present at load time.
+
+The practical consequence: every LoRA-finetuned gemma3 in our checkpoint shelf cannot serve over vLLM's high-throughput path. The fallback (`transformers + peft` shim on uvicorn at `:19200`) loses continuous batching, loses PagedAttention, loses prefix-cache page reuse, and pays per-call ~3.6s instead of vLLM's sub-second steady state. At sweep concurrency 48 this is not a 10% loss; it is a complete throughput floor below what production traffic requires.
+
+If you are reading this essay because you are considering gemma3 + LoRA + production: the serving-path tax is a separate problem from the placeholder leak, and it is severe enough on its own to disqualify gemma3 for any high-concurrency workload until upstream vLLM lands gemma3 + LoRA support. The Llama-3.2-1B path does not have this problem — `vllm serve` on FP16 merged weights works first try.
+
+## What it taught us
+
+Three things, in order of value:
+
+1. **Single-shot JSON validity is not a proxy for multi-turn JSON validity.** A model that passes 200 single-shot tests can still hit a 10% placeholder rate in a running loop. The schema is memorized; the values are not. The evaluation harness needs to probe at production lineage depth, not at depth-1.
+
+2. **Diagnose capacity vs policy before reaching for RL.** The placeholder-emission rate climbs with context length. The same training objective on a 4.6x-bigger base with 4x the seq budget cuts the rate by 10x with no RL. REINFORCE against a capacity-bound failure is a category error. The signal that distinguishes the two: does the failure rate scale with input distribution width, or with output preference? Scaling with input width means capacity. RL can't fix it.
+
+3. **Seq length is sometimes worth more than LoRA rank.** `v3_bigseq` (rank=64, seq=8192) beat `v3_r128` (rank=128, seq=4096) on val_loss by 0.19 — a meaningful margin at the small-model end. The planner corpus has long, multi-tool completions that cannot be packed into 2k. The compute budget that goes into seq is doing more work per epoch than the same compute going into rank, on this corpus. This is a corpus-specific result, not a universal rule, but the corpus is the only one we care about.
+
+4. **Throughput-on-the-wrong-base is not throughput.** The 6x training-speed win that selected gemma over falcon was structurally a V100-kernel-availability artifact. The base that ultimately worked (Llama-3.2-1B) ran on different hardware altogether. The lesson is to gate base selection on a fast neutral hardware tier and avoid letting your training infrastructure pre-decide the bake-off.
+
+5. **Schema validity and content fidelity decouple under capacity pressure.** A model can simultaneously be perfect at "what shape is the answer" and broken at "what value goes in that shape's leaf positions". A schema-leak penalty in the reward function recognizes this, but applying it via RL assumes the policy can represent both correct shape and correct content — which a too-small model cannot. Detecting the decoupling at training time requires evaluating leaf-value tokens as a separate metric class from schema tokens.
+
+### A historical asymmetry: why "small fast model wins" wasn't the right prior
+
+The choice of a 268M parameter base reflected an assumption that has been broadly true in the inference-throughput literature: smaller models are faster, and at fixed throughput-budget per call, fewer parameters allow more concurrent traffic. For decode-bound workloads with short outputs and short inputs, that holds.
+
+Planner workloads break the assumption in two places. First, the input is long (6k prompt tokens, growing with lineage). Second, the output is structured rather than free-text, so the "per token" cost dimension overweights tokens that are essentially free to generate (schema keys) and underweights the few tokens that matter (leaf values). The total latency budget per call doesn't separate the two — but the model's capacity allocation does.
+
+A small fast model is the right answer when the per-call cost is roughly proportional to total tokens. For Perseus, the per-call quality is roughly proportional to (a few) hard tokens. The model needs to be capacity-large enough to get the hard tokens right; everything else is a wash. This pushes the operating point away from the "cheap small model" regime and toward "smallest model that gets hard tokens right". Llama-3.2-1B sits at that boundary on our corpus. Gemma3-270m sits below it.
+
+This is also why the Falcon-H1-Tiny-Coder-90M case would have been worse than gemma3-270m on the same axis even if the V100 kernel problem hadn't dropped it. 91M params at the same hidden-dim profile would have hit the leaf-value problem harder, not softer. The throughput advantage on appropriate hardware would have been spent on a worse outcome.
+
+### The 6x training-throughput win that did not save us
+
+The decision to drop Falcon-H1-Tiny was driven by the 6x training-throughput gap. On V100 hardware, Falcon's Mamba state-update operations have no fused kernel — `selective_state_update`, `causal_conv1d_fn`, and `causal_conv1d_update` are all `None`, and the framework falls back to a naive Python loop. 600 steps/hr vs Gemma's 3,700/hr meant a single Falcon epoch projected to 64-110 hours at production batch sizes. Gemma fit a full 3-epoch run in under a day.
+
+In hindsight, the right framing is that throughput-on-the-wrong-base is not throughput at all. The 6x speed gemma3-270m bought us was spent producing a checkpoint that ultimately couldn't serve over vLLM and couldn't survive multi-turn lineage. The Llama-3.2-1B base, which would have been infeasible on V100 single-GPU due to DDP issues, ran cleanly on Tinker's remote SDK with a higher LoRA rank cap (128 vs the rank=32/64 we were running locally). The compute that finally worked was somebody else's compute.
+
+This is not an indictment of cato — it is a recognition that the base-model bake-off was hardware-bound in a way the bake-off itself could not see. On A100/H100 the Falcon Mamba path would have fused, the throughput gap would have closed, and the eval-on-architecture question would have been answerable on merit. We answered it on V100 throughput and got a different answer than the merits would have given.
+
+The cleaner workflow going forward: select the base on a fast hardware tier, ship to production hardware only after the base has passed an architecture-quality bar that does not include hardware-specific kernel availability. The dead-end record on Falcon (V100 Mamba fallback, Modal Trainer hangs, OOM on 3-variant ensemble) is dominated by hardware-mismatch artifacts, not by anything fundamental about state-space models on planner corpora.
+
+## Where this lives now
+
+- `gemma_plan_v3` adapter: still on cato disk at `distill/gemma_plan_v3/`. Tar at `distill_corpus/gemma_plan_v3_adapter.tar.gz` (10.9 MB).
+- `gemma_plan_v3_merged`: still at `training/gemma_plan_v3_merged/`. Still served at `:19200` as a probe-only endpoint. Not in `PERSEUS_LLM_TREE_ENDPOINTS`.
+- Production planner traffic: `https://api.openai.com/v1` with `gpt-5-nano-2025-08-07`. The cato-hosted Llama-3.2-1B variants (`:19300`, `:19310`, `:19320`, `:19305`) are deployed and probeable but not on the prod traffic path; pivot back to OpenAI direct happened during the 2026-05-12 sweep when the cato pool failed health-checks.
+- `gemma_reinforce_v3`: launched 2026-05-17 02:25 IST, still training at WAKE_UP_REPORT writing, no deployed weights at audit time.
+- Concept status post-reset: **dropped from the planner roadmap as a viable base**. The 268M attention-only profile loses on capacity at the seq lengths the planner corpus actually requires. Llama-3.2-1B is the production planner base going forward; gemma3-270m survives only as a comparison data point in the bake-off record.
+
+### What we would do differently
+
+1. **Eval at production lineage depth from the start.** The first sign of the placeholder leak was discoverable by running the trained adapter against a fixed 5-turn multi-turn fixture, not by waiting for sweep workers to crash on `open_file` of `"..."`. The cost of that fixture is one hour of setup. The cost of not running it was the entire gemma deployment cycle.
+
+2. **Track leaf-value accuracy as a separate metric from val_loss.** A simple post-hoc evaluator that grades only the `args.*` leaf positions on a held-out set would have shown the gemma adapter at ~85-90% leaf accuracy and the Llama adapter at >99%. That single number would have killed the gemma path before the FastAPI shim work.
+
+3. **Test the serving path before merging the adapter.** vLLM's `TransformersModel does not support LoRA` on gemma3 is a load-time error, not a training-time error. A 10-line `vllm serve` dry-run against the base model with `--enable-lora` would have surfaced the gemma3-vLLM incompatibility on day zero. Instead it surfaced after `peft.merge_and_unload` had been wired into the deploy pipeline, which made the workaround (FastAPI shim) feel like a smaller course-correction than it actually was.
+
+4. **Don't conflate "model can do the schema" with "model can do the task".** Single-shot JSON probes test schema knowledge. Multi-turn lineage probes test task knowledge. They are not the same measurement. The single-shot success rate of `gemma_plan_v3` was 100%; the task success rate at lineage depth 4+ was below 90%. The 10-point gap is not measurement noise.
+
+5. **Reserve RL for known-policy-bound failures.** Before launching REINFORCE against a behavior, demonstrate that the behavior changes when (a) you sample at higher temperature, (b) you condition on different inputs, or (c) you mask the unwanted region. If none of those move the failure rate meaningfully, the failure is not policy-bound and RL will not fix it. Apply the same to DPO / GRPO / best-of-N.
+
+## Cross-references
+
+- [planner base bakeoff](/essays/planner-base-bakeoff/) — the full multi-family comparison that selected Gemma for cato and dropped Falcon on the V100 Mamba kernel
+- [planner llm call](/essays/planner-llm-call/) — the call-site that consumed the gemma serve and surfaced the placeholder failure mode
+- [tinker lora bakeoff](/essays/tinker-lora-bakeoff/) — the Llama-3.2-1B sweep that proved capacity, not policy, was the bottleneck
+
+## Sources
+
+- `parking_lot/v2_archive_2026-05-18/HISTORY/29_planner_training_research.md` §1 (base-model bake-off), §2 (local cato LoRA distill - gemma_plan family), §3 (Modal H100 LoRA), §4 (Tinker LoRA SFT), §7 (schema-leak fixes)
+- `parking_lot/v2_archive_2026-05-18/HISTORY/07_dead_ends.md` #13 (V100 Mamba kernel), #17/#18 (Modal Trainer hangs), #44 (gemma multi-turn placeholder leak), #57 (specialist heads dropped), #59 (Modal volume tarball bug), #60 (Modal dataset race), #61 (Falcon-H1 HF existence claim), #62 (pretokenize v1 dropped completion field), #65 (3-falcon-variant OOM), #128 (cato pool 2026-05-12 health-check failure)
+- `parking_lot/v2_archive_2026-05-18/HISTORY/09_tinker_runs.md` (Tinker run catalog, v3_bigseq vs v3_r128 comparison)
+- `parking_lot/v2_archive_2026-05-18/HISTORY/05_model_checkpoints.md` (cato disk inventory)
+- `parking_lot/v2_archive_2026-05-18/HISTORY/12_live_components.md` (deployed serving processes, :19200 shim, :19320 vLLM)
+- `parking_lot/v2_archive_2026-05-18/HISTORY/15_training_data.md` (`distill_corpus/plan_full.jsonl` and pretokenize-v2)
+- `parking_lot/v2_archive_2026-05-18/WAKE_UP_REPORT.md` line 302 (vLLM TransformersModel LoRA rejection), line 307 (RFT pipelines blocked on dynamo + gemma3), line 370-371 (REINFORCE launch)
+- `parking_lot/v2_archive_2026-05-18/Claude.md` 2026-05-17 (planner-loop acceleration options) and 2026-05-18 (perseus-condition prompt rewrite + WM alpha emergency disable)
+- `python/muzero/main_distill_lora.py` (Phase-4++ completion-only LoRA SFT trainer)
+- `tinker_train/train_ultra.py` (production trainer used by every 2026-05-16 v3_* variant)
+- `modal_distill/modal_distill_v3.py` (custom-loop H100 trainer that produced `gemma_plan_v3_adapter.tar.gz`)
+- `modal_rft/reinforce.py` and `modal_rft/reward.py` (REINFORCE scaffold and reward function with schema-leak penalty)
+- `src/search/engine/llm_tree/planner/parse.rs` (brace-bounded JSON parser and repair-retry path)
+- `src/search/engine/llm_tree/planner/mock.rs::plan_temperature` (retry-temperature-constant rationale)

@@ -1,0 +1,329 @@
+@import "katex/dist/katex.min.css";
+
+/* -------------------------------------------------------------------------- */
+/* Fonts                                                                       */
+/* -------------------------------------------------------------------------- */
+
+@font-face {
+  font-family: "Hakumo";
+  src:
+    url("/fonts/FsHakumoRegular-V49Ky.woff2") format("woff2"),
+    url("/fonts/FsHakumoRegular-V49Ky.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Tokens (light mode, warm earthy)                                            */
+/* -------------------------------------------------------------------------- */
+
+:root {
+  --bg:          #ffffff;
+  --bg-soft:     #fafaf7;
+  --text:        #1a1815;
+  --text-dim:    #6b6157;
+  --text-faint:  #9a9082;
+  --link:        #8a6f3a;
+  --link-hov:    #5a4720;
+  --rule:        #e5e0d6;
+  --code-bg:     #f6f4ee;
+
+  --serif: "Times New Roman", Times, "Liberation Serif", serif;
+  --display: "Hakumo", "Times New Roman", serif;
+  --mono: "Iosevka", "IBM Plex Mono", Menlo, Consolas, monospace;
+
+  --reading-max: 720px;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Base                                                                        */
+/* -------------------------------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 19px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--bg);
+}
+
+@media (max-width: 720px) {
+  body {
+    font-size: 18px;
+  }
+}
+
+::selection {
+  background: var(--text);
+  color: var(--bg);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Links                                                                       */
+/* -------------------------------------------------------------------------- */
+
+a {
+  color: var(--link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  text-decoration-color: rgba(138, 111, 58, 0.5);
+  transition: color 0.12s ease, text-decoration-color 0.12s ease;
+}
+
+a:hover,
+a:focus {
+  color: var(--link-hov);
+  text-decoration-color: var(--link-hov);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Headings                                                                    */
+/* -------------------------------------------------------------------------- */
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  color: var(--text);
+  line-height: 1.2;
+  margin: 2rem 0 0.75rem;
+}
+
+h1 {
+  font-family: var(--display);
+  font-weight: 400;
+  font-size: 52px;
+  letter-spacing: 0.02em;
+  line-height: 1.1;
+  margin: 0 0 0.5rem;
+  text-shadow:
+    0.5px 0  0 currentColor,
+   -0.5px 0  0 currentColor,
+    0  0.5px 0 currentColor,
+    0 -0.5px 0 currentColor;
+}
+
+@media (max-width: 720px) {
+  h1 {
+    font-size: 32px;
+  }
+}
+
+h2 {
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 24px;
+  border-top: 1px solid var(--rule);
+  padding-top: 2rem;
+  margin-top: 3rem;
+}
+
+h3 {
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 19px;
+  margin-top: 2rem;
+}
+
+h4,
+h5,
+h6 {
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 17px;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Paragraph + inline                                                          */
+/* -------------------------------------------------------------------------- */
+
+p {
+  margin: 0 0 1rem;
+}
+
+strong {
+  font-weight: 700;
+}
+
+em {
+  font-style: italic;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--rule);
+  margin: 2.5rem 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Lists                                                                       */
+/* -------------------------------------------------------------------------- */
+
+ul,
+ol {
+  padding-left: 1.5em;
+  list-style-position: outside;
+  margin: 0 0 1rem;
+}
+
+li {
+  margin-bottom: 0.35em;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Blockquote                                                                  */
+/* -------------------------------------------------------------------------- */
+
+blockquote {
+  border-left: 2px solid var(--rule);
+  padding-left: 1rem;
+  margin: 1.25rem 0;
+  font-style: italic;
+  color: var(--text-dim);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Code                                                                        */
+/* -------------------------------------------------------------------------- */
+
+pre,
+code {
+  font-family: var(--mono);
+}
+
+pre {
+  background: var(--code-bg);
+  padding: 1rem 1.1rem;
+  border: 0;
+  border-radius: 2px;
+  overflow-x: auto;
+  font-size: 14.5px;
+  line-height: 1.55;
+  margin: 1.25rem 0;
+}
+
+pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
+
+code {
+  font-size: 0.92em;
+  color: var(--link-hov);
+}
+
+p code,
+li code {
+  background: transparent;
+  padding: 0 0.15em;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Figures                                                                     */
+/* -------------------------------------------------------------------------- */
+
+figure {
+  margin: 2rem auto;
+  max-width: 600px;
+  text-align: center;
+}
+
+figure img,
+figure svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+
+figcaption {
+  font-style: italic;
+  font-size: 14px;
+  color: var(--text-dim);
+  text-align: center;
+  max-width: 600px;
+  margin: 0.6rem auto 0;
+  line-height: 1.5;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Mermaid                                                                     */
+/* -------------------------------------------------------------------------- */
+
+.mermaid,
+svg[id^="mermaid"],
+p > svg {
+  display: block;
+  margin: 1.5rem auto;
+  max-width: 100%;
+  background: transparent;
+  padding: 1rem;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Meta line (date + read time)                                                */
+/* -------------------------------------------------------------------------- */
+
+.meta {
+  font-size: 14px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* -------------------------------------------------------------------------- */
+/* KaTeX                                                                       */
+/* -------------------------------------------------------------------------- */
+
+.katex {
+  font-size: 1em;
+}
+
+.katex-display {
+  margin: 1.25rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Tables                                                                      */
+/* -------------------------------------------------------------------------- */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.5rem 0;
+  font-size: 16px;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+th {
+  font-weight: 700;
+  border-bottom: 2px solid var(--rule);
+}

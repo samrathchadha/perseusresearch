@@ -1,0 +1,479 @@
+---
+title: "Llama-3.2-1B-Tinker: the deployed planner"
+date: 2026-05-18
+status: published
+tier: planner
+summary: "1.24B vanilla LlamaForCausalLM, LoRA-finetuned via Tinker on 180k plan.jsonl rows. Runs on cato V100 via the forked Triton prefix-prefill kernel + KV-cache shim. Composite score wins because Q × J × T × F all > 0. The production planner since 2026-05-17."
+related: ["planner-base-bakeoff","tinker-lora-bakeoff","tinker-3-epoch-ultra","v100-serving","planner-llm-call"]
+readTime: 9
+---
+
+The planner LLM is the part of Perseus that reads a query, looks at
+evidence, and emits a JSON object naming the next tool to call. Every
+node expansion in the MCTS loop is one planner call. The cost of that
+call — quality, latency, dollars — multiplies through every retrieval
+trajectory Perseus runs.
+
+Replacing `gpt-5-nano` (the teacher) with a self-hosted small LM was
+the explicit goal of the 2026-05-13 → 2026-05-17 planner training
+arc. As of 2026-05-17 18:02 IST the production checkpoint is
+`llama32-1b-epoch3-v3`: a 1.24B-parameter vanilla `LlamaForCausalLM`,
+LoRA-finetuned via Tinker on 180,720 distilled `gpt-5-nano-medium`
+trajectories, served on cato GPU 2/6 via vLLM at `:19320`.
+
+This essay is the load-bearing argument for why **that particular
+checkpoint, on that particular architecture, on that particular
+hardware** is what's running production.
+
+---
+
+## 1. Why vanilla Llama at all
+
+The shortlist from the [planner base bake-off](/essays/planner-base-bakeoff/)
+had four candidates:
+
+| Family | Params | Arch | V100 outcome |
+|---|---|---|---|
+| Falcon-H1-Tiny-Coder-90M | ~91M | FalconH1ForCausalLM (Mamba + attention hybrid) | **600 steps/hr** — Mamba state-update kernels have no fused sm_70 path. 64–110 h/epoch projected. Dropped. |
+| Gemma3-270m | 268M | Gemma3ForCausalLM (15 sliding + 3 full attn) | 3,700 steps/hr. Trained to completion. Schema-leak failure in production. |
+| LFM2-350M | ~354M | Lfm2ForCausalLM (conv + full hybrid) | SFT ran to completion. Never wired to a serving shim. Effectively shelved. |
+| **meta-llama/Llama-3.2-1B** | **1.24B** | **LlamaForCausalLM (hidden=2048, 16 layers, GQA 32/8)** | **The pick.** |
+
+The decision was *not* "biggest wins". The decision rested on four
+multiplicative properties, all of which had to be non-zero
+simultaneously.
+
+### Q (quality): vanilla LlamaForCausalLM hits the Gemma ceiling head-on
+
+Gemma3-270m trained to `val_loss ≈ 1.10` and emitted valid JSON
+one-shot. Multi-turn it leaked literal schema placeholders — `"..."`
+and `{...}` strings — into the planner loop. The parse + repair retry
+chain in `planner/parse.rs` caught some of these; the production
+fallback path was `mock://local` or back to `gpt-5-nano` over the
+OpenAI API. Empirically, prompt-only intervention against gpt-5-nano
+hit a ceiling at 53% `search_text` dominance no matter how the prompt
+was framed. The structural fix lives in
+`runtime::diversity_prior_multiplier`, but the **architectural** fix
+is more parameters in the right place.
+
+Llama-3.2-1B at rank-64 LoRA hits `val_loss = 1.098` on the same
+180k corpus where Gemma3-270m hit ~1.10. The Llama checkpoint also
+*doesn't leak schema placeholders* — multi-turn JSON stays clean
+through the entire MCTS tree. That property is what made it the
+production candidate.
+
+### J (json-mode): vLLM 0.9.x + XGrammar work on it
+
+vLLM's `guided_json` (XGrammar backend) gives schema guarantees
+without paying the pre-XGrammar 200-second Triton-`outlines` cold
+start. Gemma3 + LoRA tripped vLLM's `TransformersModel does not
+support LoRA` codepath; the team fell back to a custom FastAPI shim
+around `peft + transformers` on `:19200`. That path is unreliable
+under multi-turn load.
+
+Vanilla `LlamaForCausalLM` is a first-class vLLM model class. The
+`merge_and_unload()` → `vllm serve` path is exactly the path vLLM is
+tuned for. JSON-mode works. Tool-calling works (left disabled by
+default per `PERSEUS_LLM_TREE_GUIDED_JSON=1`). No fork.
+
+### T (throughput): the Triton prefix-prefill fork saves the architecture
+
+V100 is `sm_70`. vLLM's V1 engine refuses to start on sm_70 — we pin
+to V0 with `--enforce-eager`. The CUDA-graph capture is silently
+disabled on Volta; the flag stops vLLM from even trying.
+
+vLLM's standard `prefix_prefill.py` Triton kernel uses
+`tl.dot(..., input_precision="ieee")` and
+`tl.dot(..., out_dtype=tl.float32)`. On sm_70 the Triton IR cannot
+lower an f32-output mma — kernel compilation either fails or silently
+falls back to a slow reference path.
+
+The fork at `services/perseus_planner_server/prefix_prefill_v100.py`
+forces fp16 mma (`HMMA.884.F32.F16.F16`):
+- No `input_precision=` kwarg on `tl.dot`.
+- Q/K/V explicitly cast to fp16 before `tl.dot`.
+- `out_dtype=tl.float16` followed by manual `.to(tl.float32)` and add
+  to f32 accumulator.
+- `BLOCK_M=BLOCK_N=64` (smaller tiles fit sm_70 shared memory).
+- `num_warps=4, num_stages=2` (no async copy on Volta).
+- Drops fp8 / sliding-window / skip-decode branches.
+
+Validated standalone: **245.7 ms full prefill (q=3008, ctx=0) →
+9.73 ms cached prefix (3000 ctx + 50 delta) = 25.2× speedup.** Target
+was 10×.
+
+This kernel is **not yet wired into the live engine**. The live
+serving path (`:19320`) uses vLLM's stock PagedAttention with its
+page-granularity prefix cache. The fork lives in
+`services/perseus_planner_server/` as a validated standalone
+function plus a placeholder hook at the engine layer; the wiring is a
+~250-LOC layer-by-layer projection unroll. But the existence of a
+proven sm_70-friendly prefix-prefill kernel is what made the Llama
+path viable — it's the insurance policy that says "if vLLM's stock
+kernel regresses on Volta, we have a paved path back to tok/s parity."
+
+### F (fits): 1B fp16 = 2.4 GB, V100 has 32 GB
+
+A 1.24B-parameter Llama in fp16 takes ~2.4 GB of weights. The merged
+checkpoint on disk is exactly that:
+`tinker_merged/llama32-1b-epoch3-v3/` = 2.4 GB single
+`model.safetensors`. A V100-SXM3-32GB has ~28 GB usable VRAM after
+PagedAttention bookkeeping and the KV cache, leaving ~25 GB
+exclusively for the KV cache itself.
+
+That budget is what makes `--max-num-seqs 48 --max-num-batched-tokens
+24576 --enforce-eager` feasible on a single V100. 48 concurrent
+sequences with 24,576 tokens of paged KV is well within budget.
+Tensor parallel across 4–8 V100s was tried; the answer was the same
+single-stream tok/s. 1B fits cleanly on a single V100; TP buys
+nothing.
+
+`Q × J × T × F > 0`. The product is what matters. Falcon failed T
+(throughput); Gemma failed Q (multi-turn quality); LFM2 failed at
+the integration step (no serving shim). Llama is the only candidate
+where every multiplicative term is strictly positive.
+
+---
+
+## 2. The LoRA math, briefly
+
+LoRA decomposes the weight update as a low-rank product:
+
+$$W' = W + \frac{\alpha}{r} B A$$
+
+where $W \in \mathbb{R}^{d \times d}$ is the frozen base weight,
+$B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times d}$
+are the trainable adapter matrices, and $r \ll d$ is the rank. Only
+$BA$ moves; the base $W$ stays frozen.
+
+For Llama-3.2-1B with `hidden_size=2048` and rank `r=64`, each
+target projection (`q_proj`, `k_proj`, `v_proj`, `o_proj`) trains
+$2 \cdot 2048 \cdot 64 = 262{,}144$ params instead of the full
+$2048^2 = 4.2{,}M$ — a **16× reduction in trainable parameters per
+projection**. Across 16 decoder layers × 4 projections × 16× saving,
+the rank-64 adapter is ~33M trainable params vs the full 1.24B base.
+
+The exported adapter is 213 MB. The merged FP16 checkpoint is 2.4 GB
+— the same as the base model, because `merge_and_unload()` folds the
+LoRA delta back into $W$ in place. After merge, the model is a vanilla
+Llama-3.2-1B with a perturbed weight matrix; vLLM doesn't know it was
+ever a LoRA adapter.
+
+The Tinker rank cap for Llama-3.2-1B is **128**. Higher ranks (the
+`v3_r256_short` launch attempt) get rejected at submit time with
+`tinker.BadRequestError: 400 — lora_config.rank 256 exceeds max LoRA
+rank 128 for model meta-llama/Llama-3.2-1B`. The sweep accepted that
+ceiling and stayed at rank ∈ {64, 128}.
+
+---
+
+## 3. Tinker, in one diagram
+
+Tinker is a remote-SDK LoRA fine-tune service. The client
+(orchestrator script on Sam's laptop) calls `forward_backward()` and
+`optim_step()` against a remote optimizer state. The training script
+itself is local; the model lives on Tinker's GPUs.
+
+```
+local laptop                          Tinker remote (H100 fleet)
+─────────────                         ──────────────────────────
+train_ultra.py                        base = meta-llama/Llama-3.2-1B
+  build Datum                            (frozen weights)
+  send forward_backward(batch)   ───→   forward + backward
+                                         emit gradients into BA
+  send optim_step(adam_state)    ───→   apply AdamW step to B, A
+  poll loss                      ←───   {step_loss, val_loss}
+                                ...
+  on final:
+  uri = "tinker://<run-id>:train:0/weights/shard00_final"
+  export.py uri → PEFT tar       ←───   signed download URL
+  unpack to local HF dir                  adapter_config.json
+                                          adapter_model.safetensors
+```
+
+The pipeline-depth trick in `train_ultra.py` keeps **12** concurrent
+`forward_backward` + `optim_step` futures in flight. That single knob
+took the trainer from ~600 steps/hr to ~3,700 steps/hr on the same
+remote — the network round-trip is the bottleneck, not the GPU. The
+asyncio scheduler is the unsung star of the [Tinker 3-epoch
+ultra](/essays/tinker-3-epoch-ultra/) run.
+
+Two more `train_ultra.py` features matter for production quality:
+
+1. **Curation**: `--min-file-recall 0.5 --min-terminal-reward -1.0`
+   filters rows before packing. 180,720 → 178,848 (keeps 98.96% — the
+   filter is permissive enough to be near-no-op at the production
+   thresholds but the knob exists for [v3_superclean's strict
+   variant](/essays/tinker-lora-bakeoff/) at fr≥0.8 / tr≥0.5 which
+   cut to 88,918 rows).
+2. **First-fit bin-packing**: multiple short examples packed into one
+   `max_seq_len=4096` window. The corpus has heterogeneous lengths
+   (some planner steps are 200 tokens, some are 3,800). Bin-packing
+   bumps utilization from ~45% to ~92% per sequence, which is most
+   of the throughput win.
+
+The production hyperparameters were: rank=64, α=128, target
+modules `q_proj,k_proj,v_proj,o_proj`, base_lr=2e-4, batch=16,
+max_seq_len=4096, pipeline=12, 3 epochs over 178,848 rows = 10,892
+steps. Best `val_loss = 1.098 @ step 10,500` — exported at that
+step, not at `shard00_final` (10,892).
+
+---
+
+## 4. The export pipeline
+
+```
+1. Tinker URI:
+   tinker://0951cfea-85a6-5a21-910e-fa0b646b9d5d:train:0/weights/shard00_step010500
+              └─────────────────┬───────────────┘
+                          run-id
+
+2. tinker_train/export.py:
+   - POST resolve(uri) → signed download URL
+   - GET tar.gz → /tmp/peft_export.tar.gz
+   - extract to: tinker_exports/llama32-1b-epoch3-v3/step_10500/
+     contents: adapter_config.json (r=64, α=128, q/k/v/o)
+               adapter_model.safetensors (213 MB)
+               tokenizer.json / tokenizer_config.json (passthrough)
+
+3. peft.merge_and_unload():
+   model = AutoModelForCausalLM.from_pretrained(base_model)
+   model = PeftModel.from_pretrained(model, adapter_dir)
+   merged = model.merge_and_unload()
+   merged.save_pretrained(merged_dir, safe_serialization=True)
+
+   output: tinker_merged/llama32-1b-epoch3-v3/  (2.4 GB)
+           ├── config.json          (vanilla Llama-3.2-1B config)
+           ├── generation_config.json
+           ├── model.safetensors    (single 2.4 GB file, fp16)
+           ├── tokenizer.json
+           └── tokenizer_config.json
+
+4. vllm serve (since 2026-05-17 18:02 IST):
+   vllm serve /home/cato-user/tinker_merged/llama32-1b-epoch3-v3 \
+     --served-model-name llama32_1b_epoch3 \
+     --host 0.0.0.0 --port 19320 \
+     --max-num-seqs 48 \
+     --max-num-batched-tokens 24576 \
+     --enforce-eager \
+     --dtype float16
+```
+
+Three flags on the vLLM command line are load-bearing:
+
+- `--max-num-seqs 48` — the sweep launches up to 48 concurrent
+  multi-bench workers, each issuing planner calls. PagedAttention
+  needs the upper bound to allocate block tables.
+- `--max-num-batched-tokens 24576` — sum of all in-flight sequences'
+  decode-step tokens. 48 × 512 average context = 24,576.
+- `--enforce-eager` — disables `torch.compile` / CUDA graph capture.
+  Volta sm_70 doesn't support CUDA graph capture in vLLM V0;
+  `--enforce-eager` is the polite way of telling vLLM to not even
+  try. Without it the engine crashes at startup.
+
+The merged checkpoint is fp16 native. Why not GPTQ-INT4? Tried —
+`decode_accel/quantized/llama32_1b_tinker_gptq_int4_g128` (1.5 GB,
+auto-gptq 0.7.1, `damp_percent=0.01, desc_act=false, group_size=128`,
+32 calibration examples). Result: **~15% wall-clock loss vs FP16
+single-stream**. GPTQ Marlin kernels need sm_80+; V100 is sm_70 →
+falls back to slower paths. The whole point of INT4 (Marlin
+acceleration) doesn't exist on this hardware. FP16 native beats it.
+The GPTQ copy is retained on `:19311` as an A/B fallback only.
+
+---
+
+## 5. The comparison table — why the others lost
+
+| Variant | Params | Best val_loss | Failure mode |
+|---|---|---|---|
+| **llama32-1b-epoch3-v3 (cato)** | 1.24B | **1.098** | **Production. None.** |
+| v3_r128 (rank 128) | 1.24B (+r128 adapter) | 1.122 | Live on `:19305`. Tied epoch3-v3 on val. Likely superseded by bigseq. |
+| **v3_bigseq (seq 8192)** | 1.24B (+r64 adapter) | **0.932** | **Best val of sweep. Not deployed.** No graduation pipeline. |
+| v3_superclean | 1.24B (+r64 adapter, 88k rows) | 1.120 | Half the compute, same val as r128. Not exported. |
+| v3_r128_short (50k rows) | 1.24B (+r128 adapter) | 1.283 | Data-scaling reference; "more data > more rank". |
+| v3_r256_short | — | — | Tinker rejected rank 256 at submit. |
+| **Gemma3-270m (gemma_plan_v3)** | 268M | ~1.10 | Schema-leak in multi-turn. Single-shot OK; production-fall-back via OpenAI. |
+| Falcon-H1-Tiny-Coder-90M | ~91M | — | Mamba on sm_70 unviable. 600 steps/hr. Dropped at base-bake-off. |
+| LFM2-350M | ~354M | — | SFT completed; no serving shim wired. Shelved. |
+| gpt-5-nano (teacher) | unknown | n/a | Production fallback. The thing being replaced. |
+
+Two of these rows deserve their own essay. The first is **the
+deployment gap with `v3_bigseq`** (the next section). The second is
+the Gemma schema-leak failure — covered in detail in [planner base
+bake-off](/essays/planner-base-bakeoff/).
+
+---
+
+## 6. The deployment gap with v3_bigseq
+
+The Tinker bake-off shipped a quantitatively better variant than the
+one running in production. **`v3_bigseq` hit val_loss = 0.932 at step
+9,000.** The production checkpoint (`llama32-1b-epoch3-v3`) hit
+val_loss = 1.098 at step 10,500. On the loss axis, that's a 15%
+improvement — comparable to what you'd expect from a generation jump,
+not a hyperparameter sweep.
+
+The hypothesis behind `v3_bigseq` was: **seq-length matters more
+than rank** on this corpus. The full 180k SFT rows have nontrivial
+completion lengths from multi-tool planner outputs; rank-64 at
+seq=8192 hit a strictly lower val than rank-128 at seq=4096. The
+sweep validates that hypothesis cleanly.
+
+`v3_bigseq` is exported (`tinker_exports/v3_bigseq/step_9000/`).
+`v3_bigseq` is merged (`tinker_merged/v3_bigseq_step9000/`, 2.4 GB).
+It is **not deployed**. No vLLM listener serves it.
+
+Why not? Three reasons, in order of bluntness:
+
+1. **No auto-promote pipeline.** The Tinker-eval rotation
+   (`auto_eval_variants.py` + `benchmark_variants.py` at
+   `cato:/home/cato-user/tinker_eval/`) watches for new LoRA
+   checkpoints, exports them, merges them, launches per-variant
+   `vllm serve` on GPU 2..6 / port 19301..19305 — but the leaderboard
+   it builds is over a 5-case ripgrep suite where **only 1 of 5
+   cases (ripgrep-1367) actually hits gold**. The signal is dominated
+   by one case. Recall@5 with one positive doesn't separate variants
+   well, so the leaderboard can't say "yes, swap production now."
+2. **The benchmark suite to certify `v3_bigseq` doesn't exist yet.** A
+   diversity-balanced 100-instance pool was built at
+   `artifacts/autoresearch-instance-pool-v2.json`. Wiring it into the
+   Tinker-eval rotation is a half-day task; it just hasn't happened.
+3. **Val loss isn't quality.** A 0.932 vs 1.098 cross-entropy gap on
+   teacher trajectories is plausibly an artifact of `v3_bigseq`
+   seeing longer prefixes (it has more context to predict the next
+   token from). Downstream lift on retrieval-quality metrics — the
+   thing Perseus actually optimizes — is unmeasured.
+
+This gap is the load-bearing piece of the [Tinker LoRA
+bake-off](/essays/tinker-lora-bakeoff/) post-mortem. The team
+produced a measurably better artifact and shipped the worse one.
+That's not a training failure; that's a graduation-pipeline failure.
+
+---
+
+## 7. Why this wins, in one sentence
+
+V100 kernel work pays for the bigger model. Specifically: the Triton
+prefix-prefill fork at `services/perseus_planner_server/prefix_prefill_v100.py`
+proves Volta can serve a 1B-parameter model at ~25× cached-prefix
+speedup over the stock vLLM kernel. That validated kernel — plus the
+fact that vanilla `LlamaForCausalLM` is a first-class vLLM model
+class on V100 V0 with `--enforce-eager` — is what lets Llama-3.2-1B
+win across throughput-bound concurrent workloads where Gemma3-270m
+would be cheaper-per-call but unreliable, and where Falcon-H1-90M
+would be cheapest-per-call but 6× slower in steps/hr at training time.
+
+The single-line summary: **quality lift from Llama-1B over
+Gemma-270m at long-context dominates the throughput cost on V100.**
+That's the bet. As of 2026-05-17 18:02 IST, the bet is in production.
+
+---
+
+## 8. The current production pipeline, end-to-end
+
+```
+PERSEUS_LLM_TREE_ENDPOINTS = "http://66.172.10.101:19320/v1"
+PERSEUS_LLM_TREE_MODEL     = "llama32_1b_epoch3"
+                                    │
+                                    ▼
+              ┌─────────────────────────────────┐
+              │ /v1/chat/completions             │
+              │ vLLM 0.9.x (V0 engine, sm_70)    │
+              │ --max-num-seqs 48                │
+              │ --max-num-batched-tokens 24576   │
+              │ --enforce-eager                  │
+              └─────────────────────────────────┘
+                                    │
+                                    ▼
+              ┌─────────────────────────────────┐
+              │ /home/cato-user/tinker_merged/   │
+              │ llama32-1b-epoch3-v3/            │
+              │ ├── config.json                  │
+              │ ├── model.safetensors (2.4 GB)   │
+              │ └── tokenizer*.json              │
+              │                                  │
+              │ merge_and_unload(                │
+              │   base = meta-llama/Llama-3.2-1B,│
+              │   adapter = tinker_exports/      │
+              │     llama32-1b-epoch3-v3/        │
+              │     step_10500/                  │
+              │     (r=64, α=128, q/k/v/o)       │
+              │ )                                │
+              └─────────────────────────────────┘
+                                    │
+                                    ▼
+              tinker://0951cfea-85a6-5a21-910e-fa0b646b9d5d
+                       :train:0/weights/shard00_step010500
+                                    │
+                                    ▼
+              train_ultra.py (pipeline-depth=12, batch=16)
+                  on 178,848 / 180,720 plan.jsonl rows
+                  (fr ≥ 0.5, tr ≥ -1.0)
+                  3 epochs × 10,892 steps
+                  best val_loss = 1.098 @ step 10,500
+```
+
+The chain is reproducible end-to-end. Every step is recorded in
+`tinker_runs/manifest_2026-05-16.json` (per-variant pid, kept rows,
+hypothesis text) and in the export manifests under
+`tinker_exports/llama32-1b-epoch3-v3/`.
+
+---
+
+## 9. The honest disclaimer
+
+`engram` production currently points `PERSEUS_LLM_TREE_ENDPOINTS` at
+`https://api.openai.com/v1` with
+`PERSEUS_LLM_TREE_MODEL=gpt-5-nano-2025-08-07`. The cato-hosted
+Llamas are deployed, healthy, and probeable — but they are not on the
+production traffic path. The pivot back to OpenAI direct was made
+when the cato pool failed health-checks during the 2026-05-12 sweep.
+
+So "the deployed planner" is true in the narrow sense — `:19320` has
+been serving valid completions since 2026-05-17 18:02 — and not yet
+true in the sweep-traffic sense. The pieces that gate moving sweep
+traffic to cato are the same pieces that gate `v3_bigseq` deployment:
+a downstream-quality benchmark on the 100-instance pool, a green
+streak across the 120-minute stabilization window, and a working
+gate-streak counter in `artifacts/eval-gate-state.json`.
+
+When that gate flips, `:19320` becomes the production planner in
+both senses. Until then, this essay documents the artifact, not the
+traffic.
+
+---
+
+## Further reading
+
+- [Planner base bake-off](/essays/planner-base-bakeoff/) — the
+  Falcon / Gemma / LFM2 / Llama elimination round and why three of
+  the four failed.
+- [Tinker LoRA bake-off](/essays/tinker-lora-bakeoff/) — the four
+  v3_* variants and the deployment gap with `v3_bigseq`.
+- [Tinker 3-epoch ultra](/essays/tinker-3-epoch-ultra/) — the
+  production trainer's pipeline-depth trick and bin-packing.
+- [V100 serving](/essays/v100-serving/) — the Triton prefix-prefill
+  fork, GPTQ failure, vLLM V0 pin, `--enforce-eager`.
+- [The planner LLM call](/essays/planner-llm-call/) — what one
+  `/v1/chat/completions` looks like inside the MCTS loop.
+
+---
+
+## Sources
+
+- `parking_lot/v2_archive_2026-05-18/HISTORY/09_tinker_runs.md` —
+  full Tinker run catalog (run IDs, val_loss curves, export/merge/
+  deploy state for all 7 variants in the 2026-05-16 sweep).
+- `parking_lot/v2_archive_2026-05-18/HISTORY/29_planner_training_research.md` —
+  planner training arc, base-model bake-off, RFT scaffolding,
+  schema-leak fixes, single-task vs multi-task lessons.
+- `parking_lot/v2_archive_2026-05-18/HISTORY/52_litellm_vllm_serving.md` —
+  V100 sm_70 constraints, Triton prefix-prefill kernel fork, GPTQ
+  Marlin failure, vLLM V1 sm_70 refusal, `--enforce-eager`,
+  speculative-decode dead-end.
+- `cato:/home/cato-user/tinker_runs/manifest_2026-05-16.json` —
+  per-variant launch manifest with hypothesis text.
+- `tinker_train/` — `train_ultra.py` (the production trainer),
+  `export.py` (PEFT URI resolver), `deploy.sh` (vLLM launcher).
+- `services/perseus_planner_server/prefix_prefill_v100.py` — the
+  forked sm_70 Triton kernel (validated standalone, not yet wired).

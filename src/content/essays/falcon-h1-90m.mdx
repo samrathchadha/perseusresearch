@@ -1,0 +1,289 @@
+---
+title: "Falcon-H1-Tiny-Coder-90M: when Mamba meets sm_70"
+date: 2026-05-18
+status: published
+tier: planner
+summary: "91M-param hybrid Mamba/attention. On V100 sm_70 the Mamba selective-scan fast paths don't exist; CUDA fallback runs ~6× slower than equivalent attention. Throughput collapsed to ~600 tok/s vs Gemma's 3700. Also a lesson on verifying HF model existence with curl before claiming it doesn't exist."
+related: ["planner-base-bakeoff","v100-serving"]
+readTime: 6
+---
+
+## The model on paper
+
+`tiiuae/Falcon-H1-Tiny-Coder-90M` is a hybrid sequence model from TII: roughly
+91M parameters arranged as `FalconH1ForCausalLM` with `hidden=512` and an
+alternating stack of selective state-space (Mamba) layers and standard
+multi-head attention layers. It is a coder-tuned member of the Falcon-H1
+family, with a vocabulary of 32,784 BPE tokens and a context window large
+enough that the Mamba state — not attention — should carry the long-range
+dependency budget.
+
+The architectural pitch is the standard Mamba-2 pitch. Attention is
+$O(T^2)$ in sequence length. Mamba's selective scan is $O(T)$ sequential and
+$O(\log T)$ depth on hardware that supports the parallel-scan reduction.
+Once you cross a few thousand tokens of context, the asymptotics start to
+matter, and a hybrid stack lets you keep attention for the short-range
+copy/lookup operations it is genuinely good at while pushing the long-range
+state-tracking work into the Mamba layers, where it is cheaper.
+
+We were looking for a small, fast, distillable planner LM to replace
+`gpt-5-nano` for Perseus's MCTS planner. Three families made the short
+list — Gemma3-270m, LFM2-350M, Falcon-H1-Tiny-Coder-90M — and the smallest
+of the three was, on paper, the most interesting. 91M parameters is small
+enough that a single V100 can hold the optimizer state and several batches
+in 32GB of HBM with room to spare, and the Mamba layers were supposed to
+make the per-step compute cheaper than an equivalent-size pure-transformer
+of the same parameter count.
+
+This essay is about why none of that mattered.
+
+## The recurrence
+
+Selective state-space models update an internal state $h_t \in \mathbb{R}^N$
+per token according to a discretized linear recurrence:
+
+$$
+h_t = \bar{A}_t\, h_{t-1} + \bar{B}_t\, x_t, \qquad y_t = C_t\, h_t
+$$
+
+where $\bar{A}_t, \bar{B}_t, C_t$ are themselves functions of the current
+input $x_t$ — the *selective* part: the recurrence parameters are not
+fixed across the sequence, they are gated by what the model sees. This is
+what gives Mamba its expressive edge over linear-attention variants with
+input-independent decay.
+
+Naively, the recurrence is sequential. $h_t$ depends on $h_{t-1}$, which
+depends on $h_{t-2}$, and so on; you have to walk the sequence one token
+at a time. That is $O(T)$ depth, and on a GPU with thousands of cores
+sitting idle behind that walk, it is catastrophically inefficient.
+
+The Mamba authors observed that the recurrence, while sequential by
+default, can be re-expressed as a *prefix scan* — an associative reduction
+over a sequence of pairs $(\bar{A}_t, \bar{B}_t x_t)$ — and prefix scans
+have a well-known parallel implementation with $O(\log T)$ depth and
+$O(T)$ total work. On hardware that supports the right primitives, the
+selective scan runs at roughly the same wall-clock as a matmul of similar
+total work, and the asymptotic win over attention shows up as a real
+wall-clock win.
+
+The catch is the words "hardware that supports the right primitives."
+
+## What sm_70 doesn't have
+
+The cato fleet runs V100-SXM3-32GB cards. Compute capability sm_70 — the
+original Volta architecture, released 2017. It has fp16 tensor cores
+(HMMA.884.F32.F16.F16), it has fp32 CUDA cores, it has a respectable
+shared-memory budget. It does not have:
+
+- Async copy (`cp.async`) for double-buffered shared-memory loads.
+  Introduced in sm_80 (Ampere).
+- The fp16/bf16 reductions with f32 accumulators that Triton's parallel
+  scan kernels rely on for numerical stability at long contexts.
+- BF16 tensor cores. Volta is fp16 only for the tensor path.
+- The shared-memory pressure tolerance that the official `mamba-ssm`
+  CUDA kernels were tuned for. Those kernels target sm_80+.
+
+When Mamba's authors built the open-source kernels — `selective_scan_cuda`
+in the `mamba-ssm` package, and the `causal_conv1d` companion kernels —
+they wrote them against sm_80 and up. The selective-scan kernel uses
+async copies to overlap the prefix-scan reduction with the next chunk's
+loads; the causal-conv kernel uses the same trick for its short-window
+1D convolution. Strip those out and you have a slow reference path.
+
+There is, in principle, a sm_70-compatible version of the same algorithm.
+You can write a parallel scan in CUDA without async copies, just with
+shared-memory staging and explicit synchronization. It would be slower
+than the sm_80 version, but it would be faster than the sequential
+fallback by a wide margin. Nobody wrote that kernel. The community demand
+sits with sm_80+ users — H100s, A100s, RTX 4090s — and Volta is a
+five-year-old training card running customer workloads for people who
+don't pay for new GPUs.
+
+So when `transformers` initializes a `FalconH1ForCausalLM` on a V100,
+the model loader probes for the fast CUDA path:
+
+```
+The fast path is not available because one of (selective_state_update,
+causal_conv1d_fn, causal_conv1d_update) is None. Falling back to the
+naive implementation.
+```
+
+That warning fires on every Falcon training run on cato. Every single
+one. The naive implementation is a pure-PyTorch sequential walk through
+the recurrence — $O(T)$ depth, dispatching a separate CUDA kernel per
+token-step in the worst case, with no fusion and no parallel scan. The
+Python overhead alone is brutal. The actual GPU utilization sits in the
+single digits.
+
+## What that costs
+
+The throughput delta we measured, running the same `main_distill_lora.py`
+trainer with the same corpus and same rank/$\alpha$/dropout config across
+the three base-model families:
+
+| Base | Throughput (steps/hr) | Projected h/epoch | Notes |
+|---|---|---|---|
+| Gemma3-270m | 3,700 | ~10 | Pure attention. V100-friendly. |
+| LFM2-350M | ~2,800 | ~15 | Conv+full hybrid. No Mamba layers. |
+| Falcon-H1-Tiny-Coder-90M | ~600 | 64–110 | Mamba fallback. Dead end. |
+
+Read that last row carefully. Falcon is the *smallest* of the three at
+91M parameters. Gemma is 3× larger by parameter count. Gemma trains 6×
+faster. The asymptotic argument for Mamba — fewer FLOPs per token at
+long context — would have predicted Falcon to be faster, not slower, and
+on a sm_80+ box it probably would have been. On sm_70 the constant factor
+on the recurrence is so bad that the FLOP advantage is irrelevant.
+
+The inference picture was even worse. At realistic decode batch sizes
+the Falcon Mamba layers ran at roughly $\sim 600$ tokens/sec single-stream,
+versus Gemma3-270m's $\sim 3,700$ tokens/sec on the same V100. Throughput
+collapsed by 6×. In our base-model bake-off composite score — quality
+weighted against throughput — the throughput axis effectively zeroed out
+the Falcon column. The model could be the best planner in the world on
+quality and we still couldn't ship it.
+
+## Dropping it
+
+The decision was straightforward and final. After three days of trying
+to chase down the slow path — checking whether `triton`-based selective
+scan kernels worked on sm_70 (no), checking whether a partial Mamba
+disable was viable (no, the attention layers don't carry the model on
+their own at 90M), checking whether we could offload the Mamba state to
+CPU (yes, and the per-step latency went up another 4×) — we accepted
+the loss and moved on. `gemma_plan_v3` shipped. Falcon's LoRA adapters
+(`falcon_plan_v3` at 40MB, `falcon_quick` at 138MB, the empty
+`falcon_plan_A/B/C` slot directories from a 3-variant ensemble launch
+that OOM'd at batch=16) are still sitting on `cato:/home/cato-user/training/distill/`
+as a record of the attempt.
+
+Modal H100 LoRA was the natural fallback — H100 is sm_90, the Mamba fast
+path works, the throughput delta inverts. But Modal billed per-GPU-hour
+for restartable but fragile jobs, and the Falcon equivalent
+(`falcon_plan_v3_adapter.tar.gz`, 9.5MB) was produced once and never
+deployed because we had no V100 serve path for it. You can train on H100s
+and serve on H100s, but the serving cost at planner-request volume
+defeated the per-token throughput win. The whole point of the small
+planner LM was *cheap* inference on the cards we already paid for.
+
+## The verify-existence side lesson
+
+Before any of the above happened, the work nearly stalled on a
+different failure mode. An earlier agent claimed that `Falcon-H1-90M`
+"doesn't exist on HF" and recommended pivoting to a different family
+entirely. The claim was incorrect. The exact handle on HuggingFace is
+`tiiuae/Falcon-H1-Tiny-Coder-90M`, not `Falcon-H1-90M`, and
+`curl -sI https://huggingface.co/tiiuae/Falcon-H1-Tiny-Coder-90M` returns
+HTTP 200 with a populated model card. The agent had not checked.
+
+There is a class of "model doesn't exist" claims that should never be
+made without a curl receipt attached. The cost of a wrong claim
+propagating into a design doc is large — it removes a viable option
+from the search space, and the removal is hard to undo because the next
+agent reads the design doc as ground truth. The cost of a curl is
+zero. The asymmetry is enormous, and the policy that falls out of it
+is simple: before propagating a negative existence claim about a
+HuggingFace artifact, run the HEAD request. If you don't, you are
+guessing.
+
+We lost about two hours to the wrong claim. Trivial in absolute terms,
+but it's the kind of thing that compounds. The fix is procedural:
+hardware-aware model selection has a sm-floor check; HF existence
+checks have a curl gate. Both go in the ADR.
+
+## Why the architecture still matters
+
+It would be easy to read this as "Falcon was bad" and move on. The
+correct read is the opposite. Falcon-H1's architecture is genuinely
+strong on the hardware it was designed for. The selective-scan
+recurrence has real asymptotic advantages over attention at long
+context, and the hybrid Mamba+attention stack is a serious answer to
+the question of how to keep the attention layers small without
+sacrificing the modeling capacity that long-range dependencies need.
+
+The mistake — and it is the only mistake we attribute to the model —
+is one of assumed support. The official `mamba-ssm` kernels assume
+sm_80+. Falcon-H1's model card doesn't mention sm_70 explicitly, but
+the dependency on `mamba-ssm` carries the floor implicitly. A user who
+reads the parameter count and the architecture diagram and concludes
+"this should be fast on any GPU" will be wrong on Volta. The model is
+genuinely fast on the hardware it targets and genuinely slow on the
+hardware it doesn't.
+
+The lesson for our own model-selection process is that
+hardware-architecture matching is a hard gate, not a soft preference.
+Every model evaluation must include a sm-floor check before any
+throughput measurement. "Does this architecture have a working CUDA
+kernel for the compute we own?" is a yes/no question, and a no should
+remove the candidate from the bake-off before we burn three days on
+training runs that confirm the no empirically.
+
+That gate is now part of the ADR for base-model selection. The text
+reads, roughly: *for any candidate model, identify the compute-capability
+floor of the kernels required for the fast inference path, and reject
+the candidate if that floor exceeds the deployment hardware's sm
+level*. For the cato fleet that means sm_70. For the GCP fleet it means
+sm_90. For new candidates we run the check before the download.
+
+## What we actually got out of it
+
+A clearer policy. A concrete dead end documented in the dead-ends
+catalogue (#13, #50, #65) and three more memory files in the
+auto-memory log. A 9.5MB Modal-produced LoRA tarball that proves the
+training pipeline works when the hardware cooperates. The
+`falcon_plan_v3` adapter as evidence that the model itself, given a
+real GPU, distills cleanly from `gpt-5-nano` planner outputs.
+
+And the wrong claim — that `Falcon-H1-90M` doesn't exist — is
+neutralized in the codebase, with a curl-first policy attached so the
+next agent doesn't make it again.
+
+The architecture goes back on the shelf. When we run a planner LM on
+H100s, Falcon-H1 deserves another look. The cost of revisiting it then
+is small. The cost of pretending it never existed is much higher,
+because pretending forecloses an option that's actually live on the
+hardware we'll eventually own.
+
+## Cross-links
+
+- [planner base bakeoff](/essays/planner-base-bakeoff/) — the full
+  three-family comparison Gemma3-270m / LFM2-350M / Falcon-H1-Tiny,
+  including the throughput tables and the composite-score calculation
+  that picked Gemma.
+- [v100 serving](/essays/v100-serving/) — the broader sm_70 dead-end
+  catalogue: flash-attn v2, GPTQ Marlin kernels, bnb 8-bit, vLLM V1
+  engine, and the Triton prefix-prefill fork that finally worked.
+
+## Sources
+
+- `parking_lot/v2_archive_2026-05-18/HISTORY/29_planner_training_research.md`
+  §1 ("Base-model bake-off") for the family table including the
+  Falcon-H1-Tiny-Coder-90M row with `FalconH1ForCausalLM` arch
+  (Mamba+attention hybrid, hidden=512) and the V100 throughput verdict
+  (600 steps/hr vs Gemma's 3,700/hr, 64–110 h/epoch projected).
+- §2a ("Falcon LoRA distill family") for the per-adapter sizes
+  (`falcon_plan_v3` 40MB, `falcon_quick` 138MB, `falcon_soup_v2` 5.0MB,
+  empty slot directories from the `A/B/C` ensemble OOM) and the
+  literal mamba-kernel warning text logged on every Falcon training
+  run on V100: *"The fast path is not available because one of
+  (selective_state_update, causal_conv1d_fn, causal_conv1d_update) is
+  None. Falling back to the naive implementation."*
+- §1 paragraph following the family table for the agent-existence
+  claim and its resolution — *"The Falcon-H1 'doesn't exist on HF'
+  claim that briefly stalled this work (one agent insisted
+  Falcon-H1-90M was hallucinated; it isn't, Falcon-H1-Tiny-Coder-90M
+  is real) is documented as dead-end #61 + memory
+  `feedback_verify_hf_model_existence.md`."*
+- `parking_lot/v2_archive_2026-05-18/HISTORY/52_litellm_vllm_serving.md`
+  §9 ("Failed serving experiments") for the broader sm_70 constraint
+  context — flash-attn v2 requires sm_80+, GPTQ Marlin kernels require
+  sm_80+, vLLM V1 engine refuses to start on sm_70, all of which sit
+  in the same hardware-floor class as the Mamba selective-scan kernels.
+- §9.7 ("Speculative decoding") for the tokenizer-mismatch evidence
+  ruling out Falcon-H1-90M as a draft model for Qwen-Coder-7B
+  (vocabularies 32,784 vs 152,064).
+- Trainer entry point: `python/muzero/main_distill_lora.py`
+  (Phase-4++ LoRA SFT, completion-only loss mask). Modal H100 fallback
+  trainer: `modal_distill/modal_distill_v3.py`.
+- Memory file: `feedback_verify_hf_model_existence.md` — *"agent claimed
+  Falcon-H1-90M didn't exist; Falcon-H1-Tiny-Coder-90M does. curl
+  before propagating 'model doesn't exist' claims into design docs."*

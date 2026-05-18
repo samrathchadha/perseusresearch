@@ -1,0 +1,189 @@
+---
+import Base from "../layouts/Base.astro";
+import { getCollection } from "astro:content";
+
+const TIER_ORDER = ["pipeline", "wm", "planner", "reward", "retrieval", "audits", "infra"] as const;
+type Tier = (typeof TIER_ORDER)[number];
+
+const TIER_NAMES: Record<Tier, string> = {
+  pipeline: "Core MuZero pipeline",
+  wm: "World model training",
+  planner: "Planner and Tinker",
+  reward: "Reward and judging",
+  retrieval: "Retrieval as ML",
+  audits: "Audits and meta",
+  infra: "Infrastructure",
+};
+
+const all = await getCollection("essays", ({ data }) => data.status !== "draft");
+
+const grouped: Record<Tier, typeof all> = {
+  pipeline: [],
+  wm: [],
+  planner: [],
+  reward: [],
+  retrieval: [],
+  audits: [],
+  infra: [],
+};
+
+for (const entry of all) {
+  const t = entry.data.tier as Tier;
+  if (grouped[t]) grouped[t].push(entry);
+}
+
+// Sort each tier newest-first by date.
+for (const t of TIER_ORDER) {
+  grouped[t].sort((a, b) => b.data.date.getTime() - a.data.date.getTime());
+}
+
+function readTimeOf(entry: (typeof all)[number]): number {
+  // 200 words/min over raw body. Strip code fences and HTML-ish tokens.
+  const body = (entry.body ?? "").replace(/```[\s\S]*?```/g, " ").replace(/<[^>]+>/g, " ");
+  const words = body.split(/\s+/).filter(Boolean).length;
+  return Math.max(1, Math.round(words / 200));
+}
+
+function fmtDate(d: Date): string {
+  return d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+}
+---
+<Base
+  title="perseus essays"
+  description="Essays on a MuZero retrieval pipeline: world models, planners, reward, retrieval as ML, audits, infrastructure."
+>
+  <main class="landing">
+    <header class="hero">
+      <h1>perseus</h1>
+      <p class="subtitle">essays on a muzero retrieval pipeline</p>
+      <p class="intro">
+        A working notebook on building a planner-driven retrieval system trained with MuZero-style
+        learned world models. Each essay is a single decision, a single audit, or a single piece
+        of infrastructure made legible.
+      </p>
+    </header>
+
+    {TIER_ORDER.map((tier) => {
+      const entries = grouped[tier];
+      if (entries.length === 0) return null;
+      return (
+        <section class="tier">
+          <h2>{TIER_NAMES[tier]}</h2>
+          <ol class="essay-list">
+            {entries.map((entry) => {
+              const minutes = readTimeOf(entry);
+              return (
+                <li class="essay-row">
+                  <div class="essay-main">
+                    <a class="essay-title" href={`/essays/${entry.slug}/`}>{entry.data.title}</a>
+                    <p class="essay-summary">{entry.data.summary}</p>
+                  </div>
+                  <div class="essay-meta">
+                    <span>{fmtDate(entry.data.date)}</span>
+                    <span>{minutes} min</span>
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        </section>
+      );
+    })}
+  </main>
+</Base>
+
+<style>
+  .landing {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+  }
+
+  .hero {
+    margin-bottom: 4rem;
+  }
+
+  .hero h1 {
+    font-size: 52px;
+  }
+
+  .subtitle {
+    color: var(--text-dim);
+    font-style: italic;
+    font-size: 19px;
+    margin: 0.25rem 0 1.5rem;
+  }
+
+  .intro {
+    max-width: 640px;
+    color: var(--text);
+    font-size: 18px;
+  }
+
+  .tier {
+    margin-top: 3rem;
+  }
+
+  .essay-list {
+    list-style: none;
+    padding: 0;
+    margin: 1.25rem 0 0;
+  }
+
+  .essay-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 1.5rem;
+    padding: 0.9rem 0;
+    border-bottom: 1px solid var(--rule);
+    align-items: baseline;
+  }
+
+  .essay-row:last-child {
+    border-bottom: 0;
+  }
+
+  .essay-title {
+    font-size: 17px;
+    text-decoration: none;
+    color: var(--link);
+    border-bottom: 1px solid rgba(138, 111, 58, 0.35);
+  }
+
+  .essay-title:hover {
+    color: var(--link-hov);
+    border-bottom-color: var(--link-hov);
+  }
+
+  .essay-summary {
+    margin: 0.35rem 0 0;
+    font-size: 15px;
+    font-style: italic;
+    color: var(--text-dim);
+    max-width: 60ch;
+  }
+
+  .essay-meta {
+    text-align: right;
+    font-size: 12px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    white-space: nowrap;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  @media (max-width: 640px) {
+    .essay-row {
+      grid-template-columns: 1fr;
+      gap: 0.4rem;
+    }
+    .essay-meta {
+      text-align: left;
+      flex-direction: row;
+      gap: 0.75rem;
+    }
+  }
+</style>

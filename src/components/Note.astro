@@ -1,0 +1,78 @@
+---
+type NoteType = "aside" | "warning" | "retraction";
+
+interface Props {
+  type?: NoteType;
+  label?: string;
+}
+
+const { type = "aside", label } = Astro.props;
+
+const defaultLabels: Record<NoteType, string> = {
+  aside: "Aside",
+  warning: "Warning",
+  retraction: "Retracted",
+};
+
+const displayLabel = label ?? defaultLabels[type];
+---
+<aside class={`note note-${type}`}>
+  <span class="note-label">{displayLabel}</span>
+  <div class="note-body">
+    <slot />
+  </div>
+</aside>
+
+<style>
+  .note {
+    margin: 1.5rem 0;
+    padding: 0.9rem 1.1rem;
+    border-left: 2px solid var(--rule);
+    background: var(--bg-soft);
+    color: var(--text);
+    font-size: 16px;
+    line-height: 1.55;
+  }
+
+  .note-label {
+    display: inline-block;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    font-weight: 700;
+    margin-bottom: 0.4rem;
+  }
+
+  .note-body :global(p) {
+    margin: 0 0 0.5rem;
+  }
+
+  .note-body :global(p:last-child) {
+    margin-bottom: 0;
+  }
+
+  .note-aside {
+    border-left-color: var(--rule);
+  }
+
+  .note-warning {
+    border-left-color: #b58b3a;
+    background: #fbf6ea;
+  }
+
+  .note-warning .note-label {
+    color: #8a6716;
+  }
+
+  .note-retraction {
+    border-left-color: #a85a3a;
+    background: #f7efe8;
+    font-style: italic;
+  }
+
+  .note-retraction .note-label {
+    color: #7a3a1a;
+    font-style: normal;
+  }
+</style>

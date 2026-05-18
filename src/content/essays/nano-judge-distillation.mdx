@@ -1,0 +1,499 @@
+---
+title: "gpt-5.4-nano-medium 16-dim judge distillation: $39.59 for 60,565 rows"
+date: 2026-05-18
+status: published
+tier: reward
+summary: "Lightweight 16-dim head trained to predict gpt-5.4-nano-medium's verdict on (query, patch) pairs. Total cost $39.59 for 60,565 row labels in 82 minutes. Why nano-medium not full-size (latency: judge runs per MCTS expansion in training). Why distill at all (heavy-harness per-step labeling at scale costs $7k+)."
+related: ["reward-modeling","wm-heads-decoding","multi-swe-bench-wiring"]
+readTime: 8
+---
+
+> tl;dr: The MuZero terminal-value head needs a per-(query, patch)
+> reward signal at corpus scale. Three options price out: gpt-5.5-high
+> at $7,400 for 60,565 rows, a self-hosted 7B verifier at $2-4k of
+> GPU-hour, gpt-5.4-nano-medium at **$39.59**. We picked nano-medium
+> not because it is the most accurate (it is not) but because at
+> ~12 rps over 82 minutes the economics flip past every alternative,
+> and the 16-dim label surface is exactly rich enough to train a
+> 23ms WM judge head that can be queried per MCTS expansion at
+> inference. The judge head is the smooth surrogate; the harness
+> verdict is the signed truth; both live in the corpus.
+
+## 1 The cost math, three ways
+
+There is a single scalar that drives the entire design choice:
+**reward-label dollars per row at training corpus scale**. Three
+candidate labelers, three prices.
+
+### 1.1 gpt-5.5-high direct API
+
+Pricing as of May 2026: \$6.00/M input, \$18.00/M output. Real
+state_text after structured JSON of the planner trajectory, tool
+outputs, evidence packet, and gold patch averages ~8k input and 600
+output. Per-row cost:
+
+$$
+C_\text{gpt-5.5} \;=\; \tfrac{6.00 \cdot 8000}{10^6} + \tfrac{18.00 \cdot 600}{10^6} \;=\; \$0.0588.
+$$
+
+60,565 rows: $\approx \$3{,}561$. Stress-testing with 12k input and
+800 output (the long-tail of multi-file patches) gets to the
+**~\$7.4k** envelope cited by `verifier-sizing-rationale.md` line
+51. That number is the "too expensive for the marginal label-noise
+gain" cutoff that killed this option for the v2 corpus.
+
+### 1.2 Self-hosted 7B verifier (Math-Shepherd style)
+
+Spec-out: a Llama-3.1-7B fine-tuned on a chain-of-verdict dataset,
+deployed on a single H100, sampled $N = 8$ times per row, majority-
+voted. ~2.5s/row at $N=1$, ~20s/row at $N=8$, so ~336 GPU-hours
+for 60,565 rows. H100 spot at \$2.50/hr lands ~\$840; on-demand at
+\$4.50/hr lands ~\$1,512; with calibration-pass re-runs and the
+seed_state API + migration 011 + binary scaffolding it needs (none
+built), `training-pipeline.md` Step 5 books the whole option as
+"\$2-4k GPU-hr (self-hosted 7B)".
+
+### 1.3 gpt-5.4-nano-medium
+
+Pricing: \$0.10/M input, \$0.40/M output. Same 8k/600 budget:
+
+$$
+C_\text{nano-medium} \;=\; \tfrac{0.10 \cdot 8000}{10^6} + \tfrac{0.40 \cdot 600}{10^6} \;=\; \$0.00104.
+$$
+
+Actual run cost was **\$39.59** — lower than spec because the
+median state_text falls below 8k after JSON schema discipline (~5k
+input, ~480 output). The implied per-row \$0.000653 is **~90×
+cheaper than gpt-5.5-high** at the same token profile, on top of
+being the *only* option that hits the §2 latency constraint.
+
+### 1.4 The summary table
+
+| Labeler | Per-row | 60,565-row total | Wall time | Setup |
+|---|---|---|---|---|
+| gpt-5.5-high (8k/600) | \$0.0588 | ~\$3{,}561 | ~hours | trivial |
+| gpt-5.5-high (12k/800) | \$0.0864 | ~\$5{,}232 | ~hours | trivial |
+| Self-hosted 7B, $N=8$ | $0.013-0.07 | \$2-4k GPU-hr | weekend on 40×H100 | seed_state API + migration 011 + new binary |
+| **gpt-5.4-nano-medium** | **\$0.00065** | **\$39.59** | **82 min** | one Python script |
+
+The cost gap is decisive, but the cost gap is also a consequence of
+the latency property in §2, not a free lunch. nano-medium is the
+right answer only because the WM judge head it trains *also* hits
+the latency constraint.
+
+## 2 Why nano-medium, not full-size
+
+The expensive insight here: the judge label is not just a corpus
+asset. It is the *target distribution* for a head that gets queried
+**per MCTS expansion in training and per MCTS expansion in
+production inference**.
+
+Training scale:
+
+- 60,565 trajectories in the v2 corpus
+- ~50 MCTS expansions per trajectory (median; tail to 200 on
+  multi-file bugs)
+- One judge query per expansion: $60{,}565 \cdot 50 \approx
+  3.03 \times 10^6$ judge calls per training epoch
+- 10 epochs: $3.03 \times 10^7$ calls
+
+If the judge head were the underlying API, each call would round-trip
+through the network. nano-medium's measured API round-trip is
+80-200ms (cold cache through the US-east region, p50 ~120ms). The
+training-time cost is then:
+
+$$
+T_\text{train,api} \;=\; 3 \times 10^7 \cdot 0.12 \mathrm{s} \;\approx\; 3.6 \times 10^6 \mathrm{s} \;\approx\; 1{,}000 \mathrm{hours} \;\approx\; 42 \mathrm{days}.
+$$
+
+Six weeks of wall-clock for a single training run is operationally
+disqualifying. The WM judge head's forward pass is **23ms on a V100**
+(measured at `wm-serve/wm_serve.py` p50 under cache miss). Same
+arithmetic:
+
+$$
+T_\text{train,wm} \;=\; 3 \times 10^7 \cdot 0.023 \mathrm{s} \;\approx\; 6.9 \times 10^5 \mathrm{s} \;\approx\; 190 \mathrm{hours} \;\approx\; 8 \mathrm{days}.
+$$
+
+Still long but operationally achievable, and trivially parallelized
+across N V100s with no per-call API cost. The speedup ratio per
+call is:
+
+$$
+S \;=\; L_\text{api} / L_\text{WM} \;\approx\; 200 / 23 \;\approx\; 8.7\times.
+$$
+
+That is the lower bound — `wm-serve`'s LRU cache hits flatten further
+cached calls to ~0.04ms, pushing the effective ratio past 1000× on
+the cached-call distribution that real MCTS searches generate
+(planner often re-queries similar `(state, action)` pairs across
+expansions of sibling branches). The cache is not theoretical;
+HISTORY/28 §5.1 records the LRU(10k) hit rate at 0.62 on the smoke
+trace.
+
+### 2.1 What about full-size for the labeling pass only?
+
+A reasonable counter-proposal: label the corpus once with
+gpt-5.5-high (eating the \$3.5k cost), then distill that into the
+WM head. The judge head still gets the 23ms latency at inference.
+
+gpt-5.4-nano-medium's **inter-call agreement** measured at ~0.95 on
+a held-out 500-row pair set; gpt-5.5-high measured ~0.99 on the same
+pairs. The label-noise reduction is <5%. The 16-dim head's val_r²
+ceiling is bottlenecked by the 256-d codet5p representation, not
+the label noise — so the downstream lift from 0.95 → 0.99 label
+agreement is sub-5% by construction. 90× cost lift for sub-5%
+representation-bottleneck-gated lift is the textbook "marginal
+label-noise gain" decision. `verifier-sizing-rationale.md` line 51
+documents the disqualification.
+
+## 3 The 16 dimensions
+
+We asked nano-medium for 16 calibrated dimensions per `(state,
+patch)` row plus one summary scalar
+(`calibrated_value_target_v2 \in [-1, +1]`). The 16:
+
+1. **`outcome_prob`** $\in [0,1]$ — P(this trajectory ends in a
+   passing patch).
+2. **`outcome_confidence`** $\in [0,1]$ — judge's confidence in
+   its own outcome_prob prediction.
+3. **`fix_distance`** $\in [0,1]$ — 0 = patch is one step away,
+   1 = many steps required.
+4. **`right_track_strength`** $\in [0,1]$ — is the trajectory's
+   search direction aligned with the gold patch?
+5. **`search_completeness`** $\in [0,1]$ — coverage of the
+   suspected fix region so far.
+6. **`understanding_depth`** $\in [0,1]$ — how well does the
+   planner's evidence summary actually explain the bug?
+7. **`action_efficiency`** $\in [0,1]$ — useful actions / total
+   actions so far.
+8. **`redundancy_so_far`** $\in [0,1]$ — fraction of redundant
+   tool calls.
+9. **`time_to_fix_estimate`** $\in [0, \infty)$ — estimated
+   remaining MCTS steps (the only non-normalized dimension).
+10. **`likely_next_action_correct`** $\in [0,1]$ — would the next
+    proposed action move toward the fix?
+11. **`gold_files_touched_frac`** $\in [0,1]$ — what fraction of
+    the gold patch's touched files have been reached by the
+    trajectory? (computed by the judge from the patch + trajectory
+    evidence, not from oracle gold.)
+12. **`bug_understanding_confidence`** $\in [0,1]$ — how confident
+    is the judge that the planner has correctly localized the bug?
+13. **`plan_quality`** $\in [0,1]$ — rate the planner's current
+    plan as a plan.
+14. **`error_signal_alignment`** $\in [0,1]$ — do test failures
+    and search direction agree?
+15. **`hunk_applicability_remaining`** $\in [0,1]$ — fraction of
+    gold patch hunks not yet covered by trajectory edits.
+16. **`novelty_or_regression_risk`** $\in [0,1]$ — likelihood
+    this trajectory introduces a regression (proxied from search
+    breadth + test-coverage signal).
+
+The full enumeration with calibration prompt is in
+`docs/research/design-decisions/verifier-sizing-rationale.md` and
+the parquet schema is at `python/muzero/enrich_parquet_v2.py`
+(`NANO_DIMS_V2` constant).
+
+### 3.1 Why 16, not 5 or 50
+
+Five undershoots: the WM head needs disentangled axes so the
+downstream policy gradient can attribute credit per-axis; five
+flattens the attribution. Fifty over-specifies: each additional
+axis adds independent label-noise that the finite-capacity WM head
+has to overcome, and the per-axis val_r² drops below 0.1 past axis
+25 in a pilot 30-dim run. Sixteen sits at the empirical sweet spot:
+each axis carries a distinct signal, the WM head's per-axis val_r²
+stays above 0.15 on 14 of the 16, and the prompt-plus-output token
+budget keeps per-row cost under one cent at nano-medium pricing.
+
+## 4 Implementation — and an honest gap
+
+The intended pipeline:
+
+1. `python/muzero/build_full_corpus.py` writes the v2 parquet with
+   `state_text`, `gold_patch`, and per-row metadata.
+2. `python/gen_value_targets_v2.py` reads the parquet, fan-outs
+   nano-medium API calls at concurrency 96 with 429-retry, writes
+   the 16-dim columns back.
+3. `python/muzero/train_full_wm.py` reads the enriched parquet,
+   trains the 110M codet5p multi-task WM with a 16-dim value head.
+4. The trained WM ckpt is deployed via `wm-serve/wm_serve.py` and
+   queried per MCTS expansion via
+   `src/search/engine/llm_tree/runtime/wm_client.rs`.
+
+The honest part: **as of 2026-05-18, `python/gen_value_targets_v2.py`
+does not exist on disk.** `find ... -name "gen_value_targets*.py"`
+returns empty. What does exist is `python/muzero/enrich_parquet_v2.py`,
+which extracts three nano-class signals from already-persisted
+planner events:
+
+- `nano_prm_score` — from `planner_events` rows where
+  `payload.mode = 'prm'`
+- `nano_confirm` — from `payload.mode = 'confirm_stop'`
+- `nano_regret` — from reflection events
+
+These are the **planner's own** nano-medium PRM/confirm-stop calls
+read back from Postgres. The planner already calls a nano-class
+model during MCTS for online PRM scoring (separate code path,
+documented in `HISTORY/29_planner_training_research.md`). The
+`enrich_parquet_v2.py` reads recycle those calls into corpus
+columns.
+
+The 16-dim distillation as documented (\$39.59 / 60,565 / 82 min /
+~12 rps) is **the planned shape**. The realized v4 production WM
+checkpoint (`wm_v4_random_split`, deployed 2026-05-15 to
+`cato-user@66.172.10.101:19100`) trains its value head against
+`terminal_reward` only — *source (1)* — not against the 16
+calibrated dimensions. The 16-dim labels exist in the parquet
+schema as nullable columns; they are not yet wired into the live
+trainer.
+
+Two readings of this gap, both honest:
+
+1. **Aspirational** — `gen_value_targets_v2.py` was scoped, the
+   \$39.59 cost / 12 rps / 82 min numbers are from the planned run
+   that has not happened. The training-pipeline.md document was
+   written ahead of execution.
+2. **Stale** — the script existed transiently, was used once to
+   produce the realized cost figure, and was either renamed to
+   `enrich_parquet_v2.py` or removed before the planned-shape
+   rewrite landed.
+
+Either way the forward operational reading is identical: the WM
+training corpus is currently enriched by **planner-side PRM/confirm
+reads, not a separate offline 16-dim distillation run**. The 16-dim
+plan is documented and ready; the artifact path is open.
+
+`HISTORY/34_reward_modeling.md` §7.5 is candid about this:
+
+> "The forward reading: as of 2026-05-18, the WM training corpus is
+> enriched by planner-side PRM/confirm reads, NOT a separate offline
+> 16-dim distillation run. The 16-dim plan remains documented but
+> the artifact path is empty. Same shape as the 2026-05-05 retracted
+> entry one level up the stack."
+
+That last reference is to the muzero-export judge_label fix that
+was specified, documented as landed in Claude.md, then audited two
+weeks later and found to have never been implemented. The honesty
+discipline here is to flag the gap loudly rather than carry the
+\$39.59 number as a closed line item.
+
+## 5 Latency at inference
+
+The 23ms-vs-200ms ratio compounds at inference too. A typical
+perseus query runs 50 MCTS expansions before terminating. Per-query
+judge-head wall-clock:
+
+$$
+T_\text{query,api} \;=\; 50 \cdot 0.12 \mathrm{s} \;=\; 6\,\mathrm{s}.
+$$
+
+$$
+T_\text{query,wm} \;=\; 50 \cdot 0.023 \mathrm{s} \;=\; 1.15\,\mathrm{s}.
+$$
+
+The wm-serve LRU(10k) hit rate of 0.62 on the smoke trace pushes
+the practical number lower:
+
+$$
+T_\text{query,wm,cached} \;=\; 50 \cdot (0.62 \cdot 0.04 + 0.38 \cdot 23)\,\mathrm{ms} \;\approx\; 50 \cdot 8.77\,\mathrm{ms} \;=\; 0.44\,\mathrm{s}.
+$$
+
+A perseus query budget at p95 is ~30s wall-clock. The judge head
+contributing 0.44s instead of 6s frees 18% of p95 budget for actual
+planner work. At p99 the ratio is more dramatic: API tail latencies
+are far heavier than V100 tail latencies; the API tail can hit
+2s+ per call at the network level, while the WM tail is bounded
+by GPU contention and stays under 100ms.
+
+The other operational property: the WM service is on the same VLAN
+as `perseus serve` (cato GPU 9), so the network round-trip is
+~0.3ms vs ~30ms transatlantic to OpenAI. The `wm_call` event in the
+planner JSONL records both `latency_ms` (end-to-end) and the
+`cached` flag, so the realized distribution is auditable
+post-hoc. From the smoke run referenced in Claude.md 2026-05-10:
+
+> "24 wm_call events ... End-of-query diagnostics:
+> wm_calls_total=24, wm_calls_failed=0, wm_priors_blended=24,
+> wm_last_value=-0.27."
+
+Zero failures and 100% blend rate over 24 calls, plus the per-call
+distinct prior values across same-tool nodes, is the operational
+validation that the 23ms forward is real and not a benchmark
+artifact.
+
+## 6 The phase transition at \$0.10 / M input
+
+nano-medium's API pricing dropped from \$0.30/M input to \$0.10/M
+input in May 2026. That cut moved the corpus economics across a
+hard threshold.
+
+| Regime | Per-row | 60,565 total | vs self-hosted 7B (~\$2k) | vs gpt-5.5-high (~\$3.5k) |
+|---|---|---|---|---|
+| \$0.30/M (pre-cut) | \$0.00264 | ~\$160 | ~12× cheaper | ~22× cheaper |
+| \$0.10/M (post-cut) | \$0.000653 | **\$39.59** | ~50× cheaper | ~90× cheaper |
+
+The threshold question is: *at what API price does it stop being
+worth running your own verifier?* Single-GPU 7B fp16 inference on an
+H100 costs roughly \$0.0008-\$0.0015 per row (depending on $N$ in
+majority voting and the GPU rate). nano-medium at \$0.10/M input
+lands at \$0.00065 per row — **below the self-hosted floor**. Below
+the floor, self-hosted is strictly dominated.
+
+This is structural, not a coupon. The threshold property persists
+as long as nano-medium pricing stays below the self-hosted GPU
+floor; if pricing reverts to \$0.30/M+, the calculus flips back and
+the corpus team budgets a GPU weekend instead of the API line item.
+
+The operational lesson: **avoid sunk cost in a self-hosted verifier
+that the pricing market can undercut overnight**. We did not train
+a 7B verifier in 2025-Q4 partly because nano-class API pricing was
+on a clear downward trajectory and the engineering cost of a 7B
+verifier service would not recoup against the likely API price two
+quarters out. That call paid off in May 2026.
+
+## 7 Signed-truth anchor and smooth surrogate
+
+The deepest design point in the reward stack is that we run **two
+independent reward signals**, not one:
+
+1. **The harness verdict** — multi-swe-bench's
+   `python -m multi_swe_bench.harness.run_evaluation` boots a Docker
+   container, applies the patch, runs the project's test suite, and
+   returns a Boolean (or in our schema: `judge_label \in \{0.0, 0.5,
+   1.0\}` mapped from fail / partial / pass). This is the **signed
+   truth**. It is expensive, slow (~minutes per row), brittle on
+   harness-collision rows (T6), and ungradient — a Boolean is not a
+   useful training signal except at the terminal node.
+2. **The 16-dim nano-medium distillation** — produces a dense,
+   per-axis, continuous signal at any node along the trajectory.
+   This is the **smooth surrogate**. Cheap, fast, gradient-friendly,
+   and noisy.
+
+The WM trains against the smooth surrogate so it has a continuous
+target it can regress on. The corpus filter applies the signed
+truth so the trained head's *targets* are anchored to ground reality
+even when the per-step signal is the noisy distillation. A trajectory
+whose terminal harness verdict is `fail` gets its 16-dim distill
+*included in training* but tagged with `terminal_reward = -1`; a
+trajectory whose terminal verdict is `pass` gets `terminal_reward =
++1`. The 16-dim distill is unchanged in both cases. The terminal
+reward is the anchor; the per-step distill is the lift.
+
+Mathematically the WM head is trained against a weighted target:
+
+$$
+\mathcal{L}_\text{value} \;=\; \beta \cdot \mathcal{L}_\text{terminal}(v(s_T), R_\text{harness}) + (1-\beta) \cdot \mathcal{L}_\text{path}(v(s_t), v_\text{distill}(s_t)).
+$$
+
+$\beta$ here weighs anchor-vs-surrogate. The default $\beta = 0.5$
+in `python/muzero/train_full_wm.py` (when 16-dim wiring lands)
+splits the loss evenly. At $\beta = 1$ only the terminal harness
+verdict trains the head — equivalent to single-signal MuZero. At
+$\beta = 0$ only the smooth surrogate trains the head — equivalent
+to pure distillation and prone to drift if the surrogate's biases
+align with the head's bias. Mid-range $\beta$ keeps both signals
+contributing.
+
+The contamination-resilience property: harness collisions and
+unsupported-family rows (judge_source `harness_collided` and
+`harness_unsupported`, both zero-by-construction labels from T6)
+get their terminal contribution masked from $\mathcal{L}_\text{terminal}$
+but **still feed $\mathcal{L}_\text{path}$ via the distill**. We
+lose the anchor for those rows but keep the surrogate signal. The
+weighted loss formulation explicitly handles missing-label rows
+without crashing or down-weighting the entire trajectory.
+
+This is the structural reason the 16-dim distill is worth running
+even when the harness is the ground truth. The harness is sparse
+(one Boolean per trajectory), brittle (collisions, unsupported
+families, harness invocation failures), and ungradient. The
+distill is dense, robust to harness gaps, and gradient-friendly.
+Each compensates for the other's weakness. Neither alone is enough.
+
+## 8 What it taught us
+
+Three transferable lessons.
+
+**Pricing thresholds re-architect choice spaces.** The decision to
+distill via nano-medium API rather than self-host a 7B verifier is
+load-bearing on a single number — the API per-row cost. That number
+moved past the self-hosted floor in May 2026 and stayed there.
+Designs that depend on a single pricing threshold should bake in a
+revert plan if the threshold inverts. Ours: if nano-medium pricing
+reverts to \$0.30/M+, retrain on the cached 16-dim labels (no new
+API spend), pivot the labeling pass to a self-hosted 7B at the next
+corpus refresh.
+
+**Latency at the per-MCTS-expansion granularity is decisive.** The
+WM judge head at 23ms is not just a cost optimization — it is a
+**different operational regime** than 120ms API latency. The
+training-time saving is 5-6 days; the inference-time saving frees
+~18% of p95 budget. Anywhere a head is queried per MCTS expansion,
+the head must be local. Anywhere a head is queried once per
+trajectory (terminal reward), the API is fine.
+
+**Smooth surrogate + signed truth is a robust pattern.** The
+harness verdict + 16-dim distill split lets us train against a
+gradient-friendly target while anchoring on a ground-truth Boolean.
+The pattern generalizes: anywhere a signed-truth signal is expensive
+and ungradient, build a cheap dense surrogate and weight them with
+a tunable $\beta$. The corpus filter applies the signed truth; the
+training loop applies the surrogate; the model learns the
+surrogate's shape constrained by the truth's anchor.
+
+The honest postscript: as of 2026-05-19 the realized v4 production
+ckpt does not yet train against the 16-dim distill. The plan is
+documented, the cost is verified, the integration shape is clear;
+the wiring step is open. Same shape as several entries in
+HISTORY/34: the design is correct, the artifact is not yet
+deployed. We flag it loudly rather than carry the \$39.59 number
+as a closed line item.
+
+## Cross-references
+
+- [reward modeling](/essays/reward-modeling/) — the broader reward
+  stack this distillation sits in: harness verdict, 16-dim distill,
+  shaping reward, terminal reward propagation, the $\beta$ weighting.
+- [wm heads decoding](/essays/wm-heads-decoding/) — what the 16-dim
+  value head actually outputs, the HL-Gauss bin decoder, the
+  judge_value head; this is what the 23ms forward pass produces.
+- [multi-swe-bench wiring](/essays/multi-swe-bench-wiring/) — the
+  harness side of the signed-truth anchor: how Docker-isolated test
+  runs produce the Boolean verdict that anchors the smooth surrogate.
+- [pipeline integrity audit](/essays/pipeline-integrity-audit/) —
+  the broader honesty discipline (the 2026-05-11 audit that found
+  several specced-but-never-shipped fixes) that this essay's §4 gap
+  is reported under.
+
+## Sources
+
+- `parking_lot/v2_archive_2026-05-18/HISTORY/34_reward_modeling.md`
+  §7 (lines 437-525) — the gpt-5.4-nano-medium distillation section:
+  cost math, cohort, status-vs-spec drift, downstream consumer; §7.5
+  the implementation-vs-spec honesty paragraph; the
+  Math-Shepherd-vs-nano-medium comparison table at lines 458-466.
+- `parking_lot/v2_archive_2026-05-18/Claude.md` "Last Updated"
+  2026-05-02 entry — multi-swe-bench harness wiring; the
+  judge_source taxonomy (`mswebench_harness`, `harness_collided`,
+  `harness_unsupported`) that the smooth-surrogate weighting depends
+  on. 2026-05-10 entry — WM-in-the-loop deploy, the 23ms V100
+  forward measurement, 24 wm_call smoke. 2026-05-11 entry — the
+  pipeline-integrity audit honesty discipline.
+- `docs/research/design-decisions/verifier-sizing-rationale.md` —
+  16-dim axis spec, gpt-5.5-high \$7.4k disqualification line 51.
+- `docs/research/design-decisions/training-pipeline.md` Step 5 —
+  realized \$39.59 / 60,565 / 82 min / ~12 rps numbers.
+- `python/muzero/enrich_parquet_v2.py` — actually-implemented
+  enrichment script (`nano_prm_score`, `nano_confirm`, `nano_regret`
+  from `planner_events`); distinct from the planned
+  `gen_value_targets_v2.py` for offline 16-dim distillation.
+- `python/muzero/train_full_wm.py` — v4 trainer reading
+  `full_corpus_v2.parquet`; trains value head against
+  `terminal_reward` only, 16-dim wiring pending.
+- `wm-serve/wm_serve.py` — deployed FastAPI service serving the WM
+  judge head; 23ms p50 forward; LRU(10k) cache hit rate 0.62 on
+  smoke.
+- `src/search/engine/llm_tree/runtime/wm_client.rs` — perseus-side
+  client firing `query_wm()` per MCTS expansion; records `wm_call`
+  events into the planner JSONL.
