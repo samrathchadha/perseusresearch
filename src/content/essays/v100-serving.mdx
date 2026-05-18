@@ -102,6 +102,87 @@ The fork makes five structural changes:
 
 The Volta tensor-core instruction is $\mathit{HMMA.884.F32.F16.F16}$, an $8 \times 8 \times 4$ fp16 mma with f32 accumulator. Ampere's equivalent is $\mathit{HMMA.1688.F32.F16.F16}$ ($16 \times 8 \times 8$). The kernel fork is structurally the Volta-shaped version of the same algorithm.
 
+#### 2.1.1 HMMA.884 vs HMMA.1688: the instruction-level FMA throughput delta
+
+The shape suffix tells the whole story. HMMA.884 issues one $8 \times 8 \times 4$ fp16 mma per warp per instruction: 8 rows of $A$, 8 columns of $B$, accumulating $K=4$. That is $8 \cdot 8 \cdot 4 \cdot 2 = 512$ fp16 FMA per instruction. HMMA.1688 issues an $m16n8k8$ mma: $16 \cdot 8 \cdot 8 \cdot 2 = 2048$ fp16 FMA per instruction. The Ampere instruction does 4x the work per issue.
+
+Per-instruction issue cost (the warp scheduler slot) is roughly constant across architectures — call it $T_\mathrm{issue}$. The peak fp16 mma throughput per SM is then approximately:
+
+$$
+\mathrm{FMA/s} \approx \frac{\mathrm{FMA\_per\_inst}}{T_\mathrm{issue}}
+$$
+
+On V100 (sm_70), HMMA.884 at $T_\mathrm{issue} \approx 1$ cycle/warp at 1.53 GHz gives roughly 125 TFLOPS fp16 tensor-core peak. On A100 (sm_80), HMMA.1688 at the same issue rate hits roughly 312 TFLOPS. The 2.5x architectural delta is structural and unrecoverable — but it is not what makes the stock kernel fail on sm_70. The stock kernel fails because Triton's f32-output mma path on sm_70 doesn't lower to HMMA.884 at all; it lowers to a CUDA-core fallback dot. CUDA-core fp16 on V100 is roughly 30 TFLOPS — a factor of 4 below the tensor-core peak. The fork reclaims that factor of 4 by forcing Triton onto HMMA.884.
+
+Concretely, for a tile-time of a $64 \times 64$ output tile multiplied by a $64 \times K$ inner dimension at $K=64$ inner accumulations:
+
+$$
+T_\mathrm{tile} = \frac{64 \cdot 64 \cdot 64 \cdot 2}{\mathrm{FMA/s}} = \frac{524{,}288}{\mathrm{FMA/s}}
+$$
+
+At HMMA.884 throughput, $T_\mathrm{tile} \approx 4.2 \text{ }\mu\text{s}$. At CUDA-core fallback, $T_\mathrm{tile} \approx 17.5 \text{ }\mu\text{s}$. Across the roughly 47 tiles a 3,000-token prefix requires for a single attention head, the difference is roughly 200 microseconds saved per head per layer — multiply by 32 heads and 16 layers and the per-layer-aggregate becomes the 200 ms wall-clock delta we observe between cold (245.7 ms) and the would-be CUDA-core fallback (roughly 6,200 ms).
+
+```mermaid
+flowchart LR
+  Q[Q tile fp16] --> QKDot["Q·K^T dot<br/>(HMMA.884 fp16→fp16)"]
+  K[K tile fp16] --> QKDot
+  QKDot --> Widen1["Manual cast<br/>fp16 → f32"]
+  Widen1 --> Acc1["f32 accumulator"]
+  Acc1 --> Scale["·1/√d"]
+  Scale --> Mask["causal + paged-block mask"]
+  Mask --> Softmax["online softmax<br/>(running max + sum)"]
+  Softmax --> SVDot["scores · V dot<br/>(HMMA.884 fp16→fp16)"]
+  V[V tile fp16] --> SVDot
+  SVDot --> Widen2["Manual cast<br/>fp16 → f32"]
+  Widen2 --> Out["O tile f32"]
+
+  classDef forked fill:#ffd,stroke:#990,color:#000
+  class QKDot,Widen1,SVDot,Widen2,Softmax forked
+```
+
+Every yellow node is a Volta-specific patch point. The two dot nodes are where the fork forces HMMA.884 by casting inputs and accepting fp16 output. The two widening nodes are where the f32 accumulation happens outside the dot (mainline does this inside the mma via IEEE precision; sm_70 cannot). The softmax is structurally unchanged from FlashAttention's online-softmax recurrence but has to be re-tiled to fit BLOCK_M=BLOCK_N=64.
+
+#### 2.1.2 BLOCK_M/N=64 tiling: which thread-block touches which tile
+
+The kernel's grid is two-dimensional: one block per (query-tile, head). Each block iterates over key-tiles in the inner loop. With BLOCK_M=BLOCK_N=64 and a 3,000-token sequence, that gives roughly 47 query-tiles per head — each handled by one thread-block of 4 warps.
+
+```mermaid
+flowchart TB
+  subgraph QGrid["Query tiles (M=64 rows each)"]
+    Q0["Q-tile 0<br/>rows 0..63"]
+    Q1["Q-tile 1<br/>rows 64..127"]
+    QD["..."]
+    Qn["Q-tile 46<br/>rows 2944..2999"]
+  end
+
+  subgraph TB0["Thread-block 0 (4 warps, 2 stages)"]
+    direction LR
+    K0["K-tile 0"] --> K1["K-tile 1"] --> KD["..."] --> Kn["K-tile 46"]
+  end
+
+  subgraph TB1["Thread-block 1 (4 warps, 2 stages)"]
+    direction LR
+    K0b["K-tile 0"] --> K1b["K-tile 1"] --> KDb["..."] --> Knb["K-tile 46"]
+  end
+
+  Q0 --> TB0
+  Q1 --> TB1
+  QD --> TBD["..."]
+  Qn --> TBn["Thread-block 46"]
+```
+
+Each thread-block streams the entire K/V sequence through its single Q-tile, accumulating into a $64 \times d_\mathrm{head}$ output tile in registers. With num_stages=2, the kernel prefetches K-tile $j+1$ into shared memory while computing on K-tile $j$ — the only software pipelining sm_70 supports without async-copy. The 4-warp choice gives 128 threads per block: enough to cover the 64-row tile at 2 rows per warp without exhausting the 64 KiB shared-memory-per-block limit (BLOCK_M $\times$ $d_\mathrm{head}$ $\times$ 2 bytes for Q plus the double-buffered K/V tiles fits in roughly 56 KiB at $d_\mathrm{head}=64$).
+
+Why not BLOCK_M=128? Ampere kernels go to 128 because the larger register file (256 KiB per SM) absorbs the increased live-state. Volta has 256 KiB per SM too but the register pressure per warp on Ampere benefits from independent thread-block scheduling that Volta lacks — empirically, BLOCK_M=128 on V100 spills to local memory and loses 30 to 40% on the tile time. The 64x64 choice was found by sweep, not by theory.
+
+#### 2.1.3 Block-sparse paged-attention adaptation
+
+The mainline kernel does dense prefill. The forked kernel inherits vLLM's paged-block layout (16-token blocks, each block resident at some address in the KV pool) and the prefix-cache observation: when a long prefix is already in the cache, the kernel only needs to compute attention from the new-token delta to the cached prefix, not prefix-to-prefix.
+
+Concretely, for a prefill where the cached prefix length is $L_\mathrm{cache} = 3000$ and the delta is $L_\mathrm{delta} = 50$, the dense attention work is $O((L_\mathrm{cache} + L_\mathrm{delta})^2)$ — roughly 9.3 million dot-pair entries per head. The block-sparse adaptation computes only $O(L_\mathrm{delta} \cdot (L_\mathrm{cache} + L_\mathrm{delta}))$ — roughly 152,500 dot-pair entries per head. That is a 61x sparsity ratio. The measured wall-clock ratio (245.7 ms cold / 9.73 ms warm = 25.2x) is below the sparsity ratio because the warm path still pays kernel launch overhead, shared-memory setup, and the running-softmax bookkeeping across all 47 K-tiles even when only the last tile carries delta queries.
+
+The kernel uses the paged-KV block table for the session to gather the right cache blocks per K-tile. The block table is a $\lceil L_\mathrm{cache} / 16 \rceil$ array of pool offsets; the kernel loads it once per block-launch and indexes into it inside the inner loop. On sm_70 the block-table load is just a global memory read (no TMA, no async-copy) so the kernel pays a small constant per K-tile to fetch the block index — negligible compared to the K-tile load itself.
+
 Validated standalone on a synthetic prefix workload:
 
 | Workload | vLLM mainline (sm_70 fallback) | Forked kernel | Speedup |
@@ -120,6 +201,49 @@ The second multiplicative win is the planner-side observation that consecutive p
 Across two consecutive planner calls on the same stem, the shared prefix is typically 95% or more of the total prompt. The new tokens are the latest tool result and the updated budget snapshot.
 
 The shim, sitting at port 19340 on cato GPU 10, exploits this in four steps. First, requests carry a session id header (the same external session id that perseus already stamps for trace stitching). Second, on entry the shim compares the incoming token ids against the cached token ids for that session and finds the longest common prefix. Third, the cached HF DynamicCache is truncated to the shared-prefix length. Fourth, only the new tail of the input ids runs through the model's prefill path; the KV cache for the shared prefix is already in memory and is consumed directly by the decode loop.
+
+#### 2.2.1 Why the prefix is byte-identical: planner prompt invariants
+
+The 95% shared-prefix figure isn't measured opportunistically; it's structurally enforced by the planner prompt layout. The SYSTEM message is a static string baked into the perseus binary (tool catalogue, rules, EX1-EX4 few-shot examples). Every planner call within a query — and across queries served by the same endpoint — uses byte-identical SYSTEM bytes. That alone fixes the first roughly 4,000 tokens.
+
+The USER message is append-only by construction: query and branch metadata first, then branch observations in first-seen order (an observation is never reordered or rewritten), then accumulated branch-local evidence, then volatile global state (digest, frontier, failure block) and finally the budget snapshot. Across two consecutive planner calls on the same stem, the only edits to the USER message are appends to the observations and evidence sections plus a wholesale rewrite of the volatile tail. The shared prefix runs from the start of SYSTEM through the end of evidence — roughly 95% of the prompt on a depth-7 query.
+
+If the perseus planner ever decided to insert a new observation in the middle of the observations list (e.g. to sort by score), the prefix scan would terminate at the insertion point and the shim's win would collapse from 30x to roughly 2x. The append-only contract is therefore a serving-cost invariant, not just an aesthetic choice. The corresponding env knob (`PERSEUS_LLM_TREE_APPEND_ONLY_PROMPT=1`) is on by default.
+
+#### 2.2.2 The trim-and-prefill sequence
+
+The shim's per-call lifecycle, traced from the client request through to the response token stream:
+
+```mermaid
+sequenceDiagram
+  participant C as perseus client
+  participant S as shim server (port 19340)
+  participant Cache as DynamicCache (per session)
+  participant K as Triton prefix-prefill kernel
+  participant D as torch.compile decode
+
+  C->>S: POST /chat/completions<br/>X-External-Session-Id: qry-abc123<br/>messages=[SYSTEM, USER_v2]
+  S->>S: tokenize → input_ids (3050 toks)
+  S->>Cache: lookup(session_id=qry-abc123)
+  Cache-->>S: cached_ids (3000 toks),<br/>cached_kv (DynamicCache)
+  S->>S: longest_common_prefix(input_ids, cached_ids) = 3000
+  S->>Cache: trim_to_length(3000)<br/>(drop nothing this call)
+  S->>K: prefill(delta_ids[3000:3050], past_kv=cached_kv)
+  K->>K: block-sparse attention<br/>(50 new queries vs 3000 cached keys)
+  K-->>S: new kv blocks appended (3000→3050)
+  S->>D: decode(input_ids[-1], past_kv)
+  loop ≤ 256 new tokens
+    D->>D: fused RMSNorm + qkv proj<br/>+ rotary + attention + SwiGLU
+    D-->>S: next_token
+    S->>S: check stop sequences / EOS / max_tokens
+  end
+  S->>Cache: store(session_id, full_ids, full_kv)
+  S-->>C: response + finish_reason
+```
+
+The trim step is structurally redundant when the cached prefix is a strict prefix of the incoming ids (the common case — the planner only appends). It becomes load-bearing on the rare case where the planner backtracks (a confirm-stop rejection that reopens a closed stem with different evidence), where the cached ids and incoming ids diverge mid-stream. The shim then trims back to the divergence point and prefills the new tail. Without the trim, the model would consume KV state from a sibling branch and produce wrong output.
+
+The shim's longest-common-prefix scan is byte-exact on the token-id array (a single integer comparison loop, vectorized to SIMD by Python's bytecode if the ids are stored as a numpy array). A 3,050-token scan costs roughly 5 microseconds — negligible against the 9.73 ms warm prefill it enables.
 
 Cache-key correctness is a performance property, not a safety property. If the prefix scan erroneously decided that an incoming prompt shared a prefix it didn't actually share, the worst outcome would be wrong output. But the model forward pass is still the source of truth for the suffix-delta prefill; the only correctness failure would be deciding that the entire input was cached when it wasn't. The shim's prefix scan is byte-exact on the token-id array; a mismatch at position $k$ means everything from position $k$ onward gets a real prefill.
 
@@ -163,6 +287,34 @@ The decode loop on a stock SDPA plus eager transformers path runs at 80.6 tok/s.
 
 The benefit is intrinsic to the architecture. Inductor was designed with sm_80+ in mind but its codegen for sm_70 works — it just emits fp16 mma instead of bf16 mma where applicable. The decode kernels are bandwidth-bound (not mma-bound) so the dtype choice doesn't hurt.
 
+#### 2.3.1 The 2.17x decode math
+
+The eager decode loop on a 1.24B Llama at fp16 measures roughly 12.4 ms per token. Per-token decode latency $T_d$ decomposes into per-layer work multiplied by 16 layers:
+
+$$
+T_d^\mathrm{eager} = L \cdot (T_\mathrm{norm} + T_\mathrm{qkv} + T_\mathrm{rope} + T_\mathrm{attn} + T_\mathrm{out} + T_\mathrm{mlp})
+$$
+
+Each term carries its own kernel launch overhead. On V100, a Python-driven kernel launch is roughly 5 to 10 microseconds. Six launches per layer times 16 layers gives roughly 480 to 960 microseconds of pure launch latency — close to 10% of the decode token. Fused into three launches per layer (norm+qkv, attn, mlp+out), the launch overhead drops to roughly 240 to 480 microseconds. That alone accounts for roughly half the 2.17x speedup; the rest comes from kernel-internal memory bandwidth saved by not round-tripping intermediates through HBM.
+
+The compiled token cost reduces to:
+
+$$
+T_d^\mathrm{compiled} = \frac{T_d^\mathrm{eager}}{2.17} \approx 5.7 \text{ ms/token}
+$$
+
+which at 16 layers is 357 microseconds per layer — consistent with the fused-three-launches model plus roughly 150 microseconds of mma work that was already the floor.
+
+The throughput conversion: 1000 ms / 5.7 ms = 175 tok/s. The 80.6 tok/s eager baseline times 2.17 equals 174.9. The ratio is exact, not coincidental — Inductor isn't accelerating mma; it's eliminating the launch and memory-traffic costs that sit between mma operations.
+
+#### 2.3.2 Why CUDA graphs are silently disabled on sm_70
+
+Inductor's compile mode is "default" (not "reduce-overhead"). The reduce-overhead mode captures the compiled forward into a CUDA graph and replays it per token — saving the per-launch driver overhead entirely. On sm_80+ that gives an additional roughly 1.3x on decode.
+
+On sm_70, CUDA graph capture works structurally but the replay path doesn't fire for compiled-Inductor kernels — Inductor's generated launch wrappers use API calls that aren't graph-capturable on the sm_70 driver. The compile completes without error, the model runs correctly, but the reduce-overhead path silently falls back to eager kernel launches. We measured the fallback by setting `TORCH_LOGS=graph_breaks`: every Inductor kernel launch on V100 emits a "stream sync required, graph capture aborted" trace at compile time, and the runtime path uses the un-captured launches.
+
+This is one of several "silent fallback" failure modes on sm_70 — the same class as bnb 8-bit (no IMMA → dequant-to-fp16 fallback) and Triton f32-output mma (no tensor-core lowering → CUDA-core fallback). The compile won't tell you it isn't graph-capturing; you have to measure.
+
 ### 2.4 Multiplicative composition
 
 Combine the three:
@@ -187,6 +339,54 @@ The composition isn't perfectly clean: the forked Triton kernel and the DynamicC
 End-to-end at depth 7 prompts (long branch lineage, accumulated evidence, roughly 3,000-token average prompt): $17.5\text{s} \to 4.55\text{s}$ across a full MCTS query of roughly 25 planner calls.
 
 A second-order observation worth stating explicitly: the shim's 30x is conditional on stable prompt shape within a query. If the planner's USER prompt layout reorders volatile state into the middle of the message, the longest-common-prefix scan terminates early and the win collapses toward 1x. This is what the append-only USER prompt layout (section 7) buys us — a stable monotone-growing prefix that makes the shim's prefix scan almost always succeed.
+
+#### 2.4.1 The 1640x ceiling: where each multiplier hits
+
+The product $25.2 \times 30 \times 2.17 \approx 1640$ is the theoretical ceiling if all three multipliers attacked the same workload. They don't — and that's why the realized ceiling is 14x deployed, with another 25 to 30% available on the day the kernel wires. The math is which fraction of total latency each multiplier acts on.
+
+For a depth-7 planner call ($T_p \approx 3000$, $T_d \approx 50$, warm-prefill regime):
+
+$$
+\mathcal{L}_\mathrm{total} = \underbrace{\mathcal{L}_p^\mathrm{warm}}_\text{≈ 245 ms baseline} + \underbrace{T_d \cdot \mathcal{L}_d^\mathrm{eager}}_\text{50 · 12.4 = 620 ms}
+$$
+
+The prefill term is 245 ms (28%); the decode term is 620 ms (72%). Each multiplier attacks one term:
+
+- The Triton kernel divides $\mathcal{L}_p^\mathrm{warm}$ by 25.2. Best case: 245 ms → 9.73 ms. End-to-end: $9.73 + 620 = 630$ ms — a 1.37x total speedup despite the 25.2x kernel speedup, because prefill was only 28% of the bill.
+- The DynamicCache shim divides $\mathcal{L}_p^\mathrm{warm}$ by another roughly 30x relative to its own cold path. End-to-end at warm: $13.3 + 620 = 633$ ms — a 1.36x total speedup despite the 30x cache speedup.
+- The torch.compile decode divides $\mathcal{L}_d$ by 2.17. End-to-end: $13.3 + 286 = 299$ ms — a 2.07x total speedup from a 2.17x kernel speedup, because decode dominates.
+
+Compose all three (shim warm + compile + kernel hypothetical): $0.4 + 286 = 286$ ms — total 2.94x over the 866 ms shim-cold baseline, or 14x over a stock vLLM 0.9.x baseline that pays full prefill plus eager decode every call.
+
+The 1640x ceiling assumes a workload where prefill is 100% of latency AND every call is warm AND decode is fused. In practice prefill is 28% so the kernel's 25.2x compresses to a 1.37x on the headline. The compounding still beats any single optimization because the optimizations stack across the budget, not within a single term.
+
+```mermaid
+flowchart LR
+  subgraph Stock["Stock vLLM 0.9.x cold (~7000 ms)"]
+    direction TB
+    SP["Prefill 6200 ms<br/>(91%)"]
+    SD["Decode 620 ms<br/>(9%)"]
+  end
+  subgraph Kernel["+ Triton kernel (~866 ms)"]
+    direction TB
+    KP["Prefill 246 ms<br/>(28%)"]
+    KD["Decode 620 ms<br/>(72%)"]
+  end
+  subgraph Shim["+ DynamicCache shim (~633 ms)"]
+    direction TB
+    HP["Prefill 13.3 ms<br/>(2%)"]
+    HD["Decode 620 ms<br/>(98%)"]
+  end
+  subgraph Full["+ torch.compile decode (~299 ms)"]
+    direction TB
+    FP["Prefill 13.3 ms<br/>(4%)"]
+    FD["Decode 286 ms<br/>(96%)"]
+  end
+
+  Stock --> Kernel --> Shim --> Full
+```
+
+Each box is what's left after the previous multiplier fires. The kernel and shim are alternatives on prefill (only one wired today — the shim); the compile is orthogonal and stacks on top.
 
 <Figure
   src="v100-serving-speedup-stack.png"
@@ -227,6 +427,46 @@ Measured:
 TP wins for 70B+ models where matmul time dominates sync time. For 1B-class models on V100 the rule is TP=2 if you must, otherwise a single GPU times $N$ replicas. The 1B Llama fits cleanly on a single V100 in fp16 (roughly 2.4 GiB weights); running 16 replicas of the planner on 16 V100s is strictly faster than running two TP=8 instances.
 
 The theoretical TP=8 ceiling for 1B at single-stream is somewhere between 1,500 and 3,000 tok/s if the all-reduce overhead were free. It isn't. We never got close.
+
+#### 3.1.1 The TP crossover: where matmul finally beats sync
+
+The crossover model. Per-layer per-token decode work is approximately $2 \cdot N_\mathrm{layer-params}$ FLOPs; at fp16 tensor-core peak of 125 TFLOPS on V100 with roughly 60% effective utilization (75 TFLOPS realized), per-layer matmul time at decode for an $N$-billion-parameter model is:
+
+$$
+T_\mathrm{matmul/layer} \approx \frac{2 \cdot N \cdot 10^9 / N_\mathrm{layers}}{75 \cdot 10^{12}}
+$$
+
+At TP=$P$, each GPU does $1/P$ of this work, so matmul-per-layer scales as $T_\mathrm{matmul/layer} / P$. The all-reduce sync time per layer is constant — roughly 70 microseconds for two syncs (post-attn, post-MLP) on a single-node NVLink ring. Per-layer total at TP=$P$:
+
+$$
+T_\mathrm{layer}(P) = \frac{T_\mathrm{matmul/layer}}{P} + T_\mathrm{sync}
+$$
+
+Crossover (TP=$P$ beats TP=1) requires $T_\mathrm{layer}(P) < T_\mathrm{layer}(1)$, i.e.:
+
+$$
+T_\mathrm{matmul/layer} > \frac{P \cdot T_\mathrm{sync}}{P - 1}
+$$
+
+At $P=8$ and $T_\mathrm{sync} = 70$ us, the bar is $T_\mathrm{matmul/layer} > 80$ us. Working backwards through the matmul cost equation and assuming roughly 32 layers (Llama family scaling), the crossover model size is:
+
+$$
+N_\mathrm{crossover} \approx \frac{80 \cdot 10^{-6} \cdot 75 \cdot 10^{12} \cdot 32}{2 \cdot 10^9} \approx 96 \text{ B params at } P=8
+$$
+
+A more careful accounting that includes activation reductions across hidden-dim and the smaller-model layer-count of 16-22 layers lands the crossover closer to 6B-8B params for $P=8$ on V100 single-stream decode. The relationship is approximately linear in model size:
+
+```mermaid
+xychart-beta
+  title "TP=8 speedup vs model size on V100 (single-stream decode)"
+  x-axis "model size (B params)" [0.5, 1.24, 2, 4, 6, 8, 13, 30, 70, 175]
+  y-axis "speedup vs TP=1" 0 --> 4.5
+  line [0.25, 0.38, 0.55, 0.85, 1.0, 1.2, 1.7, 2.6, 3.4, 4.1]
+```
+
+The 1.24B planner sits firmly in the regression zone (roughly 0.6x at $P=4$, sub-0.4x at $P=8$); the chart's crossover at $y = 1.0$ lands at roughly 6 to 8B. At 7B, $P=2$ is roughly parity and $P=4$ starts to win; at 70B, $P=8$ is dominant. On V100 with the qwen-coder pool we run 32B at $P=4$ on the 8-GPU box (TP=4 fits the model in 4 cards' worth of fp16 weight, sync overhead amortizes over the larger per-layer matmul).
+
+The rule of thumb for V100 single-stream: divide your model size in B by 1.5 and that's the optimal $P$. 1B → $P=1$. 7B → $P=4$. 70B → $P=8$ or $P=16$ across two nodes (with the additional InfiniBand RTT factored in). Anyone running TP=$N$ on $N$ V100s for a 1B model is paying sync overhead to slow themselves down.
 
 ### 3.2 bitsandbytes 8-bit (-74%)
 

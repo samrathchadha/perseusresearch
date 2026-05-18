@@ -360,6 +360,48 @@ The match is 1-to-1. Every V2 concept has a perseus home; the mapping is not app
 
 This matters more than the line count. A reset that preserved architecture would have produced a 5,000-line Python codebase implementing a different algorithm, and we would not know whether the V2 numbers (or the lack of them) generalized. A reset that broke architecture would have committed us to re-running every benchmark from scratch, with no way to attribute changes to the rewrite versus the new algorithm. By holding architecture invariant and replacing only plumbing, we can read V2's archived audit corpus as a baseline. The world model still consumes the same state representation; the planner still emits the same action structure; the snapshot table still records the same visit distribution. The training data that the reset produces is drop-in compatible with the V2 training data the audit was based on.
 
+## 7b. V2 vs perseus, side by side
+
+The amputation and survival tables describe the cut in detail. The diagram below renders the same cut as a single side-by-side comparison of the runtime surface. Read top-to-bottom on each side: languages, process count, stop-function complexity, schema shape, and approximate LOC.
+
+```mermaid
+flowchart LR
+    subgraph V2 [V2 - before reset, 2026-05-18 morning]
+        V2L["Languages\nRust + Python + TypeScript"]
+        V2P["Processes\nperseus + retrieval-service + wm-serve\nplus dashboard + multi-bench worker"]
+        V2S["Stop function\nseven interacting predicates\nplanner stop, adversarial confirm,\nper-stem confirm, give_up,\ncomposite WM, depth cap, budget-ms"]
+        V2DB["Schema\n13 SQL migrations\nordering errors common"]
+        V2C["LOC\napprox 72,000\nRust monoculture in core\nthree TS dashboards\n11k lines of docs"]
+        V2L --> V2P --> V2S --> V2DB --> V2C
+    end
+
+    subgraph PER [perseus - after reset, 2026-05-18 evening]
+        PL["Languages\nPython 3.12 only"]
+        PP["Processes\none FastAPI server\nplus optional wm-serve uvicorn"]
+        PS["Stop function\nONE conjunction\nWM stop logit > 0\nAND planner status in {stop, give_up}\n95 lines total"]
+        PDB["Schema\none schema.sql applied at startup\nschema_migrations table tracks history"]
+        PC["LOC\napprox 5,000 hard cap\ncore at 3,993\nevery file under 250 lines"]
+        PL --> PP --> PS --> PDB --> PC
+    end
+
+    V2 ===|"reset 2026-05-18\n13.6x shrinkage\narchitecture survives"| PER
+
+    style V2L fill:#fdd
+    style V2P fill:#fdd
+    style V2S fill:#fbb
+    style V2DB fill:#fdd
+    style V2C fill:#fdd
+    style PL fill:#cfc
+    style PP fill:#cfc
+    style PS fill:#cfc
+    style PDB fill:#cfc
+    style PC fill:#cfc
+```
+
+Each row of the comparison is a single seam along which V2 had accumulated friction. Three languages became one because the cross-language coupling was the cost center, not any individual language. Five processes became one because every inter-process boundary in V2 carried its own retry policy, timeout policy, and schema migration. Seven stop predicates became one conjunction because the seven-layer arrangement was producing the 515-to-1 confirm-stop reject rate the audit measured. Thirteen migrations became one schema file because the migration order was a recurring source of "does engram have the latest" failures.
+
+The 13.6x shrinkage is the visible number. The invisible number is the number of cross-cutting concerns that no longer exist. The UCB exploration constant is set in one place, not three. The world-model alpha is one config field, not one env var plus one Cargo default plus one Python override. The retrieval endpoint is one string, not a fan-out of three. Most of the reset's value is in what is no longer there.
+
 ## 8. LOC accounting
 
 The before-and-after by directory makes the cut concrete.

@@ -114,6 +114,46 @@ A single query is single-threaded with respect to the MCTS loop. The planner cal
 
 Concurrency lives one level up. The HTTP server runs many queries in parallel, each with its own tree, its own aggregator, its own event bus, and its own snapshot stream. Shared resources are the retrieval service (which has its own concurrency model), the planner inference endpoint (which has its own batching), and the world-model serve endpoint (which has its own LRU cache and request pipelining). The per-query state is fully isolated.
 
+### 4.7 Tree growth across iterations
+
+To make the abstract description concrete, here is a five-iteration trace of one query's tree growth. Numbers in brackets are visit counts; the arrow with the heavy weight on each step indicates which child UCB selected as the descent path for that iteration. The reader can verify that each iteration adds exactly one new child while incrementing visit counts up the ancestry of the new leaf.
+
+```mermaid
+graph TD
+    subgraph Iter1 [Iteration 1 - expand root]
+        R1["root [1]"] -->|select| H1["hybrid_search [1]"]
+    end
+
+    subgraph Iter2 [Iteration 2 - expand hybrid leaf]
+        R2["root [2]"] -->|argmax UCB| H2["hybrid_search [2]"]
+        H2 --> O2["open_file [1]"]
+        R2 -.lower UCB.-> D2["dense_search [0]"]
+    end
+
+    subgraph Iter3 [Iteration 3 - explore dense]
+        R3["root [3]"] -->|argmax UCB| D3["dense_search [1]"]
+        R3 -.-> H3["hybrid_search [2]"]
+        H3 --> O3["open_file [1]"]
+    end
+
+    subgraph Iter4 [Iteration 4 - deepen hybrid stem]
+        R4["root [4]"] -->|argmax UCB| H4["hybrid_search [3]"]
+        H4 -->|argmax UCB| O4["open_file [2]"]
+        O4 --> S4["snippet_extract [1]"]
+        R4 -.-> D4["dense_search [1]"]
+    end
+
+    subgraph Iter5 [Iteration 5 - second hybrid child]
+        R5["root [5]"] -->|argmax UCB| H5["hybrid_search [4]"]
+        H5 --> O5["open_file [2]"]
+        H5 --> SY5["symbol_lookup [1]"]
+        O5 --> S5["snippet_extract [1]"]
+        R5 -.-> D5["dense_search [1]"]
+    end
+```
+
+The pattern visible across iterations 1 through 5: the hybrid_search stem accumulates visits faster because its $Q$-value backed up from the snippet_extract leaf is high; dense_search has been explored once and is waiting for its UCB exploration term to overtake the $Q$-gap. Iteration 4 deepens the productive stem rather than widening, because the prior $\times$ exploration weight on a new root child no longer dominates the $Q$ of the deeper child. Iteration 5 finally adds a second hybrid child once the deepening has lifted the parent's $N$ enough that a fresh sibling's exploration bonus becomes competitive.
+
 ## 5. The two-vote stop
 
 The most consequential design decision in the loop is also the smallest piece of code. Every iteration, after expansion and world-model scoring but before the tool fires, the stop function runs. It returns one of four exits.

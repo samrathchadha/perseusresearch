@@ -139,6 +139,56 @@ $$
 
 with $\hat{y} - y \approx 0.997 - 0.114 \approx 0.88$. The bias is enormous and unidirectional. The conditional structure is: given that the row-random split with high probability places sibling rows in train and val, the embedding distance between train and val rows of the same trajectory is bounded by the embedding model's intra-trajectory similarity, which is empirically small. Memorization via embedding retrieval is therefore the optimal strategy under the loss, and the model learns exactly that.
 
+## 5b. Per-shape corruption flow
+
+Before the class identity diagram, the four shapes side-by-side, each as a column showing how truth enters the pipeline, where the silent substitution happens, and what the downstream consumer ends up training on. Reading column by column reveals the substitution arrow is structurally identical across all four; only the names and volumes differ.
+
+```mermaid
+flowchart TB
+    subgraph A [Shape A - fan-out]
+        A1["truth\n10 sibling rows\nshare one key"]
+        A2["harness writes\none verdict per key"]
+        A3["substitution\nlabel(r) = verdict(key(r))\nfor all r in group"]
+        A4["downstream\nWM trains on\n9 wrong + 1 right per group"]
+        A1 --> A2 --> A3 --> A4
+    end
+
+    subgraph B [Shape B - silent default]
+        B1["truth\njudge_label is NULL\nresult column never populated"]
+        B2["Rust struct\ndrops migration-008 columns"]
+        B3["substitution\nNone -> match fails\n-> r_T = 0.0"]
+        B4["downstream\n17 days of WM ckpts\ntrained on constant zero"]
+        B1 --> B2 --> B3 --> B4
+    end
+
+    subgraph C [Shape C - enum collapse]
+        C1["truth\nharness crashed\nbefore writing report"]
+        C2["runtime recovers partial\nstamps judge_label = 0.0"]
+        C3["substitution\nNEVER_RAN and FAIL\ncollapse to same label"]
+        C4["downstream\n786 hard instances\nlook like real fails"]
+        C1 --> C2 --> C3 --> C4
+    end
+
+    subgraph D [Shape D - leakage]
+        D1["truth\nshared y_i across\nall steps of T_i"]
+        D2["random row split\ndistributes sibling rows\nacross train and val"]
+        D3["substitution\nval R-squared measures\nfingerprint lookup"]
+        D4["downstream\nalpha = 0.9 for 8 days\non memorization probe"]
+        D1 --> D2 --> D3 --> D4
+    end
+
+    style A3 fill:#fdd
+    style B3 fill:#fdd
+    style C3 fill:#fdd
+    style D3 fill:#fdd
+    style A4 fill:#fbb
+    style B4 fill:#fbb
+    style C4 fill:#fbb
+    style D4 fill:#fbb
+```
+
+Each column has the same three-arrow structure: truth state, a substitution node where the silent default is applied, and a downstream consumer that treats the substituted value as ground truth. The substitution nodes (pink) are the load-bearing failure points; the downstream nodes (red) are the visible damage. Erasing any substitution arrow and replacing it with an explicit refusal-to-label (NULL or typed error) breaks the chain at the cheap intervention point.
+
 ## 6. The class, in one diagram
 
 ```mermaid

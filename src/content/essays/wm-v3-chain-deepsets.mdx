@@ -74,6 +74,52 @@ The gradient for step $i$ depends on the pooled sum (shared across all steps) an
 
 Max-pool ablations early in the sweep lost roughly 3 $R^2$ points on every head — the corpus has too few "obviously bad" steps for max to find. Mean-pool came within 0.5 points of sum but consistently worse on long chains where count signal matters. Attention-weighted pooling (the `v3_attn_pool` row in §1) was 11 points worse than sum on terminal reward.
 
+### Mechanics on a concrete trajectory
+
+A worked example makes the per-step flow concrete. Imagine a 5-step MCTS chain that searches for an auth bug:
+
+```mermaid
+flowchart LR
+    subgraph trajectory["raw trajectory x_1 ... x_T"]
+        X1["x_1<br/>search_text(auth_token)"]
+        X2["x_2<br/>open_file(login.py)"]
+        X3["x_3<br/>snippet_extract(L42-78)"]
+        X4["x_4<br/>references_lookup(verify_jwt)"]
+        X5["x_5<br/>hybrid_search(expired token)"]
+    end
+    subgraph encoder["chain encoder (1-layer GRU, order-sensitive)"]
+        G1["h_1"]
+        G2["h_2"]
+        G3["h_3"]
+        G4["h_4"]
+        G5["h_5"]
+    end
+    X1 --> G1
+    X2 --> G2
+    X3 --> G3
+    X4 --> G4
+    X5 --> G5
+    G1 -.carries context.-> G2
+    G2 -.-> G3
+    G3 -.-> G4
+    G4 -.-> G5
+    G1 --> P1["phi(x_1, h_1)"]
+    G2 --> P2["phi(x_2, h_2)"]
+    G3 --> P3["phi(x_3, h_3)"]
+    G4 --> P4["phi(x_4, h_4)"]
+    G5 --> P5["phi(x_5, h_5)"]
+    P1 --> SUM(("Sigma sum-pool<br/>z = sum_i phi(x_i, h_i)"))
+    P2 --> SUM
+    P3 --> SUM
+    P4 --> SUM
+    P5 --> SUM
+    SUM --> RHO2["rho(z)<br/>trunk vector"]
+```
+
+Each raw step $x_i$ is the concatenated codet5p embedding of the tool name plus args plus result snippet. The GRU folds left-context into $h_i$ so $\phi$ sees both the step and what came before. Then sum-pool collapses all $T$ per-step vectors into a single trunk-shaped $z$ regardless of $T$.
+
+A 3-step chain and a 25-step chain produce the same-shaped $z$. That fixed-width output is what makes the readout $\rho$ and the head MLPs reusable across chain lengths.
+
 ### Set definition
 
 For Perseus's WM, the set $X$ is the sequence of MCTS chain steps inside one planner call.
@@ -97,6 +143,36 @@ A planner-call chain has a temporal order — step 0 happens before step 1 — b
 What matters is which evidence got into the chain, not the order in which it landed. Two chains that opened the same three files in different orders should yield the same value estimate, and we want the architecture to encode that as a hard invariant rather than learn it from data.
 
 Transformer encoders can learn this invariance from positional bias, but they spend gradient budget on learning to ignore position when position is irrelevant. DeepSets gets the invariance for free as a structural property.
+
+To see what "for free" means concretely, take three trajectory steps $a, b, c$ and feed them in two different orders. Without the GRU upstream, the chain encoder is just $\phi$, and sum-pool produces a single trunk vector $z$:
+
+```mermaid
+flowchart TB
+    subgraph order_one["order one: a, b, c"]
+        A1["phi(a)"]
+        B1["phi(b)"]
+        C1["phi(c)"]
+        S1(("sum"))
+        A1 --> S1
+        B1 --> S1
+        C1 --> S1
+    end
+    subgraph order_two["order two: c, a, b (shuffled)"]
+        C2["phi(c)"]
+        A2["phi(a)"]
+        B2["phi(b)"]
+        S2(("sum"))
+        C2 --> S2
+        A2 --> S2
+        B2 --> S2
+    end
+    S1 --> Z["z identical<br/>(commutativity of sum)"]
+    S2 --> Z
+    Z --> RHO3["rho(z)"]
+    RHO3 --> Y["same prediction y"]
+```
+
+Both orderings produce bit-identical $z$ because $\phi(a) + \phi(b) + \phi(c) = \phi(c) + \phi(a) + \phi(b)$. The architecture cannot represent an order-dependent prediction without the GRU; this is a hard structural invariant, not a learned soft one.
 
 There are cases where order does matter — did the planner read file A before committing to a give-up? — and for those we keep a small recurrent context upstream of the pool.
 
@@ -203,6 +279,29 @@ $$
 with $w_v = 1.0$, $w_p = 1.0$, $w_f = 0.5$, $w_s = 0.5$.
 
 The value loss is a 51-bin HL-Gauss cross-entropy over the discretized reward. PRM and the recall heads use BCE-with-logits or MSE depending on label type. The auxiliary heads at half-weight provide regularization on the trunk without overwhelming the primary value objective.
+
+The gradient picture is straightforward: each head produces its own loss, the four losses are summed with weights, and the gradient flows back through $\rho$ into $\phi$ and finally into the GRU.
+
+```mermaid
+flowchart BT
+    subgraph heads["four prediction heads"]
+        HV["value head<br/>L_value (w=1.0)"]
+        HP["PRM head<br/>L_prm (w=1.0)"]
+        HF["file_recall head<br/>L_fr (w=0.5)"]
+        HS["snippet_recall head<br/>L_sr (w=0.5)"]
+    end
+    SUM_L["L_joint = sum_k w_k L_k"]
+    HV --> SUM_L
+    HP --> SUM_L
+    HF --> SUM_L
+    HS --> SUM_L
+    SUM_L -. dL/dz .-> RHO_B["rho readout MLP"]
+    RHO_B -. dL/d(phi sum) .-> PHI_B["phi per-step MLP"]
+    PHI_B -. dL/dh_i .-> GRU_B["GRU chain encoder"]
+    GRU_B -. dL/dx_i (stopped) .-> FROZEN["codet5p (frozen, no grad)"]
+```
+
+Every gradient pass updates the shared trunk ($\rho$, $\phi$, GRU) with a weighted sum of four head signals. The trunk cannot collapse toward any single head's degenerate solution because three other gradients are pulling it in different directions at the same step.
 
 Setting $w_p = w_f = w_s = 0$ recovers a value-only trunk that underfits — it has no extra supervision to fight degenerate collapse toward mean reward. The multi-task interaction is the architecture; the head MLPs are almost incidental.
 

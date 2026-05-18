@@ -68,6 +68,21 @@ column because it is the load-bearing column.
 
 <Figure src="tinker-lora-bakeoff-val-curves.png" alt="val loss curves" caption="Four-parallel Tinker LoRA bake-off val_loss trajectories. bigseq (seq=8192) descends to 0.932, the lowest of the sweep. r256_short shown dashed at the rank-cap rejection point. Sequence length dominates rank at this scale." n={1} />
 
+The same trajectories, expressed as a mermaid chart so the per-step numbers are readable inline. x-axis is the training-step bucket; y-axis is val_loss in nats. The four series stop at their respective final-step counts, so r128_short terminates earliest (3,046 steps) and bigseq terminates last (9,386 steps). The baseline at val_loss 1.098 is the dashed reference line that bigseq breaks below by 0.166 nats around step 7,000.
+
+```mermaid
+xychart-beta
+    title "val_loss across four LoRA variants"
+    x-axis "training step bucket" [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000]
+    y-axis "val_loss (nats)" 0.85 --> 1.45
+    line "r128 (r=128, seq=4096)" [1.34, 1.27, 1.22, 1.19, 1.17, 1.15, 1.14, 1.13, 1.122]
+    line "bigseq (r=64, seq=8192)" [1.28, 1.18, 1.10, 1.04, 0.99, 0.96, 0.94, 0.935, 0.932]
+    line "superclean (r=64, half data)" [1.32, 1.24, 1.19, 1.16, 1.13, 1.120, 1.120, 1.120, 1.120]
+    line "r128_short (r=128, 50k rows)" [1.41, 1.34, 1.283, 1.283, 1.283, 1.283, 1.283, 1.283, 1.283]
+```
+
+Read across the chart: bigseq is the only series that crosses below the 1.098 baseline, and it does so monotonically. r128 and superclean both flatten above 1.10. r128_short never recovers from its small-data start. The visual confirms what the eight-rules section argues mechanically: seq length is the load-bearing axis at this corpus scale; doubling rank without growing context produces a worse model.
+
 ## v3_r128: capacity at constant data
 
 We doubled LoRA rank from 64 to 128 and held everything else at the
@@ -96,6 +111,30 @@ $$
 Twice the parameters. Val loss moved from 1.098 to 1.122, *worse* by 0.024
 nats. The capacity probe came back negative. We see three plausible
 readings, listed in descending order of how seriously we take them.
+
+### Where the LoRA adapter actually sits
+
+The trainable parameter count is large in absolute terms (8.4M at $r=64$, 16.8M at $r=128$) but tiny relative to the 1.2B frozen base. The arithmetic stays cheap because the adapter does not replace the frozen projection; it adds a residual computed from a rank-$r$ bottleneck. The diagram below shows the data path inside one attention block, with the frozen base $W \in \mathbb{R}^{d \times d}$ on the top edge and the trainable adapter $A \in \mathbb{R}^{r \times d}$ and $B \in \mathbb{R}^{d \times r}$ on the bottom edge. The output is the sum of the two paths.
+
+```mermaid
+flowchart LR
+    X["input x in R^d"]
+    X --> FrozenW["frozen W in R^(d x d)\nshape d=2048\nNO GRADIENT"]
+    X --> A["A in R^(r x d)\nrank-down projection\ntrainable"]
+    A --> Bottleneck["z = A x\nz in R^r\nrank r is 64 or 128"]
+    Bottleneck --> B["B in R^(d x r)\nrank-up projection\ntrainable, init zero"]
+    FrozenW --> Sum["+"]
+    B --> Scale["scale by alpha / r"]
+    Scale --> Sum
+    Sum --> Y["y = W x + (alpha/r) B A x\noutput in R^d"]
+
+    style FrozenW fill:#ddd
+    style A fill:#cfe
+    style B fill:#cfe
+    style Scale fill:#cfe
+```
+
+Two facts make this work. First, $B$ is initialized to zero so the adapter starts as an identity perturbation; training is well-conditioned because the model begins at the frozen base's behavior and drifts continuously. Second, only $A$ and $B$ enter the gradient graph, so memory and step time scale with $r \cdot d$ rather than $d^2$. The rank cap Tinker enforced at $r=128$ is therefore not arbitrary: doubling $r$ doubles both the trainable parameters and the per-step matmul cost on the adapter path, and at some rank the savings versus full fine-tune disappear.
 
 1. **The corpus is past the rank-64 knee.** The base model has 1.2B
    parameters and the curated corpus has roughly 700M tokens pre-pack

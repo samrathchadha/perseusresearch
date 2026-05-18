@@ -82,6 +82,49 @@ The honest split is by instance ID: partition $\mathcal{T}$ first into $\mathcal
 
 We trained both. The contrast is the central finding of the sweep, and it took us until 2026-05-18 to internalize it.
 
+### The leakage, made concrete on one instance
+
+To see why row-split corrupts the validation signal, consider a single instance $T_i$ with three steps and shared terminal label $y_i = +1$ ("patch passes"). Under an instance-split, the entire trajectory falls on one side of the partition. Under a row-split, each step is drawn independently, so neighboring steps from the same trajectory split across train and val. In the row-split case below, val row $s_{i,2}$ has both of its sibling rows in train, and the encoder can trivially recover $y_i$ from any state that fingerprints onto $T_i$.
+
+```mermaid
+flowchart LR
+    subgraph Instance [Instance T_i with shared label y_i = plus 1]
+        S1["step 1: s_i,1"]
+        S2["step 2: s_i,2"]
+        S3["step 3: s_i,3"]
+    end
+
+    Instance --> InsSplit
+    Instance --> RowSplit
+
+    subgraph InsSplit [Instance-split - honest]
+        direction TB
+        ITR["TRAIN cohort"]
+        IVA["VAL cohort"]
+        IT1["s_i,1, s_i,2, s_i,3\nall three rows\nstay together"]
+        IV1["empty\nfor instance T_i"]
+        ITR --- IT1
+        IVA --- IV1
+    end
+
+    subgraph RowSplit [Row-split - leakage]
+        direction TB
+        RTR["TRAIN cohort"]
+        RVA["VAL cohort"]
+        RT1["s_i,1, s_i,3\ntwo siblings with\nsame label y_i"]
+        RV1["s_i,2\nencoder sees\nfingerprint of T_i\nin TRAIN, copies y_i"]
+        RTR --- RT1
+        RVA --- RV1
+    end
+
+    style IT1 fill:#cfc
+    style IV1 fill:#cfc
+    style RT1 fill:#fdd
+    style RV1 fill:#fdd
+```
+
+The instance-split cohort puts all three steps on one side, so the val set never sees this instance and the encoder cannot fingerprint-then-lookup. The row-split cohort puts $s_{i,2}$ in val with $s_{i,1}$ and $s_{i,3}$ in train; the val row's prediction collapses to "find a sibling in train, return its label." Generalization is not measured under row-split because the model is not asked to generalize.
+
 ## Era timeline
 
 ```mermaid
