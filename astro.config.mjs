@@ -10,8 +10,26 @@ const rehypePlugins = [
   [
     rehypeMermaid,
     {
-      strategy: "img-svg",
-      mermaidConfig: { theme: "neutral" },
+      // inline-svg: rehype-mermaid spawns Playwright/Chromium at build,
+      // renders each mermaid block to SVG, inlines the SVG in the HTML.
+      // No client-side JS for diagrams. Search-indexable, FOUC-free.
+      // Requires `playwright install chromium` in the build script.
+      strategy: "inline-svg",
+      mermaidConfig: {
+        theme: "neutral",
+        themeVariables: {
+          fontFamily: "'Adobe Garamond Pro', 'EB Garamond', Times, serif",
+          fontSize: "14px",
+          primaryColor: "#fafaf7",
+          primaryTextColor: "#1a1815",
+          primaryBorderColor: "#6b6157",
+          lineColor: "#6b6157",
+          secondaryColor: "#f6f4ee",
+          tertiaryColor: "#ffffff",
+          background: "#ffffff",
+        },
+        flowchart: { curve: "basis", padding: 12 },
+      },
     },
   ],
 ];
