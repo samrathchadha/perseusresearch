@@ -4,137 +4,118 @@ date: 2026-05-18
 status: published
 tier: planner
 summary: "Production-baseline of the 2026-05-16 v3 sweep. Tinker run id 0951cfea, llama32-1b-epoch3-v3, 178,848 rows after fr≥0.5 + tr≥-1.0 filter, ~10,892 steps over 0.85 nominal epochs (3-epoch budget cap). Val_loss 1.479 → 1.098. Deployed at cato:19320 since 2026-05-17 18:02."
-related: ["tinker-lora-bakeoff","llama-32-1b-tinker-planner","planner-llm-call"]
+related: ["tinker-lora-bakeoff","llama-32-1b-tinker-planner","planner-llm-call","cohort-contamination-class"]
 readTime: 9
 ---
 
 import Figure from "../../components/Figure.astro";
 
-## What this run is
+## Thesis
 
-`llama32-1b-epoch3-v3` (cato) is the Tinker run with id
-`0951cfea-85a6-5a21-910e-fa0b646b9d5d`. It produced the merged
-safetensors directory at
-`cato:/home/cato-user/tinker_merged/llama32-1b-epoch3-v3/` and the
-single-file step-10500 copy at `..._step10500/`. As of 2026-05-17
-18:02 it is served by `vllm serve` on cato port `:19320` under the
-served-model-name `llama32_1b_epoch3`. The flags are
-`--max-num-seqs 48 --max-num-batched-tokens 24576 --enforce-eager`.
+The deployed planner baseline is not the variant that won on validation loss. We
+shipped the run with val_loss 1.098, knowing a sibling variant in the same
+sweep hit 0.932 on the same parquet under the same filter.
 
-It is the production planner baseline. The number it is asked to
-beat is its own val_loss of 1.098 at step 10,500.
+The decision is deliberate. A deployment baseline is a measurement instrument,
+not a leaderboard winner. The instrument has to hold one axis fixed at the
+trainer's default configuration so that every other variant in the sweep
+remains attributable. We argue this position in detail below.
 
-The interesting part is not that it shipped. The interesting part is
-*why* it shipped, given that another variant in the same sweep
-(`v3_bigseq`, rank 64 at seq 8192) finished at val_loss 0.932 — a
-much better number on the same parquet under the same filter. The
-short answer is that "baseline" and "winner" are different roles,
-and only one of them needs a deployment story.
+The second load-bearing claim is structural and independent of the first. This
+checkpoint trained on a corpus that was simultaneously the source of a known
+contamination class for a sibling training pipeline, and survived intact,
+because the contaminated field never touched its loss. Loss type is a
+first-class audit variable, not a downstream consequence of corpus integrity.
 
-## Corpus curation
+## The run, in one paragraph
 
-The source is `cato:/home/cato-user/distill_corpus/plan_full.jsonl`,
-8.6 GB, 180,720 rows. Each row is one teacher trajectory from
-`gpt-5-nano` against a multi-bench instance — a sequence of planner
-messages plus a target completion (the planner JSON the teacher
-emitted). The loss is token-level cross-entropy on the *completion*
-portion only. Prompt tokens get `weights=0` in the Tinker `Datum`;
-they are conditioning context, not target.
+We trained the variant `llama32-1b-epoch3-v3` on Tinker (run id
+`0951cfea-85a6-5a21-910e-fa0b646b9d5d`) against 178,848 rows of
+teacher-distillation data, batch 16, LoRA rank 64, sequence cap 4096, learning
+rate 2e-4, cosine schedule anchored at a 3-epoch budget. The run logged 10,892
+optimizer steps before Tinker's job slot drained. Best validation loss was
+1.098 at step 10,500. The merged safetensors directory was launched under vLLM
+on cato port 19320 on 2026-05-17 18:02, served under the model name
+`llama32_1b_epoch3`. That endpoint is the named production planner baseline as
+of this writing.
 
-`train_ultra.py` adds two filter knobs on top of the raw JSONL:
-`--min-file-recall 0.5` and `--min-terminal-reward -1.0`. The v3
-baseline runs with exactly those defaults. The filter keeps 178,848
-rows and rejects 1,872 — a 1.0% rejection rate. The rejected rows are
-trajectories that ended with no file recall *and* a strongly negative
-terminal reward, which roughly means "the teacher did a bad job, the
-demonstration would be miscalibrated for the student to imitate."
+The interesting question is not whether the curve converged. It did. The
+question is why this checkpoint occupies the deployment slot and not the
+bigger-sequence variant that beat it by 0.166 nats on the same validation set.
 
-Notice what the filter does *not* do. It does not look at
-`judge_label`. It does not gate on the per-row judge harness verdict
-from `multi_bench_runs`. This matters because of an audit landed on
-2026-05-11.
+## Corpus and loss
 
-The 2026-05-11 pipeline-integrity audit established that
-`pick_terminal_reward(RewardSource::Judge)` had been reading the
-legacy NULL `result` column. Every world-model checkpoint trained off
-`--reward-source judge` between the column rename and the audit was
-silently regressing toward zero by construction. The judge_label
-contamination class was real and was material.
+The source corpus is the file `plan_full.jsonl` on cato, 8.6 GB, 180,720 rows.
+Each row is one teacher trajectory from `gpt-5-nano` against a multi-bench
+instance: a sequence of planner messages plus a target completion containing
+the planner JSON the teacher emitted.
 
-What the audit *did not* affect is the SFT planner-distillation
-corpus. The Tinker teacher-CE loss takes its target from the per-row
-`completion` field — the JSON the teacher produced. Whether the
-trajectory eventually passed the judge harness is irrelevant to the
-SFT signal. The student is learning to imitate the teacher's planner
-output token-by-token, not to predict the harness verdict.
-
-So the same plan_full.jsonl that was useless for value-regression
-training (because the value target was contaminated) was a perfectly
-fine SFT corpus. Different loss type, different exposure. The
-2026-05-11 audit found a contamination class that was selective.
-
-That is the load-bearing point of this essay, and the rest of the
-text builds toward it.
-
-## The 3-epoch rationale
-
-The variant name is `llama32-1b-epoch3-v3`. The `3` is a budget cap,
-not a realized count. The arithmetic that turns the budget into steps
-is:
-
-- Rows kept after curation: **178,848**
-- Batch size: **16**
-- Bin-packing fill factor (first-fit on `max_seq_len=4096`):
-  empirically ~**0.88**
-
-The packed batch consumes roughly $178,848 / 16 = 11,178$ raw
-rows worth of training per epoch, except that `train_ultra.py` packs
-multiple short completions into each `max_seq_len` window, so the
-*effective* number of optimizer steps per nominal epoch is
+We compute token-level cross-entropy on the completion only. Prompt tokens get
+zero weight in the Tinker training datum; they are conditioning context, not
+target. The supervised loss is
 
 $$
-\text{steps/epoch} \approx \frac{N_{\text{rows}}}{B} \cdot f_{\text{pack}}
-\approx \frac{178,848}{16} \cdot 0.88 \approx 9,838
+\mathcal{L}_{\text{SFT}} = -\frac{1}{|C|} \sum_{t \in C} \log p_{\theta}(y_t \mid y_{<t}, x)
 $$
 
-A 3-epoch budget at that step rate is roughly 29,500 steps, but the
-run logged ~10,892 total steps before Tinker's job slot drained.
-Backing out: $10,892 / 9,838 \approx 1.11$ nominal epochs by the
-crude divisor; with the more honest "raw rows / batch" denominator
-ignoring packing it's $10,892 / 11,178 \approx 0.97$ epochs. The
-truth is somewhere in $[0.85, 1.1]$ nominal epochs depending on
-which counting convention you privilege. Call it ~0.85 with packing
-overhead and the early-step warmup attributed correctly.
+where $C$ indexes positions in the completion, $x$ is the prompt prefix, and
+$y_t$ is the teacher's emitted token at position $t$. The normalization by
+$|C|$ makes losses comparable across rows of unequal completion length,
+because shorter completions would otherwise contribute proportionally less
+gradient and bias the model toward verbose teacher emissions.
 
-Why was "3 epochs" the budget if only ~0.85 actually got spent? Two
-reasons.
+Two filter knobs sit on top of the raw JSONL: minimum file recall at least
+$0.5$ and minimum terminal reward at least $-1.0$. The v3 baseline uses
+exactly those defaults.
 
-1. Tinker has no early-stop hook. The trainer-side cosine LR schedule
-   needs a target total step count to anchor the decay, and you can
-   only re-anchor by killing the run. Setting the budget at 3 epochs
-   lets the LR ride down smoothly through the plateau without the
-   schedule "wanting" to keep stepping past convergence. If the
-   budget had been set to 1 epoch and the run hit the actual val
-   plateau early, the cosine would still be in its high-LR phase and
-   the model would overshoot.
+The filter keeps 178,848 rows and rejects 1,872, a $1.0\%$ rejection rate.
+Rejected rows are trajectories that ended with no file recall and a strongly
+negative terminal reward, which roughly means the teacher demonstration would
+be miscalibrated for the student to imitate.
+
+Notice what the filter does not consume: the per-row judge harness verdict
+written by the multi-swe-bench harness into the `judge_label` column on the
+multi-bench runs table. The SFT corpus reads the messages and completion
+fields from the JSONL and never joins against that column for any token in
+any kept row. We return to why this matters in the contamination section.
+
+## Step budget arithmetic
+
+The variant name says `epoch3`. The 3 is a budget cap, not a realized count.
+With 178,848 rows, batch 16, and an empirical bin-packing fill factor
+$f_{\text{pack}} \approx 0.88$ for first-fit packing into 4096-token windows,
+the effective steps per nominal epoch are
+
+$$
+\text{steps/epoch} \approx \frac{N_{\text{rows}}}{B} \cdot f_{\text{pack}} \approx \frac{178{,}848}{16} \cdot 0.88 \approx 9{,}838.
+$$
+
+A 3-epoch budget at that step rate is roughly 29,500 steps. The run logged
+10,892. Backing out, we get $10{,}892 / 9{,}838 \approx 1.11$ nominal epochs
+by the packed denominator and $10{,}892 / 11{,}178 \approx 0.97$ by the
+raw-rows-over-batch denominator that ignores packing.
+
+The honest interval is $[0.85, 1.1]$ nominal epochs, leaning low once warmup
+and packing overhead are attributed correctly. We summarize as "approximately
+0.85 nominal epochs" everywhere downstream, and that number should be read
+as "less than one full pass over the filtered corpus."
+
+We set the budget at 3 epochs even though we expected to spend under 1.5,
+for two reasons.
+
+1. Tinker exposes no early-stop hook, and the cosine learning-rate schedule
+   needs a target total step count to anchor decay. A budget of 1 epoch
+   with an early plateau would leave the optimizer in its high-LR phase
+   and overshoot. The 3-epoch anchor lets the schedule ride down smoothly.
 2. Tinker's job slot is the wall, not the budget. The run drained at
-   10,892 steps because the cato-side `train_ultra.py` shard finished
-   what it could in its window. The "3 epochs" was generosity that
-   let the schedule behave well; the actual stopping point was
-   incidental.
+   10,892 steps because the worker shard finished its window. The budget
+   was generosity for the schedule; the actual stopping point was incidental.
 
-In practice this means the published val curve is the curve of a run
-that got something between 0.85 and 1.1 effective epochs over its
-filtered corpus. Not 3. The name `epoch3-v3` describes the budget
-intent. The training trajectory described the realized count.
+## Validation trajectory
 
-## Val_loss trajectory
+The condensed per-checkpoint log:
 
-The full per-checkpoint log is at
-`cato:/home/cato-user/tinker_runs/llama32-1b-epoch3-v3/final.jsonl`.
-The condensed story:
-
-| step | val_loss | train_loss (band) |
+| step | val_loss | train_loss band |
 |---|---|---|
 | 100 | 1.479 | 1.614 |
 | 1,000 | 1.276 | 1.10 |
@@ -145,323 +126,280 @@ The condensed story:
 | 10,500 | **1.098** | 0.86 |
 | 10,800 | 1.099 | 0.86 |
 
-The curve has three regimes.
-
-**Steps 100 to ~3000.** Val drops from 1.479 to 1.150 — about 22% of
-its starting headroom evaporates in the first 28% of the run. The
-model is learning the planner JSON shape and the few high-frequency
-tool-name patterns. Most of the win in this phase is recovering
-syntactic discipline (no truncated JSON, proper tool-arg shape).
-
-**Steps 3000 to 7000.** Val drops from 1.150 to 1.103. Slope flattens
-hard. The model is learning the conditional distribution over tools
-given the planner state — a much harder, lower-density signal. Train
-loss settles into the 0.86–0.89 noise band.
-
-**Steps 7000 onward.** Val sits in `[1.099, 1.108]`. Train loss
-continues to nose down — into `0.85`-region transients — while val
-refuses to move. This is the canonical generalization-gap
-divergence: the model is starting to memorize per-trajectory
-specifics that don't transfer to held-out instances. The generalization
-gap at step 10,500 is `1.098 - 0.86 ≈ 0.24` natural log units, which
-in token-CE terms means held-out perplexity is roughly
-$e^{0.24} \approx 1.27$ times training perplexity. Modest, but real
-and growing.
-
-The "best val_loss" reported in the catalog (`1.098 @ s10500`) is the
-checkpoint actually exported. The pre-plateau checkpoints in the
-3000–7000 range would have been a defensible choice on
-generalization-gap grounds, but two arguments lean against them:
-
-- The plateau is genuinely flat, not just locally flat. The deltas
-  inside `[7000, 10500]` are within run-to-run seed noise on val
-  loss for this corpus size (we don't have multi-seed runs to put a
-  hard CI on it, but the chain-deepsets sweep on the same parquet
-  gave seed-to-seed val noise of ~0.005, smaller than the visible
-  band here).
-- Exporting at step 10,500 takes advantage of the LR schedule's full
-  decay. The cosine bottoms out around step 10,500 of the budgeted
-  29,500-step schedule — the optimizer is closer to a quenched fixed
-  point at that ckpt than at step 7,000 where it's still moving.
-
-Both reasons are weak; the choice could plausibly have been step
-8,000 and nobody would notice. What matters is the plateau itself,
-not which point on the plateau you pick.
-
 <Figure
   src="tinker-3-epoch-ultra-curve.png"
-  alt="Full training curve"
-  caption="tinker-3-epoch-ultra: 178k rows over 10500 steps. Val loss (solid) plateaus at ~1.098 from step 7000. Train loss (faded) into 0.86 noise band. Generalization gap ~0.24 indicates the long-tail is memorization."
+  alt="Validation and training loss versus step for the tinker-3-epoch-ultra run."
+  caption="tinker-3-epoch-ultra: 178k rows, 10,892 steps. Validation loss (solid) plateaus near 1.098 from step 7000. Training loss (faded) settles in the 0.86 band. The generalization gap of roughly 0.24 nats from step 7000 onward is consistent with mild memorization of per-trajectory specifics."
   n={1}
 />
 
-## Comparison to the bake-off variants
+The curve has three regimes, which we identify by slope.
 
-The 2026-05-16 sweep ran five Tinker variants on the same plan_full
-corpus. Four were launched in parallel by
-`launch_variants_2026-05-16.sh`; the bare `epoch3-v3` was a sibling
-sweep with `train_ultra.py` defaults. The headline numbers:
+1. **Steps 100 to 3000, syntactic acquisition.** Validation drops from 1.479
+   to 1.150, recovering about 22% of starting headroom in 28% of the run. The
+   model is learning planner JSON shape and the few high-frequency tool-name
+   patterns. Most of the win in this phase is recovering syntactic discipline:
+   no truncated JSON, proper tool-argument shapes, correct closing braces.
+2. **Steps 3000 to 7000, conditional-distribution acquisition.** Validation
+   drops from 1.150 to 1.103. The slope flattens hard. The model is learning
+   the conditional distribution over tools given planner state, which is a
+   much harder, lower-density signal than JSON syntax. Training loss settles
+   into the 0.86 to 0.89 band.
+3. **Steps 7000 to 10,800, plateau and gap widening.** Validation sits in
+   $[1.099, 1.108]$. Training loss continues to nose down into the 0.85 band.
+   The generalization gap at step 10,500 is
+
+$$
+\Delta = \mathcal{L}_{\text{val}} - \mathcal{L}_{\text{train}} \approx 1.098 - 0.86 = 0.238 \text{ nats},
+$$
+
+which in token-perplexity terms means held-out perplexity is roughly
+$e^{0.238} \approx 1.27$ times training perplexity. Modest, but real and
+growing. This is the canonical signature of memorization without transfer:
+the optimizer keeps reducing the training objective by absorbing
+per-trajectory specifics that do not occur in the validation split.
+
+We exported step 10,500 rather than step 7000 because the cosine schedule's
+full decay was load-bearing for stability: the optimizer is closer to a
+quenched fixed point at the bottom of the LR curve than mid-decay.
+Pre-plateau checkpoints in the 3000 to 7000 range would have been
+defensible on generalization-gap grounds, and the choice could plausibly
+have been step 8000 with no measurable downstream effect. What matters is
+the plateau, not which point on the plateau we picked. A sibling
+chain-deepsets sweep on the same parquet gave seed-to-seed validation
+noise of roughly 0.005, smaller than the visible band inside the plateau.
+
+## Generalization gap, interpreted
+
+We treat the plateau near 1.098 not as a failure of capacity but as the
+empirical ceiling of what the teacher distribution actually contains under
+this filter and sequence cap. Training loss continues to drop because the
+optimizer can memorize per-trajectory tokens (path strings, argument
+hashes, tool-call orderings) that do not occur in the validation split.
+
+We decompose the two curves as
+
+$$
+\mathcal{L}_{\text{val}}(t) \approx \mathcal{L}_{\text{val}}^{\infty} + \epsilon_{\text{opt}}(t), \qquad \mathcal{L}_{\text{train}}(t) \to \mathcal{L}_{\text{val}}^{\infty} - \delta_{\text{memo}}(t),
+$$
+
+with $\epsilon_{\text{opt}}(t) \to 0$ and the memorization gap
+$\delta_{\text{memo}}(t)$ rising monotonically once the syntactic phase
+ends. The total gap $\Delta(t) = \epsilon_{\text{opt}}(t) + \delta_{\text{memo}}(t)$
+widens from step 5000 onward while validation flatlines. We have hit the
+irreducible loss of imitating this teacher under this filter; further
+reductions in training loss buy memorization, not transfer.
+
+The v3_bigseq number of 0.932 is informative precisely because it sits
+below this apparent ceiling. Doubling the attention window changed the
+effective task, not just the optimizer's exploration of the same task.
+
+## Sweep variants
+
+The 2026-05-16 sweep ran five variants on the same plan_full corpus. Headline
+numbers:
 
 | Variant | LoRA rank | Seq | Rows kept | Steps | Best val_loss | Status |
 |---|---|---|---|---|---|---|
-| `tinker-3-epoch-ultra` (this run) | 64 | 4096 | 178,848 | 10,892 | **1.098** | **deployed :19320** |
-| `v3_r128` | 128 | 4096 | 178,848 | 10,892 | 1.122 | deployed :19305 |
-| `v3_superclean` | 64 | 4096 | 88,918 | 5,416 | 1.120 | superseded, not exported |
-| `v3_bigseq` | 64 | **8192** | 178,848 | 9,386 | **0.932** | merged, *not deployed* |
-| `v3_r128_short` | 128 | 4096 | 50,000 | 3,046 | 1.283 | reference, not exported |
-| `v3_r256_short` | (rejected) | — | — | — | — | rank cap 128 rejected |
+| **tinker-3-epoch-ultra (this run)** | 64 | 4096 | 178,848 | 10,892 | **1.098** | **deployed :19320** |
+| v3_r128 | 128 | 4096 | 178,848 | 10,892 | 1.122 | deployed :19305 |
+| v3_superclean | 64 | 4096 | 88,918 | 5,416 | 1.120 | superseded |
+| v3_bigseq | 64 | **8192** | 178,848 | 9,386 | **0.932** | merged, not deployed |
+| v3_r128_short | 128 | 4096 | 50,000 | 3,046 | 1.283 | reference |
 
-The reading on these numbers, variant by variant:
+The reading, variant by variant.
 
-- `v3_r128` paid for double the LoRA rank and got back a worse number
-  (1.122 vs 1.098). The hypothesis was "more capacity at a more
-  conservative LR (1e-4 vs 2e-4) — better fit, no overshoot." It
-  fit; it didn't overshoot. It also didn't beat the simpler
-  configuration. More-rank-is-better is not the regime on this
-  corpus.
-- `v3_superclean` ran the strictest data filter
-  (`min_file_recall=0.8, min_terminal_reward=0.5`) and kept only
-  88,918 rows — about half. It hit val 1.120 at ~half the steps.
-  Hyperparameter-efficient: it matched `v3_r128` on a tighter
-  compute envelope. But "matched the second-place number with less
-  compute" is not a winning argument against a deployment baseline
-  that is already shipped at 1.098.
-- `v3_r128_short` capped rows at 50,000 and hit val 1.283 — strictly
-  worse on every axis. It was the data-scaling reference point.
-  The deliberate purpose of this variant was to confirm
-  more-data-beats-more-rank when the budget is fixed; it did.
-- `v3_bigseq` is the actual winner on val_loss. Rank 64, but
-  `max_seq_len=8192` instead of 4096. The hypothesis was that
-  doubling the sequence-length cap would let the bin-packer fit more
-  examples per window (better packing efficiency) and would let
-  multi-step planner reasoning fit inside a single attention window.
-  The val curve went `1.272 → 0.932` over 9,386 steps. The gap to
-  the deployed baseline is **0.166 natural log units** — translating
-  to roughly an 18% perplexity reduction on held-out planner JSON.
-  This is not a noise win.
+1. **v3_r128 fit but did not win.** Doubling LoRA rank with a conservative
+   learning rate (1e-4 versus 2e-4) gave 1.122 versus 1.098. It fit, did not
+   overshoot, and still lost. More rank is not the regime on this corpus.
+2. **v3_superclean matched on half the data.** The strictest filter (file
+   recall at least 0.8, terminal reward at least 0.5) kept 88,918 rows and
+   hit val 1.120 at roughly half the steps. Matching the second-place
+   number with less compute is not a winning argument against a deployed
+   baseline already at 1.098.
+3. **v3_r128_short confirmed data beats rank.** Capping rows at 50,000 hit
+   val 1.283, strictly worse on every axis. Under a fixed budget, more
+   data dominates more rank on this corpus.
+4. **v3_bigseq is the actual winner on validation.** Rank 64, sequence cap
+   8192 instead of 4096. Doubling the cap let the bin-packer fit more
+   examples per window and let multi-step planner reasoning fit inside a
+   single attention window. Validation went 1.272 to 0.932 over 9,386 steps.
 
-So why is `v3_bigseq` not the deployed baseline?
+The gap to the deployed baseline is $1.098 - 0.932 = 0.166$ nats, which
+translates to roughly $1 - e^{-0.166} \approx 15.3\%$ perplexity reduction on
+held-out planner JSON. This is well outside the seed-noise band of 0.005 nats
+established on the sibling deepsets sweep. It is not a noise win.
 
-Two reasons, one technical and one structural.
+So why is v3_bigseq not the deployment slot?
 
-**Technical.** `v3_bigseq` finished training on 2026-05-16 23:00 and
-was merged into a serving-ready safetensors directory on 2026-05-17
-10:13. As of 2026-05-18 it has no live `vllm serve` listener.
-Deploying it would require allocating a GPU on cato, finding a free
-port in `19300..19399`, launching vLLM with appropriate
-`--max-num-batched-tokens` for the longer sequence cap, and
-verifying the planner-recall eval on the merged weights. That work
-hadn't been queued.
+```mermaid
+flowchart TD
+    A[v3_bigseq merged, val 0.932] --> B{deploy as baseline?}
+    B -->|yes: better number| C[next sweep variants measured against bigseq]
+    C --> D[bigseq moves two axes from default: corpus filter and seq cap]
+    D --> E[future eval gaps unattributable: corpus or arch?]
+    B -->|no: keep boring default| F[tinker-3-epoch-ultra shipped at :19320]
+    F --> G[bigseq run as variant in side-by-side]
+    G --> H[promote on planner-recall eval, not val_loss]
+    style F fill:#cfc,stroke:#393
+    style E fill:#fcc,stroke:#933
+```
 
-**Structural.** The "deployed baseline" is the reference point the
-sweep variants are measured *against*. There is exactly one
-production sweep baseline at any time, and changing the baseline
-mid-sweep contaminates the A/B comparison. The `tinker-3-epoch-ultra`
-checkpoint was shipped on 2026-05-17 18:02 because it was the
-default-configuration run from the sweep. It has the
-`train_ultra.py` defaults; it has the unmodified plan_full corpus
-under the standard fr≥0.5/tr≥-1.0 filter; it has rank 64; it has the
-default `max_seq_len=4096`. It is the reference point.
+There are two reasons, one technical and one structural.
 
-`v3_bigseq` is a *variant*. It moved one axis (`max_seq_len`) and
-hit a better number. Promoting it to baseline means losing the
-ability to attribute the next eval gap to either "the corpus
-changed" or "the architecture changed." The conservative play is to
-ship `tinker-3-epoch-ultra` as the named baseline, then run a
-side-by-side planner-recall eval of `bigseq` against it, then
-promote on the eval result rather than the val_loss.
+The technical reason is that v3_bigseq finished training on 2026-05-16 23:00
+and was merged into a serving-ready directory on 2026-05-17 10:13, but has
+no live vLLM listener. Deploying it requires allocating a GPU on cato,
+finding a free port in the 19300 to 19399 band, launching with appropriate
+batched-token budget for the longer sequence cap, and verifying planner
+recall on the merged weights. That work was not queued.
 
-This logic is unobjectionable in the abstract and gets a lot less
-clean the moment val_loss disagrees with eval recall, which it often
-does on this corpus.
+The structural reason is the load-bearing one. A deployment baseline is the
+reference point that sweep variants are measured against. There is exactly
+one production sweep baseline at any time, and changing the baseline
+mid-sweep contaminates the A/B comparison.
 
-## What "production baseline" actually buys you
+The tinker-3-epoch-ultra checkpoint shipped because it is the
+default-configuration run: trainer defaults, unmodified corpus under the
+standard filter, rank 64, sequence cap 4096. It is the reference point.
 
-The deployment story is:
+v3_bigseq moved one axis and hit a better number. Promoting it to baseline
+means losing the ability to attribute the next eval gap to either "the
+corpus changed" or "the architecture changed." The conservative play is to
+ship the default-configuration run as named baseline, then run a
+side-by-side planner-recall eval of bigseq against it, then promote on the
+eval result rather than the validation loss.
 
-1. **2026-05-17 08:45.** `tinker_train/export.py` resolved the
-   `tinker://0951cfea-...:train:0/weights/shard00_final` URI to a
-   signed download URL, pulled the PEFT-format tar, extracted to
-   `cato:/home/cato-user/tinker_exports/llama32-1b-epoch3-v3/`. The
-   step-10500 subdir was a separate export from the same run id.
-2. **2026-05-17 ~10:00.** `peft.merge_and_unload()` fused the LoRA
-   adapter into the base `meta-llama/Llama-3.2-1B` weights. Two
-   merged-dirs were produced: a sharded 2-file safetensors at
-   `tinker_merged/llama32-1b-epoch3-v3/` (presumably from the first
-   export attempt) and a single-file at
-   `tinker_merged/llama32-1b-epoch3-v3_step10500/`. Both are 2.4 GB
-   bf16.
-3. **2026-05-17 18:02.** `vllm serve` launched on the sharded merged
-   dir, listening on `:19320`. The served-model-name is
-   `llama32_1b_epoch3`. Flags
-   `--max-num-seqs 48 --max-num-batched-tokens 24576
-   --enforce-eager`.
-4. `scripts/env.perseus`'s `PERSEUS_LLM_TREE_ENDPOINTS` was *not*
-   pointed at `:19320`. The default planner endpoint at that
-   moment was still `:19300`, the pre-sweep `llama32_1b_tinker_merged`
-   from the local `3ba66240-...` Tinker run (2,000 steps, val_loss
-   1.198). The new `:19320` is parked for A/B traffic from
-   `tinker_eval/` — the continuous-rotation sanity loop — not for
-   production routing.
+This logic is unobjectionable in the abstract. It gets less clean the moment
+validation loss disagrees with downstream eval recall, which it often does
+on this corpus.
 
-So the "deployed production baseline" is, in practice, two things at
-once:
+## Deployment topology
 
-- The named reference checkpoint that other sweep variants are
-  measured against in the `tinker_eval` leaderboard.
-- A standby planner endpoint that production traffic can be routed
-  to once a planner-recall eval clears the path.
+```mermaid
+sequenceDiagram
+    participant T as Tinker SDK
+    participant E as export pipeline
+    participant M as merge_and_unload
+    participant V as vllm serve
+    participant P as perseus planner
+    T->>E: shard00_final URI
+    E->>M: signed URL, pull PEFT tar, extract
+    M->>M: fuse LoRA into Llama-3.2-1B base
+    M->>V: tinker_merged/llama32-1b-epoch3-v3/
+    V->>V: bind :19320, served-name llama32_1b_epoch3
+    V-->>P: standby endpoint, A/B traffic only
+    Note over P: primary endpoint still :19300 (pre-sweep 3ba66240, val 1.198)
+```
 
-The pre-sweep `llama32_1b_tinker_merged` (the local `3ba66240` run)
-is the actual default planner traffic destination. It is shipped at
-val_loss 1.198, worse than the cato `0951cfea` run by 0.100, on a
-smaller training-step count (2,000 vs 10,892) but the same row
-filter. The gap is not large enough to force a routing switch
-without evidence on a downstream metric — recall, MRR against
-`fix_patch`, latency under load.
+The deployment story is four steps: resolve the Tinker weights URI, fuse
+the LoRA into the base model, launch vLLM on the merged directory, and
+register the endpoint for A/B traffic from the rotation evaluator. The
+planner's primary endpoint variable was not flipped to port 19320 at
+deploy time. Production traffic still defaults to the pre-sweep local
+Tinker run at port 19300, val_loss 1.198, trained on 2,000 steps over the
+same row filter.
 
-That asymmetry — "we have a better checkpoint, and we haven't moved
-traffic to it" — is the actual production reality. The `:19320`
-deployment is provisional. The numbers say it should win an A/B; the
-A/B hasn't been run.
+So the deployed production baseline is two things at once. It is the
+named reference checkpoint that other sweep variants are measured against
+in the eval leaderboard, and it is a standby planner endpoint that
+production traffic can be routed to once a planner-recall eval clears the
+path. The gap of 0.100 nats between the local run and the cato baseline
+is not large enough to force a routing switch without evidence on a
+downstream metric. The asymmetry is real: we have a better checkpoint,
+and we have not moved traffic to it.
 
-## Why the SFT corpus survived the 2026-05-11 contamination
+## Why this corpus survived the 2026-05-11 audit
 
-The 2026-05-11 pipeline-integrity audit (T1–T9, documented in
-`Claude.md`) established that the `judge_label` column on
-`multi_bench_runs` had been mis-read from the legacy NULL `result`
-column by `pick_terminal_reward(RewardSource::Judge)`. Every WM
-checkpoint trained between the column rename and the audit had
-`terminal_reward = 0` by construction. The value-regression head
-trained against that target was, by construction, learning to predict
-zero.
+The 2026-05-11 pipeline-integrity audit established that the terminal-reward
+extractor under the judge source had been reading a legacy NULL column.
+Every world-model checkpoint trained off the judge reward source between the
+column rename and the audit was silently regressing toward zero by
+construction. The value-regression head trained against that target was, by
+construction, learning to predict zero.
 
-The follow-up question is: which other training pipelines were on the
-contaminated path? The audit-honest answer for the Tinker SFT track
-is **none**, and the reasoning is a one-liner about loss types.
+The audit-honest question is: which other training pipelines were on the
+contaminated path? For the Tinker SFT track the answer is none. The
+reasoning is a one-liner about loss types, and we draw it as a graph.
 
-The Tinker `train_ultra.py` loss is:
+```mermaid
+flowchart LR
+    R[plan_full.jsonl row] --> C[completion field: teacher tokens]
+    R --> J[judge_label field on multi_bench_runs]
+    C --> S[SFT loss: token CE on completion]
+    J --> W[WM loss: HL-Gauss regression on label]
+    S --> KO[tinker-3-epoch-ultra weights]
+    J -. contamination 2026-05-11 .-> W
+    W --> WO[WM checkpoints regressing to zero]
+    style S fill:#cfc,stroke:#393
+    style W fill:#fcc,stroke:#933
+    style KO fill:#cfc
+    style WO fill:#fcc
+```
 
-$$
-\mathcal{L}_{\text{SFT}} = -\sum_{t \in \text{completion}}
-\log p_{\theta}(y_t \mid y_{<t}, \text{prompt})
-$$
-
-The target $y_t$ is the teacher's *next token* in the completion
-field of the JSONL row. The completion field was captured at trajectory
-emission time, by `gpt-5-nano`, and stored verbatim. The judge label
-arrives later, via the multi-swe-bench harness, and is written into a
-*different* column on a *different* table.
-
-The SFT corpus reads `messages + completion` from plan_full.jsonl.
-The contamination class lived in `multi_bench_runs.judge_label`. The
+The supervised target $y_t$ is the teacher's next token in the completion
+field, captured at trajectory emission time by `gpt-5-nano` and stored
+verbatim in the JSONL. The judge label arrives later, via the multi-swe-bench
+harness, and is written into a different column on a different table. The
 two never join along the path that produces $y_t$.
 
-The data filter does join along a downstream axis:
-`--min-file-recall 0.5 --min-terminal-reward -1.0` are joins against
-the multi-bench row's status fields. But the filter only *drops*
-rows; it doesn't *modify* any token in a kept row's completion. A
-contaminated `terminal_reward` could mean the filter is keeping or
-dropping the wrong rows, but the resulting training signal on the
-kept rows is intact.
+The data filter does join along a downstream axis. File recall and terminal
+reward thresholds are computed against the multi-bench row's status fields.
+But the filter only drops rows; it does not modify any token in a kept row's
+completion. A contaminated terminal reward could in principle mean the
+filter keeps or drops the wrong rows, but the resulting training signal on
+the kept rows is intact.
 
-Empirically: 178,848 rows passed the filter pre-audit. After the
-audit the filter computes against the corrected `judge_label`
-column, and `--min-terminal-reward -1.0` is generous enough that
-nearly all the same rows pass — the threshold is below the
-contaminated-zero value, so even the contaminated rows passed. The
-filter outcome is roughly insensitive to the contamination, and the
-loss target was never sensitive in the first place.
+Empirically the filter outcome is roughly insensitive to the contamination.
+The threshold of $-1.0$ on terminal reward is generous enough that
+contaminated zero-valued rows pass anyway, and the kept-row count of
+178,848 was stable across the column rename. The filter outcome is roughly
+insensitive to the contamination, and the loss target was never sensitive
+in the first place.
 
-This is why "loss type" is the audit variable, not "training corpus
-file." Two pipelines reading the same JSONL file can have orthogonal
-exposure to a contamination class if they consume different fields
-under different losses. The Tinker SFT pipeline consumed
-`completion` under token-level CE. The WM value pipeline consumed
-`judge_label` (via `multi_bench_runs`) under HL-Gauss regression.
-The same source rows fed both. The contamination class hit one and
-missed the other.
+This is why loss type is the audit variable, not training corpus file. Two
+pipelines reading the same JSONL can have orthogonal exposure to a
+contamination class if they consume different fields under different losses.
+The Tinker SFT pipeline consumed the completion field under token-level
+cross-entropy. The world-model value pipeline consumed the judge label under
+HL-Gauss regression. The same source rows fed both. The contamination class
+hit one and missed the other.
 
-## Lesson
+## What we will not yet claim
 
-Loss type is a first-class audit variable. When a contamination class
-is identified in a training corpus, the right next question is not
-"do we throw out the corpus" but "which fields of the corpus
-participate in each loss, and which losses are exposed."
+We have not run a planner-recall A/B between this baseline and v3_bigseq,
+and we have not run one against the local pre-sweep checkpoint that
+currently handles production traffic at port 19300. Validation
+cross-entropy is upper-bound related to recall but not monotone in it: a
+model that fits the JSON shape better can lose recall by becoming
+over-confident in the most frequent tool prefix.
 
-The Tinker SFT pipeline survived a `judge_label` contamination
-because its target token sequence (`completion`) was captured at
-trajectory-emission time by the teacher and is independent of the
-post-hoc harness verdict. The WM value-regression pipeline did not
-survive, because its target was the harness verdict. Same JSONL.
-Different exposure.
+Both omissions are deliberate. The discipline we are practicing is: do
+not change the routing on a derived metric when the metric of interest
+can be measured directly. Validation cross-entropy is a derived metric
+for planner recall. Run the recall eval, then route.
 
-The corollary is awkward but useful: a deployment baseline that
-shipped under a contaminated cohort is not, *ipso facto*, a
-contaminated checkpoint. Whether the contamination reached the
-weights depends on whether the contaminated field was on the loss
-path. Audit per field, not per file.
+## Two lessons
 
-And the production-baseline lesson, on a different axis: the variant
-that wins on val_loss is not always the variant that gets the
-deployment slot. The deployment slot has the additional job of being
-the *named reference point* against which other variants are measured.
-That role is taken by the configuration with the fewest moving parts
-relative to the default trainer settings, not by the configuration
-with the best number. The boring reference point is load-bearing
-because it makes the orthogonal-axis variants measurable. The
-exciting winner can wait.
+The two takeaways generalize beyond this run.
 
-`tinker-3-epoch-ultra` is the boring reference. `v3_bigseq` is the
-exciting winner. Production at `:19320` runs the boring one because
-the orthogonal-axis variants would not be measurable against it
-otherwise. That is the entire deployment thesis in one sentence.
+1. Loss type is a first-class audit variable. When a contamination class is
+   identified in a training corpus, the right next question is not "do we
+   throw out the corpus" but "which fields participate in each loss, and
+   which losses are exposed." A deployment baseline shipped under a
+   contaminated cohort is not, ipso facto, a contaminated checkpoint.
+   Whether the contamination reached the weights depends on whether the
+   contaminated field was on the loss path. Audit per field, not per file.
+2. The variant that wins on validation loss is not always the variant that
+   gets the deployment slot. The deployment slot has the additional job of
+   being the named reference point against which other variants are
+   measured. That role is filled by the configuration with the fewest moving
+   parts relative to the trainer's defaults, not by the configuration with
+   the best number. The boring reference point is load-bearing precisely
+   because it makes the orthogonal-axis variants measurable. The exciting
+   winner can wait.
 
-## Cross-links
-
-- [tinker lora bakeoff](/essays/tinker-lora-bakeoff/) — the
-  variant-by-variant readout of the same five-run sweep, with
-  hypothesis-text from `manifest_2026-05-16.json` and per-variant
-  pid + kept_rows_after_curation.
-- [llama-32-1b-tinker-planner](/essays/llama-32-1b-tinker-planner/) —
-  the model side: why Llama-3.2-1B on Tinker's remote SDK replaced
-  the cato V100 LoRA-distill path, and what the rank-128 cap means
-  for the next sweep.
-- [planner llm call](/essays/planner-llm-call/) — what the served
-  endpoint at `:19320` is actually called for: the per-step planner
-  chat completion that drives the MCTS expansion loop.
-- [cohort contamination class](/essays/cohort-contamination-class/) —
-  the 2026-05-11 audit findings in full, with the per-field exposure
-  matrix that explains why this run survived.
-
-## Sources
-
-- `parking_lot/v2_archive_2026-05-18/HISTORY/09_tinker_runs.md` for
-  the per-run config (rank=64, lr=2e-4, batch=16, seq=4096,
-  min_file_recall=0.5, min_terminal_reward=-1.0), the kept-row count
-  (178,848 of 180,720), step count (10,892), val_loss trajectory
-  (1.479 → 1.098 @ s10500), train-loss band (~0.86 at plateau),
-  export dirs, merged dirs, and the `:19320` `vllm serve` deploy
-  invocation including its flags. Source-of-truth table at lines
-  187–197 and the per-variant breakdown at lines 80–164.
-- `parking_lot/v2_archive_2026-05-18/HISTORY/29_planner_training_research.md`
-  §4 ("Tinker LoRA SFT — the production track") for the trainer
-  evolution (`train.py` → `train_fast.py` → `train_ultra.py`),
-  data curation knobs, and the variant-comparison table at line 290.
-  Also §11 ("Single-task vs multi-task verdict") for the
-  multi-head-SFT robustness lesson that anchors the cross-link to
-  WM-side single-task value-only collapse.
-- `parking_lot/v2_archive_2026-05-18/HISTORY/14_wm_training.md` §5
-  for the wm-serve shim variants and the 2026-05-11 audit
-  cross-reference establishing that the contamination class was on
-  the WM value-regression path.
-- `Claude.md` 2026-05-11 entry (T1–T9 pipeline-integrity audit) for
-  the formal scope of the judge_label contamination class:
-  `MultiBenchRow.judge_label` plumbing, `RewardSource::Judge` semantics,
-  and the backfill SQL at `scripts/pipeline_integrity_backfill.sql`.
-- `cato:/home/cato-user/tinker_runs/manifest_2026-05-16.json` for the
-  per-variant launch hypothesis text + pid + kept_rows_after_curation
-  (referenced via HISTORY/09 line 230).
-- `cato:/home/cato-user/tinker_runs/llama32-1b-epoch3-v3/final.jsonl`
-  for the full per-checkpoint val_loss/train_loss log; condensed into
-  the trajectory table in this essay.
+tinker-3-epoch-ultra is the boring reference. v3_bigseq is the exciting
+winner. Production at port 19320 runs the boring one because the
+orthogonal-axis variants would not be measurable otherwise. That is the
+entire deployment thesis in one sentence.

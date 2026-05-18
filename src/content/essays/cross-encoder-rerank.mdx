@@ -3,390 +3,136 @@ title: "Cross-encoder rerank: when to spend O(L²) on the top 100"
 date: 2026-05-18
 status: published
 tier: retrieval
-summary: "Bi-encoder retrieves top-100 in O(d) per doc; cross-encoder reranks to top-K at O(L²) per (query, doc) pair. End-of-query rerank gated by PERSEUS_RETRIEVAL_RERANK=1. Qwen3-Reranker-4B beat bge-reranker-v2-m3 at CoIR 89 vs 36. jina-reranker-v3 rejected on 1084 vLLM restart loops."
+summary: "Bi-encoder retrieves top-100 in O(d) per doc; cross-encoder reranks to top-K at O(L²) per (query, doc) pair. End-of-query rerank gated off by default. Qwen3-Reranker-4B beat bge-reranker-v2-m3 at CoIR 89 vs 36. jina-reranker-v3 rejected on 1084 vLLM restart loops."
 related: ["codet5p-embedder","hybrid-search-tool","retrieval-service-rewrite"]
 readTime: 7
 ---
 
-> tl;dr: A bi-encoder embeds query and document independently, so the
-> retrieval step is an ANN lookup over pre-computed vectors. A
-> cross-encoder reads `(query, doc)` jointly through a full transformer
-> stack — quadratic in the concatenated sequence length, per pair.
-> Reranking the top-100 of an ANN lookup with a cross-encoder is the
-> standard cascade. Perseus ships it as an opt-in flag
-> (`PERSEUS_RETRIEVAL_RERANK=1`, default off) because the
-> retrieval-service already reranks inside `mode=hybrid`, the
-> perseus-side second pass was never validated on our own corpus, and
-> silent no-op behaviour bit us during the 2026-05 sweep thrash. The
-> production reranker is Qwen3-Reranker-4B (CoIR nDCG@10 = 89.18);
-> bge-reranker-v2-m3 was rejected at 35.97; jina-reranker-v3 lost
-> 1,084 restart loops to a `JinaForRanking` architecture that doesn't
-> exist in the pinned vLLM image.
+We retrieve top-100 with a bi-encoder, then optionally rerank to top-K with a cross-encoder. The bi-encoder is $O(\log N)$ per query against the corpus; the cross-encoder is $O(N L^2 d)$ over the candidate set. The cascade earns its keep when the bi-encoder leaves real signal on the table *and* the latency budget can absorb $N \cdot L^2$. In Perseus the second pass is off by default — the retrieval-service already reranks inside hybrid mode, the perseus-side knob duplicates that work on the same candidates with the same model, and the recall delta has never been measured on our own gold set.
 
-## 1. The cascade
+## 1. Two questions, two cost shapes
 
-Retrieval is two questions composed. *Given a query, which 100
-documents out of N are even plausible candidates?* That's question
-one. *Given those 100, which 10 belong at the top?* That's question
-two. The two questions have very different cost shapes, and the
-right architecture for each is different.
+Retrieval is two questions composed. First, which 100 documents out of $N$ are even plausible candidates? Second, given those 100, which 10 belong at the top? The right architecture is different for each, and the asymmetry between them is the whole story.
 
-A bi-encoder answers question one. The query is embedded once into a
-$d$-dimensional vector; every document in the corpus is embedded
-*once at index time* into the same space; retrieval is the
-approximate-nearest-neighbour lookup of `query_vec` against the
-indexed corpus. The per-query cost is $O(\log N)$ in the corpus size
-under a competent ANN structure (HNSW, IVF-PQ), with a constant that
-depends on $d$. The model never sees `(query, doc)` jointly.
+The bi-encoder answers the first question. The query embeds once into a $d$-dimensional vector; every document in the corpus embeds *once at index time* into the same space; retrieval is an approximate-nearest-neighbour lookup of the query vector against the indexed corpus. Per-query cost is
 
-A cross-encoder answers question two. For each of the $N$ candidate
-documents, the model reads `[CLS] query [SEP] doc [SEP]` *as one
-sequence* and emits a single relevance score from the `[CLS]` head.
-The per-pair cost is the cost of one transformer forward pass over a
-sequence of length $L = |q| + |d|$ — quadratic in $L$ inside each
-attention layer, linear in the number of layers and in the model's
-hidden width.
+$$C_{\text{bi}} \;=\; T_{\text{embed}}(L_q) \;+\; O(\log N \cdot d)$$
 
-The asymmetry is load-bearing. Bi-encoder retrieval is cheap because
-the document side is amortised across queries; the only on-line cost
-is one query embed and one ANN lookup. Cross-encoder rerank is
-expensive because the document side is *not* amortised — every query
-re-embeds every candidate jointly with the query, and the rerank cost
-is paid per query, per candidate.
+under a competent ANN structure (HNSW, IVF-PQ). The model never sees the query and document jointly; the dot product is the only interaction.
+
+The cross-encoder answers the second question. For each of $N$ candidates the model reads the concatenation `[CLS] query [SEP] doc [SEP]` as one sequence and emits a single relevance score from the `[CLS]` head. The per-pair cost is one transformer forward pass over length $L = L_q + L_d$:
+
+$$C_{\text{cross}}(N) \;=\; N \cdot \Theta(L^2 d \cdot \text{layers})$$
+
+The $L^2$ is the attention block inside each layer; the $d \cdot \text{layers}$ is the per-layer parameter scan.
+
+The asymmetry is load-bearing. Bi-encoder retrieval is cheap because the document side is amortised across queries: only the query embed and ANN lookup happen on-line. Cross-encoder rerank is expensive because the document side is *not* amortised — every query re-encodes every candidate jointly with the query text, and the rerank cost is paid per query, per candidate.
+
+```mermaid
+flowchart LR
+    Q[query q] --> BE[bi-encoder embed]
+    BE --> ANN[ANN lookup over N docs]
+    ANN -->|top-100 candidates| GATE{rerank flag}
+    GATE -->|off, default| HITS[return top-K]
+    GATE -->|on| CE[cross-encoder rerank]
+    CE -->|reorder by relevance| HITS
+    CORPUS[(N docs, pre-embedded)] -.indexed once.-> ANN
+```
 
 ## 2. The cost in numbers
 
-Concretely:
+For the live stack the budget decomposes as follows. One query embed through Qwen3-Embedding-4B at fp16 on a V100 over $L_q \approx 32$ tokens runs in roughly 50ms wall-clock. The ANN lookup against the qdrant collection is low-millisecond. Document embeds are pre-computed at index time and never recomputed on-line.
 
-- **Bi-encoder retrieval cost.** One query embed (one forward pass
-  through Qwen3-Embedding-4B at $L \approx 32$ query tokens) plus an
-  ANN lookup against the qdrant collection. The query embed dominates
-  at fp16 on a V100 — call it ~50ms wall-clock for the 4B encoder
-  over a short query, plus low-millisecond ANN lookup. *Document
-  embeds are pre-computed at index time and never recomputed
-  on-line.*
-- **Cross-encoder rerank cost.** One forward pass through
-  Qwen3-Reranker-4B per `(query, doc)` pair, with $L \approx 32 +
-  \text{snippet length}$ tokens. Cross-encoder cost scales as $O(N
-  L^2 d)$ across the $N$ candidates — the $L^2$ is the attention
-  cost inside each layer; the $d$ is per-attention-head and per-
-  layer. The retrieval-service ships with `RERANK_TOP_K_CANDIDATES =
-  100` ([`crates/retrieval-service/src/config.rs:85`](https://github.com/starling-sh/perseus))
-  — that's 100 forward passes through a 4B-parameter cross-encoder
-  per query.
+The cross-encoder side is one forward pass through Qwen3-Reranker-4B per pair, with $L \approx 32 + L_{\text{snippet}}$ tokens. With the retrieval-service default of 100 candidates that is 100 forward passes through a 4B-parameter cross-encoder per query. The ratio that matters: bi-encoder retrieval is one query-side forward pass; cross-encoder rerank of top-100 is one hundred forward passes on `(query, doc)`-concatenated input.
 
-The headline ratio is: bi-encoder lookup is one forward pass on the
-query side; cross-encoder rerank of the top-100 is one hundred
-forward passes on `(query, doc)`-concatenated input. For
-fixed-architecture rerankers the per-pair cost dominates the
-end-of-pipeline latency budget, which is exactly why rerank is
-gated behind a flag.
+For $L = 512$ — a comfortable snippet budget for codet5p-class encoders — the attention block alone does roughly $L^2 = 262144$ pair-token interactions per layer per head. The bi-encoder over the same snippet pays the same $L^2$ once at index time, not $N$ times per query.
 
-Per-pair attention cost is $O(L^2)$ in the concatenated sequence
-length. For $L = 512$ (a comfortable snippet budget for codet5p-class
-encoders) the attention block alone does ~262k pair-token
-interactions per layer per head. The bi-encoder, over the same
-snippet but without the joint pair, does $O(L)$ work per token —
-self-attention is still $L^2$ inside the encoder, but the encoder
-runs *once* on the document side at index time, not $N$ times per
-query.
+Two consequences fall out of the arithmetic:
 
-Two consequences:
-
-1. Reranker latency is governed by $N$ and $L$, not by corpus size.
-   Doubling the corpus does not double rerank cost; doubling
-   `rerank_top_k` does.
-2. There is a sweet spot for $N$. Below it, the reranker has too
-   little to work with — the top-K it produces is just the top-K the
-   bi-encoder already produced. Above it, you pay $L^2$ for
-   diminishing recall gains. The Perseus default of 100 is the
-   inherited Python-service value; **no in-house sweep over the
-   rerank_top_k axis (50 / 100 / 200) has been logged**
-   ([`HISTORY/30:352-353`](https://github.com/starling-sh/perseus)).
+1. Reranker latency is governed by $N$ and $L$, not by corpus size. Doubling the corpus does not double rerank cost; doubling the candidate-set size does.
+2. There is a sweet spot for $N$. Below it, the reranker has too little to work with — the top-K it produces is just the top-K the bi-encoder already produced. Above it, you pay $L^2$ for diminishing recall gains. The Perseus default of 100 candidates is inherited from the Python service; no in-house sweep over $N \in \{50, 100, 200\}$ has been logged.
 
 ## 3. Why end-of-query rerank is off by default
 
-`PERSEUS_RETRIEVAL_RERANK=1` is the planner-side knob that triggers a
-second rerank pass *after* `build_hits` returns. The implementation
-([`src/search/engine/config_types.rs:350`](https://github.com/starling-sh/perseus))
-sends `(query, [snippets])` to `POST /v1/rerank`, reorders
-`final_hits` by the returned indices, and overwrites `hit.score`
-with the rerank score. Partial or out-of-range indices silently
-preserve the original order — that's the no-op failure mode.
+The planner-side rerank knob triggers a second rerank pass *after* the retrieval call returns. The implementation sends the query and the returned snippets to the rerank endpoint, reorders the final hits by the returned indices, and overwrites the hit scores with rerank scores. Partial or out-of-range indices silently preserve the original order — that is the no-op failure mode.
 
-The default is `0`. Three reasons:
+The default is off. Three reasons.
 
-1. **The retrieval-service already reranks inside `mode=hybrid`.**
-   The hybrid retriever
-   ([`crates/retrieval-service/src/retriever/hybrid.rs:130`](https://github.com/starling-sh/perseus))
-   does an RRF fuse of dense and sparse results, then reranks the top
-   `rerank_candidates` (default 100). When perseus calls
-   `hybrid_search` it is already getting a reranked list back. A
-   second perseus-side rerank pass is *the same model on the same
-   candidates with a tighter $N$* — at best a refinement of the same
-   signal; at worst a contradictory reorder if the snippet text fed
-   to the second pass differs from the first pass.
-2. **It was never validated on our own corpus.** The reranker choice
-   was made on Qwen3-Reranker-4B's published CoIR nDCG@10 = 89.18 and
-   the operational rule that bge-reranker-v2-m3's 35.97 was
-   unacceptable ([`HISTORY/30:374-375`](https://github.com/starling-sh/perseus)).
-   No in-house head-to-head against gold patches has been run on
-   either model. The single-source-of-truth retrieval quality table
-   in `HISTORY/30` lists every row as "not measured" for in-house
-   recall@k. Shipping a second rerank pass on top of an unmeasured
-   first pass is double-blind.
-3. **Silent no-op behaviour bit us.** Catalogued as risk B16 in
-   `hi-compact.md:465` and `HISTORY/07_dead_ends.md:922`: "end-of-query
-   rerank silently swaps top hits when `PERSEUS_RETRIEVAL_RERANK=1`"
-   — measurable behaviour change, unmeasured direction. During the
-   2026-05 sweep thrash the operational guidance was to *explicitly
-   set `PERSEUS_RETRIEVAL_RERANK=0` and
-   `PERSEUS_RETRIEVAL_MODE_DEFAULT=dense`* to neutralise rerank
-   flakiness when qwen3-rerank was unhealthy
-   ([`hi.md:9026 / 9095 / 9116 / 20782`](https://github.com/starling-sh/perseus)).
+1. The retrieval-service already reranks inside hybrid mode. The hybrid retriever does a reciprocal-rank-fusion of dense and sparse results, then reranks the top $K_{\text{rerank}}$ candidates (default 100). When perseus calls the hybrid tool it is already getting a reranked list back. A second perseus-side rerank pass is *the same model on the same candidates with a tighter $N$* — at best a refinement of the same signal, at worst a contradictory reorder if the snippet text fed to the second pass differs from the first.
+2. The reranker was never validated on our own corpus. The choice was made on Qwen3-Reranker-4B's published CoIR nDCG@10 of 89.18 and the operational rule that bge-reranker-v2-m3's 35.97 was unacceptable. No in-house head-to-head against gold patches has been run on either model. The single-source-of-truth retrieval quality table lists every row as "not measured" for in-house recall@k. Shipping a second rerank pass on top of an unmeasured first pass is double-blind.
+3. Silent no-op behaviour bit us during the 2026-05 sweep thrash. The catalogued risk is "end-of-query rerank silently swaps top hits when the flag is set" — measurable behaviour change, unmeasured direction. Operational guidance during the thrash was to explicitly disable rerank and force dense mode to neutralise reranker flakiness when the rerank service was unhealthy.
 
-The flag exists. It's wired. It is off because turning it on costs
-$N \cdot L^2$ ms per query and the recall delta has never been
-measured on our own gold set.
+The flag exists, it is wired, and it is off because turning it on costs $N \cdot L^2$ ms per query and the recall delta has never been measured on our own gold set.
+
+```mermaid
+stateDiagram-v2
+    [*] --> RetrievalCall
+    RetrievalCall --> HybridFuse: mode=hybrid
+    HybridFuse --> ServiceRerank: top-100 from RRF
+    ServiceRerank --> HitsReturned: reordered top-K
+    HitsReturned --> FlagCheck
+    FlagCheck --> Done: rerank flag off (default)
+    FlagCheck --> SecondRerank: rerank flag on
+    SecondRerank --> Done: same model, tighter N, unknown direction
+    Done --> [*]
+```
 
 ## 4. Models tried
 
-Four reranker candidates went through the pipeline. Three were
-rejected; one is live.
+Four reranker candidates went through the pipeline. Three rejected, one live.
 
-**Qwen3-Reranker-4B — live.** Cross-encoder, 4B parameters, fp16 on
-V100 served by vLLM at cato `:8060` as `qwen3-rerank` with
-`--hf-overrides
-'{"architectures":["Qwen3ForSequenceClassification"],
-"classifier_from_token":["no","yes"],
-"is_original_qwen3_reranker":true}'`
-([`HISTORY/30:80-83`](https://github.com/starling-sh/perseus)). The
-HF-override is load-bearing — without it vLLM's default architecture
-resolver falls through to a generation head that does not exist on the
-reranker checkpoint. CoIR nDCG@10 = **89.18** on the code corpus;
-selected on published bench plus Apache-2.0 plus "fits 3 replicas
-per V100 at fp16."
+**Qwen3-Reranker-4B, live.** Cross-encoder, 4B parameters, fp16 on V100 served by vLLM at the cato reranker port with three replicas. CoIR nDCG@10 of 89.18 on the code corpus; selected on published bench plus Apache-2.0 plus the operational fit of three replicas per V100 at fp16. The HF-override that pins the architecture to `Qwen3ForSequenceClassification` and the classifier head to the `no`/`yes` tokens is load-bearing — without it the default architecture resolver falls through to a generation head that does not exist on the reranker checkpoint, and the container restarts.
 
-**bge-reranker-v2-m3 — rejected.** CoIR nDCG@10 = **35.97**
-([`claude_revival.md:218`](https://github.com/starling-sh/perseus)).
-Open-license alternative, but the 53-point gap to Qwen3 is
-catastrophic. Not deployed.
+**bge-reranker-v2-m3, rejected.** CoIR nDCG@10 of 35.97. Open-license alternative, but the 53-point gap to Qwen3 is catastrophic; not deployed.
 
-**Qwen3-Reranker-0.6B — rejected.** Smaller variant of the same
-architecture, "too small" per the selection log. No CoIR number cited
-in the rejection.
+**Qwen3-Reranker-0.6B, rejected.** Smaller variant of the same architecture, marked "too small" in the selection log. No CoIR number cited at rejection.
 
-**jina-reranker-v3 — rejected, expensively.** Tried first on the
-2026-04-22 cato-101 rebuild. Published bench was higher than Qwen3.
-Failure mode:
+**jina-reranker-v3, rejected expensively.** Tried first on the 2026-04-22 cato rebuild. Published bench was higher than Qwen3 at the time. The failure mode was an architecture-resolution loop: the pinned vLLM image did not contain the `JinaForRanking` architecture, the resolver fell back to a generic causal-LM head, the language-model head weights failed to initialise, the container restarted. We watched this cycle 1084 times before pulling the plug. The relevant upstream PR was reported merged on 2026-04-10 per research notes, but the pinned `latest` digest did not contain it. Standing rule: do not retry jina-v3 until that PR is verified present in the pinned digest. Adjacent miss: our gateway expects singular `query` on the rerank route, jina exposes `/score` with plural `queries`, so a translator would have been required either way.
 
-```
-vllm/vllm-openai:latest
-→ JinaForRanking architecture missing in pinned image
-→ falls back to TransformersForCausalLM
-→ lm_head.weight init fails
-→ container restarts
-→ ... × 1084
-```
-
-`PR #38800` was supposedly merged 2026-04-10 per upstream research,
-but the pinned `:latest` digest did not contain it. Swapped to
-Qwen3-Reranker-4B via the HF-override workaround. The standing rule
-([`HISTORY/07_dead_ends.md:23`](https://github.com/starling-sh/perseus))
-is: don't retry jina-v3 unless vLLM PR #38800 is verified merged in
-the pinned digest. Adjacent miss: LiteLLM's `/rerank` expects
-singular `query`; jina exposes `/score` with plural `queries` —
-would have required a translator either way.
-
-The Qwen3-Reranker-4B → 89.18 / bge-reranker-v2-m3 → 35.97 gap is the
-one number that justifies the cascade at all. If the reranker
-delivers 53 nDCG@10 points over the next-best candidate, the $O(L^2
-N)$ tax buys real signal. If the gap had been five points the
-cost-benefit would have looked very different.
+The 53-point gap between Qwen3-Reranker-4B and the next candidate is the one number that justifies the cascade at all. If the reranker delivers that much nDCG@10 over the next-best, the $O(L^2 N)$ tax buys real signal. Had the gap been five points, the cost-benefit would have looked very different and the cascade would not be in the codepath.
 
 ## 5. The wire-shape alias shim
 
-Two retrieval services have run in production. The Python
-`infra/retrieval-service/server/*.py` (service_version 0.3.x → 0.4.0)
-shipped first; the Rust port `crates/retrieval-service/` (service_version
-0.5.0) replaced it during the 2026-04-24 audit-fix chain. They speak
-*different wire shapes* for the same logical response.
+Two retrieval services have run in production. The Python service shipped first; the Rust port replaced it during the 2026-04-24 audit-fix chain. They speak different wire shapes for the same logical response.
 
-Python 0.3.x `/rerank`:
-```json
-{"results": [{"index": 2, "relevance_score": 0.9},
-             {"index": 0, "relevance_score": 0.1}]}
+The Python rerank endpoint returns a list of result objects, each carrying an `index` field and a `relevance_score` field. The Rust port returns two parallel arrays, `indices` and `scores`. The perseus-side blocking client must speak to either, and the fix is a custom deserializer that accepts both shapes and flattens them to one canonical struct of parallel arrays. If the `results` array is present it gets collapsed into `(indices, scores)`; otherwise the parallel arrays pass through unchanged.
+
+The embedding side has the same problem in milder form. Python returned `vectors`; the Rust port returned `embeddings`. Both shapes carry the same nested float array, so a single serde alias on the canonical field handles both: declare the canonical field `embeddings` and alias it to `vectors`. One client speaks to either service unchanged.
+
+Two unit tests pin both directions. The first round-trips the Python rerank shape — a `results` array of `{index, relevance_score}` objects — and asserts it deserializes into the parallel-array struct. The second round-trips an embed response whose top-level field is named `vectors` and asserts it lands on the `embeddings` field. The alias shim was load-bearing during the cutover: the Rust service was promoted to default endpoint the same week it shipped, and any client still pointing at the Python service — autoresearch, eval harnesses, the multi-bench driver — kept working without recompilation.
+
+This is the kind of compatibility layer that looks like over-engineering in isolation and is mandatory in practice. The cost is roughly twenty lines of custom deserialization; the benefit is that a service rewrite does not break every caller in the dependency tree.
+
+```mermaid
+sequenceDiagram
+    participant P as perseus client
+    participant Svc as retrieval-service
+    P->>Svc: POST /rerank {query, snippets}
+    alt Python service (0.3.x)
+        Svc-->>P: {results: [{index, relevance_score}, ...]}
+    else Rust service (0.5.0)
+        Svc-->>P: {indices: [...], scores: [...]}
+    end
+    Note over P: custom Deserialize<br/>flattens both shapes
+    P->>P: RerankResp { indices, scores }
 ```
-
-Rust port `/rerank`:
-```json
-{"indices": [2, 0], "scores": [0.9, 0.1]}
-```
-
-The perseus-side `BlockingRetrievalClient` needs to speak to either.
-The fix is a custom `Deserialize` in
-[`src/search/retrieval.rs:240-261`](https://github.com/starling-sh/perseus)
-that accepts both shapes and flattens to one canonical struct:
-
-```rust
-struct RerankRespWire {
-    #[serde(default)]
-    indices: Vec<usize>,
-    #[serde(default)]
-    scores: Vec<f32>,
-    #[serde(default)]
-    results: Vec<RerankResultWire>,
-}
-
-struct RerankResultWire {
-    index: usize,
-    #[serde(default, alias = "score")]
-    relevance_score: f32,
-}
-
-impl<'de> Deserialize<'de> for RerankResp {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D)
-        -> Result<Self, D::Error>
-    {
-        let wire = RerankRespWire::deserialize(d)?;
-        // Python shape: collapse `results` into parallel vectors.
-        if !wire.results.is_empty() {
-            let mut indices = Vec::with_capacity(wire.results.len());
-            let mut scores = Vec::with_capacity(wire.results.len());
-            for r in wire.results {
-                indices.push(r.index);
-                scores.push(r.relevance_score);
-            }
-            return Ok(RerankResp { indices, scores });
-        }
-        Ok(RerankResp { indices: wire.indices, scores: wire.scores })
-    }
-}
-```
-
-The embedding side has the same problem. Python returned `vectors`;
-the Rust port returned `embeddings`. A simpler serde alias does the
-job there:
-
-```rust
-pub(crate) struct EmbedResp {
-    /// Accept both `embeddings` (Rust port contract) and `vectors`
-    /// (Python service contract). Both shapes carry a `Vec<Vec<f32>>`
-    /// — aliasing lets one client speak to either service unchanged.
-    #[serde(default, alias = "vectors")]
-    pub embeddings: Vec<Vec<f32>>,
-}
-```
-
-Two unit tests pin both directions
-([`src/search/retrieval.rs:1211-1232`](https://github.com/starling-sh/perseus)):
-`rerank_resp_accepts_python_results_shape` round-trips `{"results":
-[{"index": 2, "relevance_score": 0.9}, ...]}`;
-`embed_resp_accepts_vectors_alias` round-trips `{"vectors":
-[[0.1, 0.2], ...]}`. The alias shim was load-bearing during the
-cutover — the Rust service was promoted to default endpoint the same
-week it shipped, and any client still pointing at the Python service
-(autoresearch, eval harnesses, the multi-bench driver) kept working
-without recompilation.
-
-This is the kind of compatibility layer that looks like over-engineering
-in isolation and is mandatory in practice. The cost is twenty lines of
-custom `Deserialize`; the benefit is that a service rewrite does not
-break every caller.
 
 ## 6. When the cascade earns its keep
 
-The cross-encoder rerank cascade is worth its $N \cdot L^2$ cost when
-two conditions hold simultaneously.
+The cascade is worth its $N \cdot L^2$ cost when two conditions hold simultaneously.
 
-**Condition one: the bi-encoder leaves real signal on the table.**
-This happens when the query-doc semantic gap is too large for the
-bi-encoder to bridge in $d$ dimensions. Symptoms: top-1 from the
-bi-encoder is wrong but top-10 contains the right answer; queries
-that paraphrase rather than quote the gold doc; queries that require
-multi-hop reasoning over text the bi-encoder hasn't seen jointly.
-HyDE (hypothetical-document expansion) is a *cheaper* version of the
-same fix — synthesise a hallucinated doc that's lexically closer to
-the gold doc, then bi-encode that. When HyDE is already on and the
-top-100 still misses, the cross-encoder is the next lever.
+The first condition is that the bi-encoder leaves real signal on the table. This happens when the query-doc semantic gap is too large for the bi-encoder to bridge in $d$ dimensions. The symptoms are diagnosable: top-1 from the bi-encoder is wrong but top-10 contains the right answer; queries paraphrase rather than quote the gold doc; queries require multi-hop reasoning over text the bi-encoder has not seen jointly. Hypothetical-document expansion is a cheaper version of the same fix — synthesise a hallucinated doc that is lexically closer to the gold doc, then bi-encode that. When that is already on and the top-100 still misses, the cross-encoder is the next lever.
 
-**Condition two: the latency budget can absorb $N \cdot L^2$.** For
-the Perseus planner loop a single retrieval call is one of dozens of
-operations inside a multi-second MCTS expansion. An extra ~1–2s for
-top-100 rerank is in-budget. For an interactive code-search box where
-the user expects sub-300ms first-paint, top-100 rerank is out of
-budget; the cascade truncates to top-20 rerank or skips rerank
-entirely.
+The second condition is that the latency budget can absorb $N \cdot L^2$. For the Perseus planner loop a single retrieval call is one of dozens of operations inside a multi-second MCTS expansion; an extra one-to-two seconds for top-100 rerank is in-budget. For an interactive code-search box where the user expects sub-300ms first-paint, top-100 rerank is out of budget; the cascade truncates to top-20 rerank or skips rerank entirely.
 
-The flip side: when the bi-encoder is *already good enough* — when
-the top-1 is right 95% of the time on the actual workload — the
-reranker is paying $O(L^2 N)$ to reshuffle the same answer. For
-ripgrep-style exact-match code search the bi-encoder over codet5p-110m
-already lands the right file in top-3 most of the time; the
-cross-encoder rerank is theatre.
+The flip side: when the bi-encoder is already good enough — when top-1 is right 95% of the time on the actual workload — the reranker is paying $O(L^2 N)$ to reshuffle the same answer. For ripgrep-style exact-match code search the bi-encoder over codet5p-110m already lands the right file in top-3 most of the time; the cross-encoder rerank is theatre.
 
-The default-off posture is exactly this calculus. Until the in-house
-recall@k sweep that compares bm25 / dense / hybrid / hybrid+rerank
-against gold patches is logged, we know that:
+The default-off posture is exactly this calculus. Until the in-house recall@k sweep comparing bm25 / dense / hybrid / hybrid-plus-rerank against gold patches is logged, the three things we know are these.
 
-- Qwen3-Reranker-4B beats bge-reranker-v2-m3 by 53 nDCG@10 points on
-  public CoIR. (Reranker choice is correct.)
-- The retrieval-service already reranks inside `mode=hybrid`. (One
-  rerank pass is already in the budget.)
-- A second perseus-side rerank pass on top of `mode=hybrid` has
-  unknown direction. (Default off.)
+1. Qwen3-Reranker-4B beats bge-reranker-v2-m3 by 53 nDCG@10 points on public CoIR — the reranker choice is correct.
+2. The retrieval-service already reranks inside hybrid mode — one rerank pass is already in the budget.
+3. A second perseus-side rerank pass on top of hybrid has unknown direction — default off.
 
-What's open: an in-house recall@k sweep on the multi-bench gold-patch
-set, holding the embedder fixed and toggling rerank on/off, with
-$N \in \{50, 100, 200\}$ to find the actual sweet spot of the
-candidate-set size. Without that, the flag stays off and the cascade
-stays in the retrieval-service.
+What is open: an in-house recall@k sweep on the multi-bench gold-patch set, holding the embedder fixed and toggling rerank on and off, with the candidate-set size sweeping over $\{50, 100, 200\}$ to find the actual sweet spot. Without that sweep the flag stays off and the cascade stays in the retrieval-service.
 
-## Sources
-
-- `Claude.md` — Retrieval-Service Integration section
-  (`PERSEUS_RETRIEVAL_RERANK` flag, default `0`); 2026-04-22 retrieval
-  integration entry (HyDE + end-of-query rerank wiring); 2026-04-24
-  audit-fix chain entry (Rust port promoted to default endpoint).
-- [`HISTORY/30_retrieval_research.md §4`](https://github.com/starling-sh/perseus)
-  — Qwen3-Embedding-4B + Qwen3-Reranker-4B current primary stack,
-  HF-override workaround, CoIR 89.18 and bge-reranker-v2-m3 35.97
-  selection log.
-- [`HISTORY/30_retrieval_research.md §5`](https://github.com/starling-sh/perseus)
-  — jina-reranker-v3 dead end, 1,084 restart loops, vLLM PR #38800
-  verification rule, LiteLLM `/rerank` vs jina `/score` translator
-  miss.
-- [`HISTORY/30_retrieval_research.md §7`](https://github.com/starling-sh/perseus)
-  — end-of-query cross-encoder rerank on/off ablation, default-off
-  rationale, B16 silent-no-op risk, 2026-05 sweep-thrash operational
-  guidance.
-- [`HISTORY/30_retrieval_research.md §10`](https://github.com/starling-sh/perseus)
-  — Retrieval-service Rust port, wire-shape compatibility
-  (`embeddings` vs `vectors`, `indices/scores` vs `results[{index,
-  relevance_score}]`).
-- [`HISTORY/30_retrieval_research.md §14`](https://github.com/starling-sh/perseus)
-  — Cross-encoder rerank top_k variants, `RERANK_TOP_K_CANDIDATES =
-  100` default, no in-house rerank_top_k sweep.
-- [`src/search/retrieval.rs:194-261`](https://github.com/starling-sh/perseus)
-  — `EmbedResp` `vectors` alias; `RerankResp` custom `Deserialize`
-  flattening both wire shapes.
-- [`src/search/retrieval.rs:1211-1232`](https://github.com/starling-sh/perseus)
-  — `rerank_resp_accepts_python_results_shape` and
-  `embed_resp_accepts_vectors_alias` unit tests pinning the alias
-  shim.
-- [`crates/retrieval-service/src/retriever/hybrid.rs:21-22, 130-139`](https://github.com/starling-sh/perseus)
-  — `candidate_k = max(top_k, rerank_k)`, hybrid retriever rerank
-  path, soft-fallback to fused order on rerank error.
-- [`crates/retrieval-service/src/config.rs:80-85`](https://github.com/starling-sh/perseus)
-  — `EMBED_MODEL`, `RERANK_MODEL`, `RERANK_TOP_K_CANDIDATES = 100`
-  defaults.
-- [`HISTORY/07_dead_ends.md:14-23`](https://github.com/starling-sh/perseus)
-  — jina-reranker-v3 rejection record, PR #38800 verification rule.
-- [`hi-compact.md:465`](https://github.com/starling-sh/perseus),
-  [`hi.md:9026, 9095, 9116, 20782`](https://github.com/starling-sh/perseus)
-  — B16 silent-no-op risk, 2026-05 sweep-thrash operational
-  `PERSEUS_RETRIEVAL_RERANK=0` guidance.
-
-Cross-link: [codet5p embedder](/essays/codet5p-embedder/),
-[hybrid search tool](/essays/hybrid-search-tool/),
-[muzero pipeline](/essays/muzero-pipeline/).
+The shape of the answer we expect: hybrid-plus-rerank dominates dense-alone on multi-hop queries where the bi-encoder paraphrase gap matters, and ties dense-alone on exact-match queries where the bi-encoder already lands top-1. If both halves of that prediction hold, rerank stops being a global flag and becomes a per-query routing decision driven by the planner's read of the query shape. That is the version of the cascade that earns its $O(L^2)$ tax honestly — not by reranking everything, but by reranking only the queries where the bi-encoder demonstrably fails.

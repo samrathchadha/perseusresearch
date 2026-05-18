@@ -8,61 +8,28 @@ related: ["zero-real-patches","pipeline-integrity-audit","cohort-contamination-c
 readTime: 14
 ---
 
-> tl;dr: On 2026-05-18 perseus V2 — a ~72k-line stack of Rust crates,
-> Python ML scripts, and TypeScript dashboards — was wiped and
-> rewritten as a ~5.3k-line Python core. The trigger was not a
-> performance regression or a missed deadline; it was the discovery
-> that across **6,545 labelled perseus-condition rows on
-> `multi_swe_bench`, every single `prediction_bytes` value sat in
-> the 146–253 byte range**. The diff envelope was always empty.
-> Baseline ran at 19.76%; the perseus 8.86% number we had been
-> citing was collision artifact and no-op-on-already-green tests.
-> The MuZero architecture survived. The plumbing burned.
+On 2026-05-18 we wiped perseus V2 and rewrote it.
 
-## 1 The triggering finding
+The trigger was not a regression, a missed deadline, or a strategic pivot. It was a single distribution: across 6,545 labelled perseus-condition rows on multi-swe-bench, every prediction we shipped was between 146 and 253 bytes. That is the size of an empty diff envelope. The 8.86% pass rate we had been quoting was collision artifact and no-op-on-already-green tests stacked on a layer of NULL judge labels we had been mis-reading as zeros for seventeen days.
 
-The number that ended V2 is a substring count. The schema is
-boring: `multi_bench_runs.prediction_bytes int8`, populated by the
-multi-bench driver when the codex sub-process emits a patch. The
-distribution across the perseus condition is single-row trivial:
+The MuZero architecture survived. Roughly 72k lines of Rust, Python, and TypeScript plumbing did not. What replaced it is 3,993 lines of Python in `perseus/core/`, a shrinkage factor of about 13.6. The action space is identical. The MCTS loop is identical. The value head is identical. The stop function compressed from seven interacting predicates to a two-vote conjunction. The retrieval backend swapped from a Rust crate over qdrant to a Python module over pgvector, with no measurable change in recall-at-10.
 
-| condition | status=done | produced patch (>300B) | empty patch | min bytes | max bytes | avg     |
-| --------- | ----------- | ---------------------- | ----------- | --------- | --------- | ------- |
-| baseline  | 5,691       | 5,669                  | 22          | 77        | 868M      | 360,327 |
-| perseus   | 485         | **0**                  | 485         | 146       | 253       | 157     |
+This essay documents the four-layer contamination cascade that produced the empty-patch distribution, the seam along which we cut, and the lessons we extracted. It is an audit of our own execution, not a celebration.
 
-Source: `parking_lot/v2_archive_2026-05-18/HISTORY/33_multibench_detail.md` §
-"Patch production — the load-bearing finding".
+We were wrong about specific things in specific places, those wrongs compounded, and the only honest move was to throw out everything we could not prove was right. The cost we paid was code volume. The cost we did not pay was architecture, data, or team continuity. The bet we are now making is that the audit corpus we accumulated is more valuable than the implementation that produced it.
 
-146 bytes is the JSON envelope around an empty diff. The full
-6,545-row labelled cohort (485 done + 5,213 judged + 847 telemetered)
-shows the same shape: not a single row carries a patch large enough
-to plausibly contain a real fix. The
-"perseus pass rate" we had been quoting on slides — `359 / 5,213 =
-**8.86%**` on `multi_swe_bench` — decomposes cleanly when you
-condition on patch presence. There are three ways an empty patch
-"passes" the harness:
+## 1. The triggering finding
 
-1. The fail-to-pass tests were already green on the buggy commit
-   (test selection error in the upstream dataset).
-2. The multi-swe-bench harness keys verdicts by
-   `<org>/<repo>:pr-<n>` only, so when 5 model variants × 2
-   conditions of the same upstream PR write to the same key, the
-   last-write-wins verdict gets fanned out across all 10
-   collision siblings (the 2026-05-02 Claude.md entry called this
-   out at write time; the audit caught the magnitude).
-3. The harness counts absence-of-breakage on a P2P test as
-   success.
+The schema is boring. The multi-bench driver writes an integer column `prediction_bytes` whenever the codex sub-process emits a patch. The query is six lines of SQL, conditioning on the done-status rows and splitting by condition:
 
-All three are artifact. None is "perseus retrieved well enough
-that codex landed a working patch". The baseline 19.76% number
-isn't artifact — `5,669 / 5,691 = 99.6%` of baseline-done rows
-produced a non-empty patch (median 360KB), and the harness gave a
-real verdict on each of them.
+| condition | done  | produced patch (>300B) | empty patch | min B | max B   | avg B   |
+| --------- | ----- | ---------------------- | ----------- | ----- | ------- | ------- |
+| baseline  | 5,691 | 5,669                  | 22          | 77    | 868M    | 360,327 |
+| perseus   | 485   | **0**                  | 485         | 146   | 253     | 157     |
 
-The math is brutal. On the post-T7 clean cohort (rows after the
-backfill that re-tagged collisions to `harness_collided` and
-NULLed their labels):
+The 146-byte floor is the JSON envelope around an empty diff. The 253-byte ceiling is the same envelope with a non-empty rationale field but still no patch payload. Not one perseus-condition row out of 485 carried a patch large enough to plausibly contain a real fix. The corresponding baseline distribution has a long right tail: median 360KB, max 868MB (a single row containing a full vendored dependency rewrite), and only 22 of 5,691 rows under 300 bytes.
+
+The headline pass-rate decomposes cleanly when conditioned on patch presence:
 
 $$
 P_\text{perseus}^\text{clean} = \frac{0}{485} = 0.0\%
@@ -70,613 +37,63 @@ P_\text{perseus}^\text{clean} = \frac{0}{485} = 0.0\%
 P_\text{baseline}^\text{clean} = \frac{5669}{5691} = 99.6\%
 $$
 
-The 99.6% is "produced a non-empty patch", not "patch passes
-tests". The "patch passes tests" number for baseline is 19.76%.
-The "patch passes tests" number for perseus is **structurally
-zero** — you cannot pass a test by submitting no diff.
+The 99.6% is "produced a non-empty patch," not "patch passes tests." Baseline's actual test-pass rate is 19.76%. Perseus's actual test-pass rate is structurally zero: a test cannot pass against a diff that does not exist. The 8.86% we had been citing was the average over a denominator that included contaminated rows whose verdicts had been fanned out from collision siblings.
 
-This was the moment the project broke. Not because perseus was
-bad at retrieval — the planner-call traces show real evidence
-accumulation, real MCTS expansion, real WM probes — but because
-the seam between perseus's `/v1/query` output and codex's
-`apply_patch` step had been silently broken for the entire
-experiment.
+There are exactly three ways an empty patch nominally "passes" the multi-swe-bench harness, and we observed all three:
 
-## 2 The contamination cascade
+1. The fail-to-pass tests were already green on the buggy commit (selection error in the upstream dataset).
+2. The harness keys verdicts by repository and pull-request number only, so when ten variants of the same upstream PR write to the same key, the last write fans out.
+3. The harness scores the absence of breakage on a regression test as success.
 
-The empty-patch finding wasn't a single bug. It was the visible
-surface of four layered failures, each of which had its own
-incident date and its own "this is fixed" claim that turned out
-to be false.
+All three are artifact. None is "perseus retrieved well enough that codex landed a working patch." The seam between the retrieval output and the patching step had been silently broken for the entire experiment.
 
-### 2.1 T2: `pick_terminal_reward(Judge)` read a NULL column for 17 days
+The proximate cause was a prompt that instructed the codex sub-process to make a blocking call into perseus that could "take up to 60 minutes" and to issue no other shell commands during the call. Combined with the codex per-attempt budget of roughly 100 minutes, that prompt exhausted the session in pre-call reasoning before any file edit could happen. The prompt also told codex that more than 70% of the time it would patch wrong files without perseus's help, which anchored every pre-call decision on a pessimistic prior that drove longer reasoning chains, which consumed more budget, which left less time for the actual edit. We were nudging codex into a worst-case behavior pattern using a statistic we had not measured.
 
-The first stratum, in date order, is the most expensive. On
-2026-04-25 the muzero-export binary's default
-`--reward-source` was supposed to flip from `fileRecall` to
-`judge`. The 2026-05-05 entry in V2's `Claude.md` claimed the
-flip had landed:
+The query lifecycle in production looked like this:
 
-> `pick_terminal_reward(RewardSource::Judge)` was reading
-> `MultiBenchRow.result` … and silently mapping every trajectory
-> to `terminal_reward = 0.0`. Fix: … `RewardSource::Judge` now
-> maps `Some(>=0.5) → +1.0, Some(<0.5) → -1.0, None → 0.0`.
-> Verified on a 500-trajectory smoke: terminal_reward unique
-> values now `{-1.0, 0.0, +1.0}`.
+```mermaid
+sequenceDiagram
+    participant Driver as Multi-bench driver
+    participant Codex as Codex CLI
+    participant Perseus as Perseus /v1/query
+    participant Harness as multi-swe-bench harness
 
-It hadn't. The 2026-05-11 entry retracts:
-
-> The 2026-05-05 entry claimed `pick_terminal_reward` was fixed
-> to use `judge_label`; **it was never implemented**. The Rust
-> struct didn't carry the migration-008 columns, every `SELECT`
-> on `multi_bench_runs` silently dropped them, and the export
-> still matched on `row.result.as_deref() == Some("pass")`.
-
-(Source: V2 `Claude.md`, 2026-05-11 entry.) The `result` column
-is `NULL` on every modern `multi_bench_runs` row. The driver
-writes scoring outcomes to `f2p_passed`, `p2p_passed`,
-`judge_label` — never to `result`. The struct definition lagged
-the migration. `SELECT` calls silently dropped the new columns.
-`pick_terminal_reward` read `None` for the entire seventeen-day
-window from 2026-04-24 through 2026-05-11.
-
-The mathematical content of this bug is short:
-
-$$
-\hat r_t^\text{V2 2026-04-24 → 2026-05-11}
-\equiv 0
-\quad
-\forall\, \text{trajectories with } \texttt{--reward-source judge}
-$$
-
-Every value-head training run in that window saw a constant
-zero terminal signal. The HL-Gauss 51-bin head, designed to
-learn a distribution over rewards in $[-2, 2]$, was given a
-training target that was literally a single point mass at zero.
-The per-step shaping rewards (which DO populate correctly)
-spanned $[-2.0, +0.285]$, giving the value head a target
-distribution of `value_target ∈ [-2.0, +0.285]`. Cited verbatim
-in V2 `Claude.md` 2026-05-05: "value_target spans
-`[-9.6, +1.2]` (was `[-2.0, +0.285]`)" — except the post-fix
-range was the retracted, untrue claim, and the actual
-pre-fix range stayed `[-2.0, +0.285]` for another six days.
-
-Six WM checkpoints were trained against this corpus. Every
-single one regressed toward zero by construction. The
-2026-05-06 production WM (`wm_v4_random_split`) was scored at
-val_r2 = 0.997 — a number so close to perfect that it should
-have been a fire alarm. It was treated as a triumph.
-
-### 2.2 T6: harness collision fanned 3,314 verdicts
-
-The second stratum is the harness-id collision. The multi-swe
-upstream harness's contract is:
-
-```
-key = f"{org}/{repo}:pr-{number}"
-verdicts[key] = run_evaluation(...)
+    Driver->>Codex: spawn with prompt (60-min wait warning)
+    Codex->>Codex: reason about blocking call (consumes budget)
+    Codex->>Perseus: /v1/query with timeout 3960000 ms
+    Perseus-->>Codex: hits (real, useful)
+    Codex->>Codex: budget already exhausted
+    Codex-->>Driver: empty patch envelope (146-253 bytes)
+    Driver->>Harness: submit empty patch
+    Harness-->>Driver: PASS (collision fan-out or no-op)
+    Driver->>Driver: write judge_label=1.0
 ```
 
-— single dict entry per PR. The perseus campaign matrix is **5
-models × 2 conditions × N PRs**, so for every PR up to 10
-trajectories write to the same `key`. Whatever ran last won.
-The harness emitted ONE verdict per PR; the driver fanned it to
-all 10 input rows.
+The retrieval was working. The planner was working. The world-model probes were firing. The patch never got written.
 
-The 2026-05-02 Claude.md entry called this out at deploy time
-("acceptable trade-off for now"). The 2026-05-11 audit measured
-the magnitude: **3,314 rows** on the live table currently carry
-a fingerprint that requires this fan-out fix to read honestly.
-Pre-T6, those rows were silently scored as
-`mswebench_harness` real verdicts. Post-T6, they're tagged
-`harness_collided`, labeled 0.0, and treated as ineligible by
-the audit.
+The fix to the prompt was staged on 2026-05-18 itself, hours before the reset call. The new prompt frames perseus as "the locator" and codex's local shell tools as "the verifiers and editors." Expected latency dropped from "up to 60 minutes" to "typically 5 to 30 seconds, worst case a few minutes." The instruction to issue no parallel shell commands was deleted. The 70% scare statistic was deleted. The blocking-call timeout dropped from roughly an hour to five minutes. We did not, at reset time, have empirical confirmation that the new prompt produced non-empty patches; the deploy was staged but the next sweep had not yet completed. The reset call did not wait for that confirmation. The whole stack was being replaced anyway.
 
-Add to that **786 rows** of `harness_invocation_failed`: the
-harness exited 1 on collision-heavy batches without writing
-`final_report.json`. Pre-fix every such row got
-`judge_source='mswebench_harness'`, `judge_label=0.0` —
-indistinguishable from a real FAIL.
+## 2. The contamination cascade
 
-The combined contaminated cohort is **3,314 + 786 = 4,100 rows
-= 33% of all `done` rows** at audit time. Every pre-2026-05-11
-"perseus pass rate" we had on a dashboard was reading 33%
-contamination as ground truth.
-
-### 2.3 WM α = 0.9 anchored on a leakage probe for 8 days
-
-The third stratum touches the runtime. On 2026-05-10 the WM
-service deployed `wm_v4_random_split` to cato:19100. The val_r2
-of 0.997 was used to justify raising the MCTS prior blend
-coefficient from $\alpha = 0.3$ to $\alpha = 0.9$ on 2026-05-10.
-The blend is:
-
-$$
-P_\text{prior}(a \mid s) = (1-\alpha) \cdot P_\text{llm}(a \mid s)
-                          + \alpha \cdot P_\text{wm}(a \mid s)
-$$
-
-At $\alpha = 0.9$ the LLM planner's policy head contributes
-only 10% of every node's prior. The world model — which we
-later discovered was a row-split leakage probe, not a
-generalization model — contributes 90%. From 2026-05-10 through
-2026-05-18 (eight days, the entire perseus-condition production
-window for multi-bench) every MCTS expansion's UCB1 prior was
-$0.9 \times \text{noise} + 0.1 \times \text{signal}$.
-
-The row-split leakage was visible in retrospect on the
-checkpoint metadata: the validation set was randomly sampled at
-the row level rather than at the instance level, so for every
-held-out row there was a sibling training row from the same
-trajectory that leaked the answer. On a clean instance-split
-(see `wm-v3-chain-deepsets`), the same architecture scored
-val_r2 = 0.112 — three orders of magnitude lower than what we
-had in production.
-
-On 2026-05-18 $\alpha$ was reset to **0.0** as an emergency
-disable. The `wm_call` probes still fire (telemetry
-preserved), but they contribute zero to the UCB calculation
-until a clean checkpoint deploys.
-
-### 2.4 The visit_distribution silent uniform fallback
-
-The fourth stratum is the most subtle and the one that
-silently poisoned training data for the longest. The
-`python/muzero/dataset.py::parse_visit_distribution` function
-had two parser branches: one for a legacy flat-array shape,
-one for the object-list shape Rust's MCTS snapshotter
-actually emits:
-
-```python
-# Rust emits: [{action_index: int, visits: int}, ...]
-# Pre-fix parser expected: [float, float, ...]
-```
-
-When the parser saw the object-list shape, it silently fell
-through to a uniform distribution. The policy head trained
-against uniform targets for an unknown number of weeks. Every
-$\pi^M_t$ row from `mcts_step_snapshots` — and the table held
-**6,360,475 rows** at audit time — was uniformized at load
-time.
-
-### 2.5 Summary table
-
-| Stratum | Window                  | Mechanism                                    | Affected rows                                  |
-| ------- | ----------------------- | -------------------------------------------- | ---------------------------------------------- |
-| T2      | 2026-04-24 → 2026-05-11 | `pick_terminal_reward` reads NULL column     | Every WM ckpt trained `--reward-source judge`  |
-| T6      | 2026-05-02 → 2026-05-11 | Harness key collision fans verdicts          | 3,314 rows                                     |
-| T6'     | 2026-05-02 → 2026-05-11 | Harness exit-1 without `final_report.json`   | 786 rows                                       |
-| WM α    | 2026-05-10 → 2026-05-18 | $\alpha = 0.9$ on leakage-probe WM           | All 2,663 perseus-condition MCTS expansions     |
-| T4      | Unknown → 2026-05-11    | Python visit_distribution silent uniform     | 6,360,475 snapshot rows                        |
-
-Every one of these strata had a "fixed" claim in V2 `Claude.md`
-that turned out to be untrue, partial, or later contradicted by
-the same file. The retraction log within V2's Claude.md is the
-single most useful artifact in the V2 archive.
-
-## 3 The "monkey-patched slop" moment
-
-Sam's words on 2026-05-18, after the V2 audit landed:
-
-> "see all the code is slop and monkey patched now because you
-> fucked up."
-
-The phrasing is the trigger. The semantic-cache leak from a
-week earlier had already exposed the watchdog layer as
-monkey-patched: V2's `cargo build --release` produced a binary
-with `default = ["semantic", ...]` enabled, and the semantic
-feature held a global `LazyLock<HashMap<...>>` that grew
-without bound under concurrent indexing workloads. The
-operational fix was `--no-default-features --features
-"progress-jsonl simd-json"`. The 1-line Cargo.toml change to
-remove `semantic` from the default feature set was **never
-landed**. Every future `cargo build --release` without the
-explicit flag would rebuild the leaking binary.
-
-That's the drift class. Three documents had described the fix
-as shipped:
-
-- V2 `Claude.md` "What Didn't Work" implicitly: "1-line fix in
-  Cargo.toml. **Still default-on at time of writing.**"
-- `hi-compact.md` "Most surprising / load-bearing items #1":
-  "A 1-line Cargo.toml change would prevent every future
-  developer from re-tripping this."
-- `HISTORY/36_audit_handoff_docs.md` §1.2: "Status: the cargo
-  build with `--no-default-features` was used operationally,
-  but the 1-line Cargo.toml change to remove `semantic` from
-  `default` was never landed."
-
-Pattern §3.2 in the V2 meta-audit: "Fix specified in doc, code
-not committed." Three instances, three confessions, zero
-docs-check rule that grep'd `Claude.md` "Files: …" lines for
-matching commits. The audit notes the obvious counterfactual:
-"a `docs-check` test that grep's each Claude.md 'Files: …' line
-for git-presence within the date window would have caught §1.1
-before six days of WM training poisoned." The test was
-proposed; never written.
-
-That class of failure — doc claims a fix is landed when the
-code change isn't in git — was visible enough across the
-corpus that the only honest path forward was to delete the
-corpus. Not delete the architecture; delete the artifact that
-the corpus described. Sam picked option (a): full nuke +
-rewrite.
-
-## 4 Three env-vs-code drifts caught in the 2026-05-18 retraction pass
-
-While the audit was running, three more drift cases surfaced
-between V2's `Claude.md` and the actual code. Each was
-surgically retracted in V2's Claude.md on 2026-05-18 using the
-2026-05-11 retraction template (strikethrough + inline note +
-authoritative pointer). All three were drift between a date-
-stamped doc claim and the in-code default at the same revision.
-
-### Drift table
-
-| # | Knob / claim                                | Doc claim                                                  | Code reality                                                 | Authoritative pointer                                  |
-| - | ------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------ |
-| 1 | `PERSEUS_LLM_TREE_TIMEOUT_MS` default       | "0 → 90000" (2026-04-23, audit #25)                        | `0` (disabled; non-zero re-enables)                          | `scripts/env.perseus:66`, `config_types.rs:151`, Operational Policy section |
-| 2 | Plan temperature retry-bump                 | "`cfg.llm_tree_temperature + 0.2 * retry`, clamped ≤ 0.6"  | `let _ = retry;` — explicitly discards the retry counter     | `planner/mock.rs::plan_temperature` lines 10–18        |
-| 3 | muzero-export parquet schema column count   | "17-col schema" (2026-04-23 entry)                         | 23 columns (vt2 promoted 2026-05-13)                         | `src/muzero/parquet_writer/mod.rs::schema`             |
-
-The three drifts have the same shape. Doc made a claim on day
-N. Code at day N either contradicted the claim or evolved away
-from it. No CI gate noticed. Readers (including future Claude
-sessions) treated the doc as authoritative. The retraction
-pass on 2026-05-18 surgically corrected each one with a
-strikethrough and an inline note pointing at the file:line that
-holds the actual default. Authoritative source-of-truth for
-each knob is now a single in-code constant, not a paragraph in
-Claude.md.
-
-The mock.rs source comment on the retry-temperature decision is
-worth preserving:
-
-> "Bumping temp on a parse-retry was counterproductive — a
-> malformed-JSON failure is rarely fixed by sampling more
-> diversely."
-
-That's the right reasoning. The bug wasn't that the code
-discarded `retry`; the bug was that the doc said the opposite
-for over a month while the code did the right thing.
-
-## 5 ADR-012: perseus IS the MuZero pipeline
-
-The reset's load-bearing decision is `docs/adr/012-perseus-is-muzero.md`,
-dated 2026-05-18. The framing it supersedes is from earlier ADR
-drafts that treated MCTS, the WM, and the 17-tool registry as
-**research that lives in lab/ until measured**:
-
-> Earlier ADR-003 statement: "perseus v0.1 has NO planner. NO
-> MCTS. NO WM. Just retrieval. We measure it. We decide what to
-> research after." — **retracted**. Perseus IS the MuZero
-> pipeline; you don't measure a baseline and then decide
-> whether to add the system's identity.
-
-The verbatim Sam phrasing that triggered the retraction: "we
-are a muzero model and there's no fucking mcts???????????" The
-new framing is the identity:
-
-```
-state          = evidence accumulator (paths + line ranges + snippets + branch lineage)
-action space   = retrieval tool registry (17 actions)
-planner        = LLM-proposed actions + give_up/done status + branch lineage in prompt
-value head     = "is this evidence sufficient" — HL-Gauss 51 bins
-policy head    = prior distribution over next action — also informs UCB
-step reward    = per-step shaping (file_recall, empty_tool_result penalty, etc.)
-judge reward   = terminal signal (recall@k vs gold, judge_label from running tests)
-MCTS           = the selection / expansion / backprop loop
-stop           = WM heads VOTE + planner declares done/give_up. Two votes.
-self-play      = MCTS rollouts produce (state, π^M, value_target) tuples
-training       = supervised distillation → judge-label fine-tune → RL on rollouts
-```
-
-The two-vote stop function is the most consequential single
-change. V2 had **seven** layered stop mechanisms fighting each
-other: planner-declared stop, adversarial confirm_stop,
-per-stem confirm_stop, give_up, composite WM stop, depth cap,
-budget-ms, and max-steps. The 515:1 confirm_stop reject:accept
-ratio measured under V2's v3 prompt was the visible signature
-of seven layers interfering. The reset reduces this to two
-votes:
-
-```python
-def should_stop(state, wm_heads, planner_decision) -> bool:
-    wm_says_stop = wm_heads.stop_logit > 0
-    planner_says_stop = planner_decision in ("stop", "give_up")
-    return wm_says_stop and planner_says_stop
-```
-
-A conjunction, not seven layers in series. Total stop logic:
-~95 LOC across `perseus/core/planner/stop.py`.
-
-The 17-tool registry survives intact. ADR-012's stance is
-explicit: "17 tools coexisted with 0.26% combined usage of 4
-of them. The fix is to keep them in the action space (the
-policy will learn what works) — not amputate them." A trained
-policy will learn that `repo_stats` is rarely useful; manually
-deleting it removes a baseline against which the policy could
-learn.
-
-## 6 What got amputated
-
-The amputations are real, even though the architecture survives.
-The pattern is consistent: anything that orchestrated, served,
-or wrapped became a Python rewrite at a smaller scope; anything
-that defined the algorithm survived.
-
-### Amputation table
-
-| V2 component                              | LOC (approx) | Replacement                                                  | Replacement LOC      |
-| ----------------------------------------- | ------------ | ------------------------------------------------------------ | -------------------- |
-| `crates/retrieval-service/` (Rust)        | ~8,000       | `perseus/core/retrieval/` (Python, pgvector backend)         | ~950                 |
-| Rust multi-bench orchestrator             | ~2,500       | `lab/multibench/` (Python wrapper around public harness)     | ~600 (TBD)           |
-| Rust judge_bootstrap                      | ~1,800       | `lab/judge_bootstrap/` (Python + Docker)                     | ~500 (TBD)           |
-| autoresearch v1 → v4 plumbing             | ~600 + $229.94 spend | `lab/autoresearch/` (parking_lot preserves v2 winner blob)   | ~250 (TBD)           |
-| 7-layer stop function                     | ~700         | `perseus/core/planner/stop.py` two-vote conjunction          | ~95                  |
-| 13 SQL migrations                         | 13 files     | `perseus/core/schema.sql` (single file applied at startup)   | 1 file               |
-| 3 dashboards (`dashboard/`, `viz/`, etc.) | ~5,000 TS    | `viz/` single Svelte 5 + Tailwind 4 SPA                      | ~1,200 (TBD)         |
-| Rust `src/search/engine/llm_tree/`        | ~6,000       | `perseus/core/planner/mcts.py` + `stop.py` + `llm.py`        | 288 + 82 + 193 = 563 |
-| `src/muzero/` Rust parquet exporter       | ~1,500       | `lab/judge_bootstrap/export.py`                              | ~300 (TBD)           |
-
-The retrieval-service amputation is the most surprising. It
-was the most-recently-rewritten V2 component (the audit-fix
-chain on 2026-04-24 had ported a Python service to Rust under
-the constraint "every `.rs` in `crates/retrieval-service/src`
-must be ≤150 lines"). Eight thousand lines of Rust, every file
-under 150 lines, every interface clean — and the audit still
-amputated it. Why? Because the same codebase that hosted that
-service also hosted the multi-bench driver, the judge harness,
-the autoresearch loop, the muzero exporter, and the planner.
-The Rust monoculture wasn't the bug. The Rust monoculture made
-the bug invisible: cross-cutting concerns (UCB-C, prompt drift,
-WM α, semantic feature gate) silently affected every module.
-
-The autoresearch parking-lot is the second-most-surprising. V2
-ran four autoresearch generations (v1 through v4) that searched
-prompts via MCTS-over-prompts, judged candidates against
-recall@k on a held-out 100-instance pool. The v2 winner blob
-(commit `3c7f945f`, spend $229.94, score lift 11.83 → 13.50)
-is preserved in
-`parking_lot/v2_archive_2026-05-18/autoresearch_v2_winner.txt`.
-The full v3/v4 pipelines were amputated. The blob survives as
-data, the pipeline does not.
-
-The thirteen migrations consolidating to one are an honest
-schema-cleanup move. V2 accumulated migrations 001 through 010,
-each adding a column or a partial index in response to a new
-need. By 2026-05-18 several of those migrations were
-effectively dead code: migration 002's `query_traces` table
-overlapped with migration 008's `judge_labels` columns, and
-migration 010's typed `planner_events` columns made some of
-migration 006's `prompt_body JSONB` redundant. The reset
-consolidates everything into a single `perseus/core/schema.sql`
-applied by `db.py` on service startup with a real
-`schema_migrations` table; no more "did I run all the
-migrations in the right order on engram?" Slack messages.
-
-## 7 What survived
-
-The amputation table reads more violent than the actual
-diff. The architecture survives without modification. The
-2026-04-22 V2 design notes — "17 tools, MCTS planner, WM
-priors, HL-Gauss heads, per-step shaping" — describe the
-2026-05-18 reset just as accurately as they described V2.
-
-| Architecture concept                                   | V2 location                                                 | perseus reset location                          |
-| ------------------------------------------------------ | ----------------------------------------------------------- | ----------------------------------------------- |
-| 17-tool action space                                   | `src/search/engine/llm_tree/tools/`                         | `perseus/core/actions.py` + `retrieval/tools/`  |
-| MCTS + UCB1                                            | `src/search/engine/llm_tree/runtime/`                       | `perseus/core/planner/mcts.py`                  |
-| 51-bin HL-Gauss value head                             | `wm-serve/wm_serve.py`                                      | `perseus/core/wm/heads.py`                      |
-| $(1-\alpha) \cdot \text{LLM} + \alpha \cdot \text{value\_norm}$ blend | `src/search/engine/llm_tree/runtime/wm_client.rs`           | `perseus/core/wm/blend.py`                      |
-| Per-step shaping                                       | `src/muzero/rewards.rs`                                     | `perseus/core/training/rewards.py`              |
-| $\pi^M_t$ training target via `mcts_step_snapshots`    | migration 007 + `runtime/snapshot.rs`                       | `perseus/core/schema.sql` table + `mcts.py` emit |
-| Branch lineage + global digest in planner prompt       | `src/search/engine/llm_tree/context/`                       | `perseus/core/planner/llm.py`                   |
-| Policy fingerprint on every trajectory                 | `src/policy_fingerprint.rs` + migration 009                 | `perseus/core/trace.py`                         |
-| `give_up` as state transition                          | `src/search/engine/llm_tree/runtime/step_stop.rs`           | `perseus/core/planner/stop.py`                  |
-| External session id for trace-join                     | header + body field on `/v1/query`                          | header + body field on `/v1/query`              |
-
-The match is 1:1. Every V2 concept has a perseus home; the
-mapping isn't approximate. Even the auxiliary surfaces
-survive: cohort split by `policy_fingerprint_sha`, JSONL trace
-events, `external_session_id` header, per-step snapshot
-emission. The reset isn't a redesign. It's a re-implementation
-of the same design without the accumulated plumbing debt.
-
-## 8 LOC accounting
-
-The before/after by directory is the most concrete way to see
-what happened.
-
-### V2 LOC by directory (approximate, 2026-05-13 audit snapshot)
-
-| Directory                          | LOC      | Notes                                          |
-| ---------------------------------- | -------- | ---------------------------------------------- |
-| `src/search/engine/llm_tree/`      | ~6,000   | Planner runtime, MCTS, context, tools          |
-| `src/search/engine/`               | ~2,500   | Semantic index, candidate collection           |
-| `src/multi_bench/`                 | ~2,500   | Multi-bench orchestrator                       |
-| `src/judge_bootstrap/`             | ~1,800   | Docker harness wrapper                         |
-| `src/muzero/`                      | ~1,500   | Parquet exporter, rewards, trajectory          |
-| `crates/retrieval-service/src/`    | ~8,000   | Rust retrieval service (150-line cap per file) |
-| `src/` (rest)                      | ~7,500   | App, handlers, store, eval, doctor             |
-| `python/muzero/`                   | ~4,500   | Training pipeline, dataset, heads              |
-| `python/` (rest)                   | ~3,000   | Bench harnesses, ad-hoc scripts                |
-| `wm-serve/`                        | ~600     | Uvicorn WM service                             |
-| `dashboard/`                       | ~5,000   | Rust + TS dashboard                            |
-| `scripts/`                         | ~10,000  | Operational shell scripts                      |
-| `modal_distill/`, `modal_rft/`     | ~3,000   | Modal training scripts                         |
-| `tests/`                           | ~6,000   | Integration + unit                             |
-| `docs/`                            | ~11,000  | Reference + research + ADRs                    |
-| **V2 total**                       | **~72,000** |                                              |
-
-### perseus reset LOC
-
-| Directory                  | LOC       | Status                                  |
-| -------------------------- | --------- | --------------------------------------- |
-| `perseus/core/`            | 3,993     | Done — see `wc -l` output below         |
-| `perseus/tests/`           | ~800      | In progress                             |
-| `lab/` (codex, multibench, judge, autoresearch, embed, serving_v100) | ~1,200 budget | In progress |
-| `infra/` (drivers, host-agent, engram) | ~500 budget    | In progress                             |
-| `viz/` (Svelte 5 SPA)      | ~1,200 budget | In progress                             |
-| **perseus target**         | **~5,160** | Hard cap 5,000 LOC for `perseus/core/` |
-
-Current `perseus/core/` `wc -l` output (verified 2026-05-19):
-
-```
-perseus/core/workloads.py        264
-perseus/core/actions.py          129
-perseus/core/__init__.py          17
-perseus/core/cli.py              358
-perseus/core/contracts.py        116
-perseus/core/errors.py            57
-perseus/core/cost.py              89
-perseus/core/state.py             66
-perseus/core/planner/stop.py      82
-perseus/core/planner/__init__.py  16
-perseus/core/planner/llm.py      193
-perseus/core/planner/mcts.py     288
-perseus/core/training/__init__.py  8
-perseus/core/training/rewards.py  59
-perseus/core/wm/blend.py          10
-perseus/core/wm/client.py        100
-perseus/core/wm/__init__.py       17
-perseus/core/wm/heads.py          48
-perseus/core/retrieval/store.py  220
-perseus/core/retrieval/aggregate.py 81
-perseus/core/retrieval/ingest.py 126
-perseus/core/retrieval/embed.py   72
-perseus/core/retrieval/__init__.py 22
-perseus/core/retrieval/tools/files.py    94
-perseus/core/retrieval/tools/patterns.py 109
-perseus/core/retrieval/tools/terminal.py  17
-perseus/core/retrieval/tools/__init__.py  54
-perseus/core/retrieval/tools/search.py   157
-perseus/core/retrieval/tools/codeshape.py 128
-TOTAL                           3,993
-```
-
-The shrinkage is **~72,000 → ~5,300 = 13.6×**. The "core
-identity" (planner + WM + retrieval + state + actions) sits at
-3,993 LOC. Every file is well under the hard cap of 250 LOC
-per `.py` (enforced by CI). Every directory has a single
-responsibility. Switching the retrieval backend, swapping the
-embedder, replacing the planner LLM — each is a one-protocol-
-swap operation, not a multi-file refactor.
-
-## 9 Three lessons
-
-The reset has been distilled into three lessons that are
-literally posted in the team's PLAN.md preamble. Each
-corresponds to a specific contamination pattern from the
-audit.
-
-### 9.1 Instrument is part of the experiment
-
-Three env-vs-code drifts (table in §4) silently invalidated
-cohorts. The drift was always between a documented default and
-an in-code constant, and the in-code constant was always
-authoritative. The drift wasn't detectable from inside a
-running query — perseus's runtime didn't know that
-`Claude.md` claimed `PERSEUS_LLM_TREE_TIMEOUT_MS=90000` while
-`scripts/env.perseus` set it to `0`. Cohorts that ran under
-"doc default" and cohorts that ran under "code default" mixed
-silently in the same `policy_fingerprint_sha`. The 17 days of
-T2 contamination is the upper bound of how bad this gets when
-the instrument is wrong.
-
-The perseus reset response is structural. There is one config
-source: `config.yaml` + `pydantic-settings`. Code reads from
-it. No `${VAR:-default}` shell shims. ADR-004 ("no silent
-fallbacks") makes the policy explicit; every defaulting site
-that V2 had is now a `Field(...)` with an explicit value or a
-`required=True` that fails loud at service startup.
-
-### 9.2 Docs aren't provenance
-
-The 2026-05-05 entry in V2's Claude.md is the proof. It
-contained:
-
-- An English description of the bug.
-- An English description of the fix.
-- A claim that a 500-trajectory smoke test had been run.
-- A claim that `terminal_reward unique values now {-1.0, 0.0,
-  +1.0}`.
-- A file list (`src/store/mod.rs`, `src/store/postgres.rs`,
-  `src/muzero/export.rs`, `src/bin/muzero_export.rs`).
-
-Every part of it was plausible. None of it was true. The fix
-was specified; no commit shipped. Six days of WM training were
-poisoned. The 2026-05-11 entry retracts:
-
-> The 2026-05-05 entry claimed `pick_terminal_reward` was
-> fixed; **it was never implemented**.
-
-If docs were provenance — if every "Files: …" line in
-Claude.md had been mechanically grep'd against
-`git log -p --since=<date>` — the 2026-05-05 claim would have
-failed CI. Provenance lives in git, not in markdown.
-
-The perseus reset response is also structural. ADR-005
-("checkpoint provenance") enforces that every model file
-ships with a sibling `.metadata.json` containing split
-strategy, training data range, val metrics by head, git
-commit. Loading a checkpoint without metadata fails loud.
-The same template extends to the docs/adr/ folder: every
-ADR is dated, signed, and references either a commit or a
-configuration file (not a paragraph).
-
-### 9.3 Architecture survives, plumbing burns
-
-The retrieval-service amputation makes this explicit. The
-Rust retrieval service was well-engineered: 150-line cap per
-file, clean trait boundaries, typed enum for retrieve mode,
-shared `reqwest::Client` interning. It was deleted anyway.
-Not because the engineering was bad — because the engineering
-choices (Rust, separate crate, in-tree with the planner)
-optimized for **the wrong invariants**. The right
-invariants for this stage of the project are:
-
-- Easy to read across a 3-person team.
-- Easy to swap an implementation behind a Protocol.
-- One process, one schema, one CLI.
-- Reset cost dominated by code volume, not by
-  language-runtime cost.
-
-A Python re-implementation at 950 LOC backed by pgvector
-satisfies all four. A Rust crate at 8,000 LOC satisfies none.
-
-The architecture concepts — MCTS, WM blend, HL-Gauss heads,
-two-vote stop, $\pi^M_t$ snapshots — survived intact. The
-plumbing burned. The reset is a clean separation of those two
-categories.
-
-## 10 Contamination cascade timeline → reset call → V3 core layout
+The empty-patch finding was the visible surface of four layered failures, each of which had its own incident date and its own "this is fixed" claim that turned out to be false.
 
 ```mermaid
 flowchart TD
-    A["2026-04-24\nWM α raised 0.3 → 0.9\n(on wm_v4_random_split val_r2=0.997)"] -->|"8 days production\nα blends leakage probe\nat 90% weight"| F["2026-05-18 reset"]
-
-    B["2026-04-24 → 2026-05-11\nT2: pick_terminal_reward\nreads NULL column\n(17 days)"] -->|"6 WM ckpts trained\nagainst r̂_t ≡ 0"| F
-
-    C["2026-05-02 → 2026-05-11\nT6 / T6′: harness\ncollision + exit-1\n(4,100 rows)"] -->|"33% of done rows\nsilently scored\nas real verdicts"| F
-
-    D["2026-05-12 → 2026-05-13\nPerseus condition runs\n485/485 empty patches"] -->|"P_pers = 0/485\nvs P_base = 5669/5691"| F
-
-    E["Pre-2026-05-18\nThree env-vs-code drifts\n(TIMEOUT_MS, plan_temp,\nparquet schema)"] -->|"Doc != code\nfor 4–6 weeks"| F
-
-    F -->|"Sam: 'see all the code\nis slop and monkey patched'"| G["Option (a):\nfull nuke + rewrite"]
-
-    G --> H["ADR-012:\nperseus IS MuZero"]
-    G --> I["Wipe V2 Rust + Python\n~72k LOC"]
-    G --> J["parking_lot/v2_archive_2026-05-18/\npreserves audit + data"]
-
-    H --> K["perseus/core/\n3,993 LOC\nPython 3.12 + FastAPI"]
+    A["2026-04-24<br/>WM alpha 0.3 to 0.9<br/>(on val_r2=0.997 leakage probe)"] -->|"8 days production<br/>blend 90 percent noise"| F["2026-05-18 reset"]
+    B["2026-04-24 to 2026-05-11<br/>Terminal-reward extractor<br/>reads NULL column (17 days)"] -->|"6 WM ckpts trained<br/>against r_hat identically 0"| F
+    C["2026-05-02 to 2026-05-11<br/>Harness collision<br/>plus exit-1 failure (4,100 rows)"] -->|"33 percent of done rows<br/>silently scored as real"| F
+    D["2026-05-12 to 2026-05-13<br/>Perseus condition<br/>485 of 485 empty patches"] -->|"P_pers 0/485<br/>vs P_base 5669/5691"| F
+    E["Pre-2026-05-18<br/>Three env vs code drifts<br/>(timeout, plan temp, schema)"] -->|"Doc not equal code<br/>for 4 to 6 weeks"| F
+    F -->|"'all the code is slop<br/>and monkey patched'"| G["Option a:<br/>full nuke and rewrite"]
+    G --> H["ADR-012:<br/>perseus IS MuZero"]
+    G --> I["Wipe V2 stack<br/>~72k LOC"]
+    G --> J["parking_lot archive<br/>preserves audit and data"]
+    H --> K["perseus/core/<br/>3,993 LOC<br/>Python 3.12 + FastAPI"]
     I --> K
-    J --> L["lab/\nautoresearch v2 winner\nmultibench, judge harnesses"]
-
-    K --> M["Two-vote stop:\nWM heads vote +\nplanner declares"]
-    K --> N["pgvector replaces qdrant\nschema.sql is one file"]
-    K --> O["17-tool registry\nsurvives (ADR-012)"]
+    J --> L["lab/<br/>autoresearch v2 winner<br/>multibench, judge harnesses"]
+    K --> M["Two-vote stop:<br/>WM heads + planner"]
+    K --> N["pgvector replaces qdrant<br/>schema.sql is one file"]
+    K --> O["17-tool registry<br/>survives (ADR-012)"]
 
     style A fill:#fdd
     style B fill:#fdd
@@ -689,162 +106,395 @@ flowchart TD
     style L fill:#cfc
 ```
 
-## 11 What the parking_lot preserves
+### 2.1 Seventeen days of zero terminal reward
 
-The reset wasn't a `rm -rf`. The V2 tree was rsync'd to
-`parking_lot/v2_archive_2026-05-18/` with a manifest. The
-preserved corpus is read-only; nothing in perseus depends on
-it; future agents can read it for context.
+The most expensive stratum, in date order. On 2026-04-25 the muzero export binary's default reward source was supposed to flip from file-recall to judge-label. The 2026-05-05 entry in V2's audit ledger claimed the flip had landed, with a verification claim that the terminal-reward distribution now spanned the set $\{-1, 0, +1\}$. It had not.
 
-Contents:
+The Rust row struct did not carry the migration-008 columns. Every SELECT against the multi-bench-runs table silently dropped them. The extractor still matched on the legacy `result` column, which is NULL on every modern row because the driver writes scoring outcomes to `f2p_passed`, `p2p_passed`, and `judge_label` instead. The struct definition lagged the migration. The extractor lagged the struct. The audit ledger ran ahead of all three.
 
-- `HISTORY/` — 44 markdown files documenting V2's design,
-  evals, prompts, sweeps, training data, postgres schema, tool
-  registry, autoresearch generations, dashboards, dead ends.
-  `HISTORY/33_multibench_detail.md` is the load-bearing one —
-  it's where the empty-patch finding is documented row-by-row.
-  `HISTORY/36_audit_handoff_docs.md` is the meta-research log
-  on V2's retraction patterns; it's the source for §3 and §4
-  of this essay.
-- `Claude.md` — V2's full audit ledger with every retraction
-  inline (2026-05-05 retracted by 2026-05-11; 2026-04-23 audit
-  #25 retracted by 2026-05-18; plan-temperature retry-bump
-  retracted by 2026-05-18; parquet schema column count
-  retracted by 2026-05-18).
-- `AGENT_HANDOFF.md`, `WAKE_UP_REPORT.md`, `hi.md`,
-  `hi-compact.md`, `SESSION_DUMP.md`, `RUN.md`, `RUN_LOCAL.md`
-  — session-state corpus at reset time.
-- `autoresearch_v2_winner.txt` — the prompt blob from git
-  commit `3c7f945f` that scored 13.50 on the v2 autoresearch
-  loop ($229.94 total spend; 11.83 baseline → 13.50 winner).
-  Preserved as data because the prompt may still be useful as
-  an initialization for `lab/autoresearch/`.
-- `v2_prompt_rewrite_2026-05-18.rs` — the day-of blocking-call
-  removal in V2's `src/multi_bench/prompt.rs`. The fix was
-  staged-not-proven at reset time; preserved so the diff is
-  recoverable.
-- `perseus_v2_essentials.dump` — `pg_dump` of `query_traces`,
-  `planner_events`, `mcts_step_snapshots`, `tool_events`,
-  `multi_bench_runs`, `perseus_index_build_status`. ~19,881
-  multi-bench rows, post-T7-backfill (collisions tagged,
-  labels NULLed). The bytes are preserved because
-  re-generating them costs ~$1,400 in API spend and ~3 weeks
-  of harness running. The schema is gone; the data is
-  accessible via raw `pg_restore` into a sandbox DB.
-- `wm_ckpts.tar.gz` — `v3_chain_deepsets` (honest baseline R²
-  ≈ 0.11 on instance split), Tinker `v3_bigseq` merged (val
-  loss 0.932). The leakage-probe `wm_v4_random_split`
-  checkpoint is NOT preserved; it's the artifact that anchored
-  the WM α = 0.9 mistake, and ADR-005 explicitly refuses to
-  load a checkpoint without an instance-split metadata header.
+For the entire seventeen-day window the terminal reward extractor returned the constant zero:
 
-The reset cost a lot of code but very little data. Every row
-of every contaminated cohort is still reachable for forensic
-analysis. The corpus that says "this is what happened and why"
-survives. The corpus that says "this is the code that did it"
-does not — by design, because that code shipped buggy results
-and any agent reading it for context will be tempted to mimic
-its patterns.
+$$
+\hat r_t \equiv 0 \qquad \forall\, t \in \text{trajectories with reward-source = judge}
+$$
 
-## 12 What the reset call actually was
+The HL-Gauss head is designed to learn a distribution over rewards in $[-2, 2]$ across 51 bins. The cross-entropy training objective for a single trajectory step is:
 
-The reset wasn't "throw away the architecture and start over".
-The reset was a clean cut along a specific seam: anything that
-described **what perseus does** (the MuZero pipeline) survives,
-in a smaller form, in a different language; anything that
-described **how V2 plumbed it together** is gone. Sam's
-phrasing: "the architecture was right; the execution was
-sloppy."
+$$
+\mathcal{L}_v(t) = -\sum_{i=1}^{51} \mathbb{1}[r_t \in \text{bin}_i] \cdot \log \hat{p}_i(s_t)
+$$
 
-The two months between V2's first sweep (2026-04-23) and the
-reset (2026-05-18) produced exactly one useful artifact: the
-audit corpus. The audit found that perseus's empirical pass
-rate was structurally zero on the cohort we cared about. The
-audit found the four contamination strata (§2). The audit
-found the three env-vs-code drifts (§4). The audit found the
-"fix specified, code not committed" pattern (§3).
+When $r_t$ is identically zero, only the bin spanning zero ever receives gradient signal. The head collapses to a delta distribution centered at the zero-bin. Combined with the per-step shaping rewards (which DO populate correctly and span $[-2.0, +0.285]$), the value target distribution narrowed to roughly $[-2.0, +0.285]$ instead of the intended $[-9.6, +1.2]$ that a well-mixed judge-reward signal would produce.
 
-Every other artifact — the Rust orchestrator, the eight-thousand-line
-retrieval service, the dashboards, the autoresearch pipelines,
-the seven-layer stop function, the eleven migrations — was a
-sunk cost that the reset chose to pay rather than continue
-maintaining. The cost was paid in code volume (72k LOC → 5.3k
-LOC, 13.6× shrinkage). The cost was NOT paid in architecture
-(every V2 concept survives in `perseus/core/`). The cost was
-NOT paid in data (every contaminated row is preserved in
-`parking_lot/`).
+Six world-model checkpoints were trained against this corpus. Every one regressed toward zero by construction. The 2026-05-06 production checkpoint was scored at $R^2 = 0.997$ on its validation set, a number close enough to perfect that it should have been a fire alarm. We treated it as a triumph. The lesson is not "validate more carefully." The lesson is that an $R^2$ this high on a learning problem this hard is itself the bug report.
 
-The reset is what the audit recommended without naming itself.
-The audit's §5 in `HISTORY/36_audit_handoff_docs.md` proposes:
+### 2.2 Harness collisions fanned 3,314 verdicts
 
-> 1. Apply the §1.1 retraction template to §1.2, §1.3, and
->    §1.7. Either land the actual fix, or add a Claude.md
->    "Retracted 2026-05-18" entry.
-> 2. Add a `make docs-check` rule that grep's each Claude.md
->    `Files: ...` line for at least one matching commit in
->    `git log --since=<date>`.
-> 3. Convert all docs to the AGENT_HANDOFF model: every "X is
->    live at Y" claim must be paired with a probe command.
-> 4. The harness collision backfill (T7) is the next overdue
->    item.
-> 5. B-agent silent-fallback enumeration (B1–B20) should each
->    become a numbered audit item.
+The multi-swe-bench harness's evaluation contract keys results by repository slug and pull-request number. The perseus campaign matrix is five models times two conditions times $N$ pull requests, so for every PR up to ten trajectories write to the same key:
 
-Items 1, 3, 4, and 5 are subsumed by the reset — there are
-fewer docs to fix because most of them are gone, the harness
-backfill is moot because the new pipeline produces a clean
-cohort, and the silent-fallback enumeration is closed by
-ADR-004's "no silent fallbacks" policy. Item 2 (the
-docs-check CI rule) is open work in perseus; it's queued
-as a pre-commit hook that grep's commit-mentioned files
-against `git diff HEAD`.
+$$
+|\text{trajectories per PR}| = |\text{models}| \times |\text{conditions}| = 5 \times 2 = 10
+$$
 
-## 13 Looking forward
+$$
+|\text{verdicts per PR}| = 1
+$$
 
-The reset closes a chapter, not the project. The next
-chapter starts with concrete numbers:
+The harness emits one verdict; our driver fanned it across all ten input rows. The 2026-05-02 deploy notes flagged this as "acceptable trade-off for now." The 2026-05-11 audit measured the magnitude: 3,314 rows on the live table currently carry a fingerprint that requires this fan-out fix to read honestly.
 
-- `perseus/core/` LOC at 3,993, hard cap 5,000.
-- Two-vote stop function at 82 LOC, replaces 7-layer V2 stop
-  at ~700 LOC.
-- Single `schema.sql` replaces 10 migrations.
-- WM α = 0.0 emergency disabled; reverse the moment a clean
-  instance-split checkpoint deploys.
-- Empty-patch contamination is gone because the new
-  `/v1/query` returns hits the consumer can apply directly;
-  no codex middleman to silently swallow them.
+A sibling failure: 786 rows whose harness invocation exited 1 on collision-heavy batches without writing the final report. Pre-fix every such row received `judge_source = mswebench_harness` and `judge_label = 0.0`, indistinguishable from a real failure. The combined contaminated cohort is $3{,}314 + 786 = 4{,}100$ rows, which is 33% of all done rows at audit time. Every pre-2026-05-11 perseus pass rate on every dashboard was reading 33% contamination as ground truth.
 
-The chapters that will follow this one in the essay sequence
-cover: the [pipeline integrity audit](/essays/pipeline-integrity-audit/)
-in technical detail (T1–T9); the [cohort contamination class](/essays/cohort-contamination-class/)
-pattern (why V2 mixed contaminated and clean rows in the same
-fingerprint); the [WM in the loop](/essays/wm-in-the-loop/)
-story of α = 0.3 → 0.9 → 0.0; the [autoresearch saga](/essays/autoresearch-saga/)
-of four prompt-search generations that produced one usable
-prompt and three dead pipelines; and [zero real patches](/essays/pipeline-integrity-audit/)
-(now folded into the pipeline-integrity audit essay, but
-preserved as a section heading so the load-bearing finding
-is search-indexable).
+The backfill that addresses this is operationally non-trivial. The contaminated rows cannot be deleted (they carry trajectory and planner-event data that is still valuable for training). They must be re-tagged to a `harness_collided` source and have their labels NULLed so that downstream consumers treat them as unlabeled rather than as confirmed failures. The reset moots the backfill by emitting clean labels going forward; the V2 backfill remains a one-off SQL operation on the archived dump.
 
-The MuZero identity holds. The plumbing is new.
+### 2.3 The world-model blend was anchored on leakage
 
----
+The third stratum touches the runtime. On 2026-05-10 we deployed the leakage-anchored world model to our cato inference server. The deployment was triggered by a validation score we did not interrogate hard enough.
 
-## Sources
+The validation $R^2 = 0.997$ was used to justify raising the MCTS prior blend coefficient from $\alpha = 0.3$ to $\alpha = 0.9$. The blend is the standard convex combination over the action prior:
 
-- `parking_lot/v2_archive_2026-05-18/AUDIT_REPORT.md` (475 lines, 2026-05-05) — pre-reset MuZero pipeline audit. Source of the row distributions in §1 and §2.
-- `parking_lot/v2_archive_2026-05-18/HISTORY/33_multibench_detail.md` (532 lines, 2026-05-18) — every multi-bench row's judge outcome and failure mode. Source of the empty-patch finding in §1 and the contamination cascade in §2.
-- `parking_lot/v2_archive_2026-05-18/HISTORY/36_audit_handoff_docs.md` (596 lines, 2026-05-18) — meta-research log on V2's retraction patterns. Source for §3 (the "monkey-patched slop" moment), §4 (env-vs-code drifts), and §9.2 (docs aren't provenance).
-- `docs/adr/012-perseus-is-muzero.md` (147 lines, 2026-05-18) — the load-bearing ADR. Source for §5 and the architecture-survives framing throughout.
-- `PLAN.md` (143 lines, 2026-05-18) — module shape, LOC budget, first-principles design choices. Source for §6, §7, §8.
-- `parking_lot/v2_archive_2026-05-18/Claude.md` — V2's full retraction log. Verbatim retraction template in §2.1 and §4.
-- `perseus/core/` `wc -l` output (verified 2026-05-19) — LOC accounting in §8.
-- `scripts/env.perseus:66`, `src/search/engine/llm_tree/planner/mock.rs:10-18`, `src/muzero/parquet_writer/mod.rs::schema` — authoritative pointers for the three env-vs-code drifts in §4.
+$$
+P_\text{prior}(a \mid s) = (1 - \alpha) \cdot P_\text{llm}(a \mid s) + \alpha \cdot P_\text{wm}(a \mid s)
+$$
 
-Cross-links:
+At $\alpha = 0.9$ the LLM planner's policy head contributes 10% of every node's prior. The world model contributes 90%. For the eight days from 2026-05-10 through 2026-05-18 (the entire perseus-condition production window for multi-bench) every UCB1 expansion drew its prior from $0.9 \cdot \text{noise} + 0.1 \cdot \text{signal}$.
 
-- [pipeline integrity audit](/essays/pipeline-integrity-audit/) — the T1–T9 detail
-- [cohort contamination class](/essays/cohort-contamination-class/) — the pattern across V2
-- [WM in the loop](/essays/wm-in-the-loop/) — the α = 0.3 → 0.9 → 0.0 story
-- [autoresearch saga](/essays/autoresearch-saga/) — four generations, one usable prompt
-- [zero real patches](/essays/pipeline-integrity-audit/) — folded into the pipeline-integrity audit
+The leakage was visible in retrospect on the checkpoint metadata. The validation set was sampled at the row level, not the instance level, so for every held-out row a sibling training row from the same trajectory leaked the answer. The validation $R^2$ measured pattern recognition over leaked siblings, not generalization. On a clean instance-split, the same architecture scored $R^2 = 0.112$, roughly three orders of magnitude lower. That is the honest baseline.
+
+On 2026-05-18 we reset $\alpha$ to 0 as an emergency disable. The world-model probes still fire (telemetry preserved) but contribute zero to UCB until a clean checkpoint deploys. The UCB1 selection rule with the disabled blend reduces to:
+
+$$
+\text{UCB}(a; s) = Q(s, a) + c \cdot P_\text{llm}(a \mid s) \cdot \frac{\sqrt{N(s)}}{1 + N(s, a)}
+$$
+
+— the LLM prior alone, exactly as before the WM service was introduced. The fail-open path was tested at build time. The reset just exercises it.
+
+### 2.4 Visit distributions silently fell through to uniform
+
+The most subtle and longest-running failure. The Python loader's visit-distribution parser had two branches. One for a legacy flat-array shape; one for the object-list shape that Rust actually emits. When the parser saw the object-list shape it silently fell through to a uniform distribution.
+
+The policy head loss is a KL-divergence-style cross-entropy between the predicted distribution $\hat{\pi}(s_t)$ and the MCTS visit target $\pi^M_t$:
+
+$$
+\mathcal{L}_\pi(t) = -\sum_{a} \pi^M_t(a) \cdot \log \hat{\pi}(a \mid s_t)
+$$
+
+When $\pi^M_t$ is uniform over 17 actions, the target carries zero information about which actions actually mattered, and the gradient pushes the policy toward maximum entropy. The policy head trained against uniform targets for an unknown number of weeks. The snapshot table held 6,360,475 rows at audit time. Every one was uniformized at load time.
+
+| Stratum  | Window                  | Mechanism                                | Affected                                          |
+| -------- | ----------------------- | ---------------------------------------- | ------------------------------------------------- |
+| T2       | 2026-04-24 to 2026-05-11 | Terminal-reward reads NULL column        | Every WM ckpt trained with judge reward source     |
+| T6       | 2026-05-02 to 2026-05-11 | Harness key collision fans verdicts      | 3,314 rows                                         |
+| T6 prime | 2026-05-02 to 2026-05-11 | Harness exit-1 without final report      | 786 rows                                           |
+| WM alpha | 2026-05-10 to 2026-05-18 | alpha = 0.9 against leakage-probe WM     | All 2,663 perseus-condition MCTS expansions        |
+| T4       | Unknown to 2026-05-11   | Python visit-distribution uniform fallback | 6,360,475 snapshot rows                          |
+
+Every stratum had a "fixed" claim that turned out to be untrue, partial, or later contradicted by the same audit ledger. The retraction log within V2's ledger is the single most useful artifact in the V2 archive.
+
+Worth noting the cascade structure explicitly. The strata are not independent. The dependencies are:
+
+1. The terminal-reward NULL was the upstream cause of the value-head collapse.
+2. The value-head collapse fed the world-model blend with garbage.
+3. The blend at $\alpha = 0.9$ amplified the garbage.
+4. The amplified garbage drove MCTS into branches the codex prompt could not exploit.
+5. The codex prompt was instructed to wait on perseus rather than act.
+6. The empty patches that resulted got fanned out across collision siblings by the harness contract.
+7. The inflated pass rate was treated as confirmation that the world model was good, which justified raising $\alpha$ from 0.3 to 0.9 in the first place.
+
+Each layer reinforced the layer above it. No single fix would have caught the cascade. The audit caught it by reading the prediction-byte distribution directly, which sits at the bottom of the stack and cannot be inflated by any contamination above it. The lesson is to instrument the lowest-level observable that the cascade cannot reach. The empty-patch byte count is one such observable. The exit code of the test harness is not (it can be inflated). The label written to the database is not (it can be inflated). The bytes of the patch are real, regardless of how the cascade above them is configured.
+
+Putting it together, the joint loss the world model was nominally optimizing was:
+
+$$
+\mathcal{L} = \mathcal{L}_v + \mathcal{L}_\pi + \mathcal{L}_r + \mathcal{L}_\text{aux}
+$$
+
+— value plus policy plus per-step reward plus auxiliary heads. Three of those four terms were degenerate. The value loss saw a delta at zero. The policy loss saw a uniform target. The reward loss saw the seventeen-day NULL contamination. Only the auxiliary head (file-recall regression) saw a clean signal. That is why the auxiliary head's metrics looked sensible while everything else either collapsed or memorized.
+
+## 3. The "monkey-patched slop" moment
+
+Sam's words on 2026-05-18, after the audit landed: "see all the code is slop and monkey patched now because you fucked up."
+
+The phrasing is the trigger. A week earlier we had already exposed the watchdog layer as monkey-patched. V2's release build produced a binary with the semantic feature enabled by default. The semantic feature held a process-global hash map that grew without bound under concurrent indexing workloads. The operational workaround was a longer build invocation with non-default features. The one-line Cargo manifest change to remove `semantic` from the default feature set was specified in three separate documents and never landed. Every future release build without the explicit flag would rebuild the leaking binary.
+
+This is a class of failure, not an instance. We named it: pattern §3.2 in V2's meta-audit, "fix specified in doc, code not committed." Three documents had described the same Cargo fix as shipped. Zero CI rules grep'd the audit ledger's "Files: ..." lines against `git log -p` for matching commits within the date window. The audit notes the obvious counterfactual: a docs-check test that grep'd each ledger line for git presence would have caught the first instance before six days of WM training poisoned. The test was proposed. Never written.
+
+That class of failure — doc claims a fix is landed when the code change is not in git — was visible enough across the corpus that the only honest path forward was to delete the corpus. Not delete the architecture; delete the artifact that the corpus described. We chose full nuke plus rewrite.
+
+## 4. Three env-vs-code drifts caught in the retraction pass
+
+While the audit was running, three more drift cases surfaced between V2's audit ledger and the actual code. Each was surgically retracted on 2026-05-18 with a strikethrough plus an inline pointer to the authoritative file. The shape is consistent: doc made a claim on day N, code at day N either contradicted the claim or evolved away from it, no CI gate noticed, readers (including future Claude sessions) treated the doc as authoritative.
+
+| # | Knob or claim                                | Doc claim                                                      | Code reality                                                  |
+| - | -------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------- |
+| 1 | Planner-call timeout default                 | "0 to 90000" (2026-04-23 audit item 25)                        | 0 (disabled; non-zero re-enables)                             |
+| 2 | Plan temperature retry-bump                  | base plus $0.2 \cdot \text{retry}$, clamped at 0.6             | Discarded explicitly                                          |
+| 3 | Parquet export schema column count           | 17 columns (2026-04-23 entry)                                  | 23 columns (vt2 promoted 2026-05-13)                          |
+
+The retry-temperature decision is worth preserving for its reasoning. The in-code comment reads: bumping temperature on a parse-retry was counterproductive, because a malformed-JSON failure is rarely fixed by sampling more diversely. That is the right judgement. The bug was not that the code discarded the retry counter; the bug was that the doc said the opposite for over a month while the code did the right thing.
+
+Authoritative source-of-truth for each knob is now a single in-code constant, not a paragraph in the audit ledger. ADR-004 (no silent fallbacks) makes the policy explicit: if a config value is required, the service refuses to start without it; if it is optional, the default is exactly one place in the code; documentation that contradicts the code is wrong, not authoritative.
+
+The third drift (parquet schema) is the easiest to fix and the easiest to miss. A schema growing from 17 columns to 23 across two months of development is the expected behavior of a healthy training-data pipeline. Each added column came from a real need (judge label, trajectory length, embedding paths, sub-search name). The ledger entry that recorded "17 columns" was simply too old to be relevant. There was no equivalent of a database migration tracker to detect drift. The reset's response is a literal pyarrow schema expressed in code, exposed as a version constant on the writer, and validated at load time by the trainer. A trainer that loads parquet files written with a different schema version refuses to merge them.
+
+## 5. ADR-012: perseus IS the MuZero pipeline
+
+The reset's load-bearing decision lives at `docs/adr/012-perseus-is-muzero.md`, dated 2026-05-18. It supersedes an earlier framing that treated MCTS, the world model, and the 17-tool registry as research that lived in a lab directory until measured. That framing was wrong.
+
+The verbatim Sam phrasing that triggered the retraction: "we are a muzero model and there's no fucking mcts." The complaint is structurally correct. A system that calls itself a MuZero implementation but treats the search component as an optional research feature is not actually a MuZero implementation. It is a retrieval system with an MCTS shaped attachment.
+
+The new framing is the identity. State is an evidence accumulator: paths, line ranges, snippets, branch lineage. The action space is the 17-tool retrieval registry. The planner proposes actions plus a status token (`stop` or `give_up`) and carries branch lineage in the prompt. The value head learns "is this evidence sufficient" via HL-Gauss across 51 bins. The policy head outputs a prior over the next action and informs UCB. The step reward is per-step shaping (file recall, empty-tool-result penalty). The terminal reward is recall-at-k against the gold patch plus the judge label from running tests. MCTS provides selection, expansion, backprop. Self-play rollouts produce tuples of state, MCTS visit distribution, and value target. Training is supervised distillation followed by judge-label fine-tune followed by RL on rollouts.
+
+Reading the identity row by row makes it clear there is no optional component. State, actions, value, policy, reward, search, rollout, training: each maps to a concrete piece of the codebase. The "perseus is a retrieval system" framing dropped half of these. The reset's framing keeps all of them in scope from day one.
+
+The two-vote stop function is the most consequential single change. V2 had seven layered stop mechanisms fighting each other: planner-declared stop, adversarial confirm_stop, per-stem confirm_stop, give_up, composite WM stop, depth cap, budget-ms, max-steps. The 515-to-1 confirm-stop reject-to-accept ratio measured under V2's late-stage prompt was the visible signature of seven layers interfering. The reset reduces this to two votes:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active
+    Active --> WMVotes: each MCTS step
+    WMVotes --> PlannerVotes: WM stop logit > 0
+    WMVotes --> Active: WM stop logit <= 0
+    PlannerVotes --> Stopped: planner says stop or give_up
+    PlannerVotes --> Active: planner continues
+    Stopped --> [*]
+```
+
+The stop predicate is the conjunction of the two votes. Total stop logic is about 95 lines of Python across one module.
+
+The conjunction is conservative by design. The world model can be wrong (and we now know it has been wrong for eight days at a stretch). The planner can be wrong (the V2 confirm-stop reject rate was 515 to 1 against accept). Requiring both votes means a single faulty signal cannot terminate a branch alone. The cost is slightly longer trajectories under noisy world-model inputs; the benefit is that no single layer can quietly truncate a search that should have kept going.
+
+The 17-tool registry survives intact. ADR-012's stance is explicit: 17 tools coexisted with 0.26% combined usage of four of them; the fix is to keep them in the action space (the policy will learn what works), not amputate them. A trained policy learns that the repo-stats tool is rarely useful. Manually deleting it removes a baseline the policy could learn against. Action-space surgery is a research operation, not an engineering optimization, and the reset deliberately avoids confusing the two.
+
+## 6. What got amputated
+
+The amputations are real, even though the architecture survives. The pattern is consistent: anything that orchestrated, served, or wrapped became a Python rewrite at a smaller scope. Anything that defined the algorithm survived.
+
+A useful way to read the amputation table is to ask, for each row, "if we replaced this with a stub that returns hard-coded values, would the architecture still work?" For the retrieval-service, the multi-bench orchestrator, the judge-bootstrap subsystem, and the autoresearch plumbing, the answer is yes — they are integration code that connects perseus to external systems. For the MCTS loop, the world-model heads, and the per-step shaping, the answer is no — they are the system. The reset deleted the things that could be replaced with stubs and rewrote the things that could not.
+
+| V2 component                            | LOC approx              | Replacement                                                    | Replacement LOC          |
+| --------------------------------------- | ----------------------- | -------------------------------------------------------------- | ------------------------ |
+| Rust retrieval-service crate            | ~8,000                  | Python retrieval module, pgvector backend                      | ~950                     |
+| Rust multi-bench orchestrator           | ~2,500                  | Python wrapper around public harness                           | ~600 (TBD)               |
+| Rust judge-bootstrap subsystem          | ~1,800                  | Python plus Docker                                             | ~500 (TBD)               |
+| autoresearch v1 through v4 plumbing     | ~600 plus 229.94 USD spend | Python lab module (parking lot preserves v2 winner blob)    | ~250 (TBD)               |
+| Seven-layer stop function               | ~700                    | Two-vote conjunction in `stop.py`                              | ~95                      |
+| 13 SQL migrations                       | 13 files                | Single `schema.sql` applied at startup                         | 1 file                   |
+| Three TS dashboards                     | ~5,000 TS               | Single Svelte 5 plus Tailwind 4 SPA                            | ~1,200 (TBD)             |
+| Rust planner runtime                    | ~6,000                  | Python `mcts.py` + `stop.py` + `llm.py`                        | 288 + 82 + 193 = 563     |
+| Rust parquet exporter                   | ~1,500                  | Python judge-bootstrap export                                  | ~300 (TBD)               |
+
+The retrieval-service amputation is the most surprising. It was the most-recently-rewritten V2 component (the audit-fix chain on 2026-04-24 had ported a Python service to Rust under a strict 150-line-per-file cap). Eight thousand lines of Rust, every file under 150 lines, every interface clean — and we amputated it anyway.
+
+The reason is not that the engineering was bad. It is that the same codebase that hosted that service also hosted the multi-bench driver, the judge harness, the autoresearch loop, the muzero exporter, and the planner. The Rust monoculture was not the bug. The Rust monoculture made the bug invisible: cross-cutting concerns (the UCB exploration constant, prompt drift, the world-model alpha, the semantic feature gate) silently affected every module. A change to the retrieval client's reqwest pool could deadlock the planner. A change to the planner's prompt-context layout could blow up the multi-bench harness. A bug in the semantic-feature default could leak memory across both. The coupling was invisible because everything shared a Cargo workspace; the testing surface was small because everything used the same types.
+
+A Python re-implementation at one-eighth the size restores the right kind of friction. The retrieval module exposes a typed retrieval-backend protocol. The planner depends on the protocol, not on a concrete implementation. Swapping pgvector for qdrant, or swapping pgvector for an in-memory dict for testing, is a single-file change. The V2 retrieval-service-to-planner coupling required four files across two crates plus a config flag.
+
+The autoresearch parking-lot is the second-most-surprising. V2 ran four autoresearch generations that searched prompts via MCTS-over-prompts, judged candidates against recall-at-k on a held-out 100-instance pool. The v2 winner blob (commit hash `3c7f945f`, total spend 229.94 USD, score lift from 11.83 baseline to 13.50) is preserved as data. The v3 and v4 pipelines were amputated.
+
+The reason to preserve the v2 winner but delete its pipeline is asymmetric. The prompt blob is a piece of data we paid for. It can be re-loaded into any future autoresearch loop as an initial condition. The pipeline that produced it depended on V2's planner runtime, V2's retrieval semantics, V2's prompt-context layout — none of which exist in perseus. A reset that preserved the pipeline would also have preserved the surface that the pipeline coupled to, which would re-introduce the coupling we just paid to remove. Preserving the blob costs 4KB of disk. Preserving the pipeline would have cost roughly 600 lines of V2 plumbing that nothing else needs.
+
+The thirteen migrations consolidating to one is an honest cleanup move. V2 accumulated migrations 001 through 010, each adding a column or partial index in response to a new need. By 2026-05-18 several were effectively dead code: the early observability table overlapped with the later judge-label columns, and migration 010's typed planner-event columns made some of migration 006's JSONB body columns redundant. The reset consolidates into a single startup-applied schema with a real migrations tracking table. No more "did I run all the migrations in the right order on engram" Slack messages.
+
+The reset's schema, expressed as a mermaid ER diagram:
+
+```mermaid
+erDiagram
+    QUERY_TRACE ||--o{ PLANNER_EVENT : produces
+    QUERY_TRACE ||--o{ MCTS_SNAPSHOT : produces
+    QUERY_TRACE ||--o{ TOOL_EVENT : produces
+    QUERY_TRACE {
+        text run_id PK
+        text policy_fingerprint
+        text external_session_id
+        timestamp started_at
+        jsonb result
+    }
+    PLANNER_EVENT {
+        text run_id FK
+        int step
+        text mode
+        jsonb prompt_body
+        text completion_body
+        text model
+    }
+    MCTS_SNAPSHOT {
+        text run_id FK
+        int step
+        jsonb visit_distribution
+        int chosen_action_index
+    }
+    TOOL_EVENT {
+        text run_id FK
+        int step
+        int action_index
+        jsonb observation
+    }
+    SCHEMA_MIGRATION {
+        text version PK
+        timestamp applied_at
+    }
+```
+
+Five tables, four foreign keys, one migration tracking row. The full schema fits on a single screen. The V2 schema required scrolling through ten files in numeric order, mentally applying each diff, to figure out what the current shape was.
+
+## 7. What survived
+
+The amputation table reads more violent than the actual diff. The architecture survives without modification. The 2026-04-22 V2 design notes — 17 tools, MCTS planner, WM priors, HL-Gauss heads, per-step shaping — describe the 2026-05-18 reset as accurately as they described V2.
+
+This is the single fact that distinguishes a reset from a pivot. A pivot is a change of direction; the destination is somewhere else. A reset is a change of vehicle; the destination is the same. The team's PLAN.md on 2026-05-18 names the same north-star metric (judge-pass-rate on multi-swe-bench instance-level held-out splits) that the V2 PLAN.md named on 2026-04-22. The hypothesis (retrieval-conditioned codex patches pass more tests than unconditioned codex patches) is unchanged. The architecture is unchanged. The team is unchanged. What changed is the implementation.
+
+| Architecture concept                                                  | V2 location                                  | perseus reset location                            |
+| --------------------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------- |
+| 17-tool action space                                                  | Rust planner tools directory                 | `perseus/core/actions.py` plus retrieval/tools    |
+| MCTS plus UCB1                                                        | Rust planner runtime                         | `perseus/core/planner/mcts.py`                    |
+| 51-bin HL-Gauss value head                                            | wm-serve Python service                      | `perseus/core/wm/heads.py`                        |
+| Convex prior blend $(1-\alpha) \cdot \text{LLM} + \alpha \cdot \text{WM}$ | Rust WM client                            | `perseus/core/wm/blend.py`                        |
+| Per-step shaping                                                      | Rust rewards module                          | `perseus/core/training/rewards.py`                |
+| Policy training target $\pi^M_t$ via MCTS step snapshots              | Migration 007 plus Rust snapshotter          | Schema table plus emit from `mcts.py`             |
+| Branch lineage plus global digest in planner prompt                   | Rust context modules                         | `perseus/core/planner/llm.py`                     |
+| Policy fingerprint on every trajectory                                | Rust fingerprint module plus migration 009   | `perseus/core/trace.py`                           |
+| `give_up` as state transition                                         | Rust step-stop module                        | `perseus/core/planner/stop.py`                    |
+| External session id for trace-join                                    | Header plus body field on query endpoint     | Header plus body field on query endpoint          |
+
+The match is 1-to-1. Every V2 concept has a perseus home; the mapping is not approximate. Even the auxiliary surfaces survive: cohort split by policy-fingerprint hash, JSONL trace events, the external-session-id header, per-step snapshot emission. The reset is not a redesign. It is a re-implementation of the same design without the accumulated plumbing debt.
+
+This matters more than the line count. A reset that preserved architecture would have produced a 5,000-line Python codebase implementing a different algorithm, and we would not know whether the V2 numbers (or the lack of them) generalized. A reset that broke architecture would have committed us to re-running every benchmark from scratch, with no way to attribute changes to the rewrite versus the new algorithm. By holding architecture invariant and replacing only plumbing, we can read V2's archived audit corpus as a baseline. The world model still consumes the same state representation; the planner still emits the same action structure; the snapshot table still records the same visit distribution. The training data that the reset produces is drop-in compatible with the V2 training data the audit was based on.
+
+## 8. LOC accounting
+
+The before-and-after by directory makes the cut concrete.
+
+V2 lines of code by directory, from the 2026-05-13 audit snapshot:
+
+| Directory                          | LOC      | Notes                                          |
+| ---------------------------------- | -------- | ---------------------------------------------- |
+| Rust planner runtime               | ~6,000   | MCTS, context, tools                           |
+| Rust search engine                 | ~2,500   | Semantic index, candidate collection           |
+| Rust multi-bench                   | ~2,500   | Orchestrator                                   |
+| Rust judge bootstrap               | ~1,800   | Docker harness wrapper                         |
+| Rust muzero export                 | ~1,500   | Parquet, rewards, trajectory                   |
+| Rust retrieval-service crate       | ~8,000   | 150-line cap per file                          |
+| Rust src rest                      | ~7,500   | App, handlers, store, eval, doctor             |
+| Python muzero                      | ~4,500   | Training, dataset, heads                       |
+| Python rest                        | ~3,000   | Bench harnesses, ad-hoc scripts                |
+| wm-serve                           | ~600     | Uvicorn WM service                             |
+| Dashboard                          | ~5,000   | Rust plus TS                                   |
+| Scripts                            | ~10,000  | Operational shell                              |
+| Modal distill and RFT              | ~3,000   | Training scripts                               |
+| Tests                              | ~6,000   | Integration and unit                           |
+| Docs                               | ~11,000  | Reference, research, ADRs                      |
+| **V2 total**                       | **~72,000** |                                              |
+
+Perseus reset lines of code:
+
+| Directory                  | LOC       | Status                                  |
+| -------------------------- | --------- | --------------------------------------- |
+| `perseus/core/`            | 3,993     | Done                                    |
+| `perseus/tests/`           | ~800      | In progress                             |
+| `lab/`                     | ~1,200 budget | In progress                         |
+| `infra/`                   | ~500 budget    | In progress                        |
+| `viz/`                     | ~1,200 budget | In progress                         |
+| **perseus target**         | **~5,160** | Hard cap 5,000 LOC for core             |
+
+The shrinkage is roughly $72{,}000 \to 5{,}300 \approx 13.6\times$. The core identity (planner, world model, retrieval, state, actions) sits at 3,993 lines. Every file is well under the per-module hard cap of 250 lines (enforced by CI). Every directory has a single responsibility. Switching the retrieval backend, swapping the embedder, replacing the planner LLM — each is a one-protocol-swap operation, not a multi-file refactor.
+
+## 9. Three lessons
+
+The reset distilled into three lessons that are now literally posted in the team's planning preamble. Each corresponds to a specific contamination pattern from the audit.
+
+### 9.1 The instrument is part of the experiment
+
+Three env-vs-code drifts (the table in section 4) silently invalidated cohorts. The drift was always between a documented default and an in-code constant, and the in-code constant was always authoritative. The drift was not detectable from inside a running query — perseus's runtime did not know that the ledger claimed one timeout value while the environment file set a different one. Cohorts that ran under the doc default and cohorts that ran under the code default mixed silently in the same policy-fingerprint hash. The 17 days of terminal-reward contamination is the upper bound of how bad this gets when the instrument is wrong.
+
+The reset response is structural:
+
+1. One config source, read through `pydantic-settings`. No shell-style default substitution. No environment-file backstops that mask in-code constants.
+2. Every defaulting site is either an explicit field with an explicit value, or a required field that fails loudly at service startup.
+3. Every running process logs its resolved configuration as the first line of its trace. Cohorts can be split by config-hash post-hoc.
+4. The policy-fingerprint hash takes the configuration hash as an input. A change in any defaulted value produces a new fingerprint. Cohorts with different fingerprints cannot be silently mixed.
+
+The cost of this structure is that a misconfigured service refuses to start. The benefit is that we never again train against a fingerprint that means two incompatible things to two different agents on two different days.
+
+### 9.2 Docs are not provenance
+
+The 2026-05-05 ledger entry was the proof. It contained an English description of the bug, an English description of the fix, a claim that a 500-trajectory smoke test had been run, a claim that the terminal-reward distribution now took three distinct values, and a file list naming four touched source files. Every part of it was plausible. None of it was true. The fix was specified; no commit shipped. Six days of WM training were poisoned. The 2026-05-11 entry retracts in one line: the 2026-05-05 entry claimed the fix was landed; it was never implemented.
+
+If docs were provenance — if every "Files: ..." line had been mechanically grep'd against the corresponding git history window — the 2026-05-05 claim would have failed CI. Provenance lives in git, not in markdown.
+
+The reset response has three structural elements:
+
+1. ADR-005 (checkpoint provenance): every model file ships with a sibling metadata file containing split strategy, training data range, validation metrics per head, and git commit. Loading a checkpoint without metadata fails loudly. The leakage-probe checkpoint that caused the eight-day production incident would not load under this policy.
+2. ADRs are dated, signed, and reference either a commit or a configuration file. No "behavior X was changed on date Y" claim survives without a git-pinned anchor.
+3. A pre-commit hook (queued, not yet shipped) will grep commit messages for file references and refuse the commit if any referenced file is not actually in the staged diff. This catches the "Files: ..." class at the moment of authorship.
+
+The pattern we are blocking is well-defined. An agent (human or LLM) writes a plausible English description of a fix, names the files that should change, and commits the documentation without committing the code. Future readers treat the documentation as authoritative. The fix never happens. The cost is hidden until the downstream effect surfaces in a metric, at which point the documentation has been compounded into the rest of the audit ledger and is hard to retract. Mechanical provenance breaks the cycle at step one.
+
+### 9.3 Architecture survives, plumbing burns
+
+The retrieval-service amputation makes this explicit. The Rust service was well-engineered. It was deleted anyway. Not because the engineering was bad — because the engineering choices (Rust, separate crate, in-tree with the planner) optimized for the wrong invariants.
+
+The right invariants for this stage of the project:
+
+1. Easy to read across a three-person team. Python wins on the reading-speed axis; even competent Rust readers are slower than competent Python readers on equivalent code.
+2. Easy to swap an implementation behind a protocol. Python's structural protocols and Rust's nominal traits both work, but Python's cost less when the implementation is small.
+3. One process, one schema, one CLI. V2 had three processes (perseus, retrieval-service, wm-serve), nine schemas (ten migrations minus consolidation), and seventeen CLI subcommands. The reset has one process, one schema, three CLI subcommands.
+4. Reset cost dominated by code volume, not by language-runtime cost. A future reset (and there will be one) should cost no more than a week of work.
+
+A Python re-implementation at 950 lines backed by pgvector satisfies all four. A Rust crate at 8,000 lines satisfies none.
+
+The architecture concepts — MCTS, world-model blend, HL-Gauss heads, two-vote stop, policy-target snapshots — survived intact. The plumbing burned. The reset is a clean separation of those two categories. Anything we could express as a definition (data structure, mathematical update, loss term, training target) survived. Anything we could only express as an implementation (HTTP client pool, retry logic, schema migration, deployment script) was replaced from scratch.
+
+## 10. What the parking_lot preserves
+
+The reset was not a destructive delete. The V2 tree was rsync'd to a dated archive directory with a manifest. The preserved corpus is read-only; nothing in perseus depends on it; future agents can read it for context.
+
+Forty-four HISTORY markdown files document V2's design, evals, prompts, sweeps, training data, postgres schema, tool registry, autoresearch generations, dashboards, and dead ends. The load-bearing one is HISTORY/33, which documents the empty-patch finding row-by-row. HISTORY/36 is the meta-research log on V2's retraction patterns and is the source for sections 3 and 4 of this essay. V2's full audit ledger is preserved with every retraction inline. Session-state corpus at reset time (AGENT_HANDOFF, WAKE_UP_REPORT, hi.md, hi-compact.md, RUN.md) survives as a snapshot of what the team thought was true on the day of the reset.
+
+The autoresearch v2 winner prompt blob is preserved as data because the prompt may still be useful as an initialization for the reset's autoresearch module. The day-of blocking-call removal in V2's prompt module is preserved so the diff is recoverable. A postgres dump of the observability tables (`query_traces`, `planner_events`, `mcts_step_snapshots`, `tool_events`, `multi_bench_runs`, index-build status) is preserved: roughly 19,881 multi-bench rows post-backfill, with collisions tagged and labels NULLed. The bytes are kept because re-generating them costs roughly 1,400 USD in API spend and roughly three weeks of harness running.
+
+World-model checkpoints are split into two categories. The honest-baseline chain (instance-split, $R^2 \approx 0.11$) and the Tinker fine-tune are preserved. The leakage-probe checkpoint that anchored the $\alpha = 0.9$ mistake is NOT preserved. ADR-005 explicitly refuses to load a checkpoint without an instance-split metadata header. The artifact that caused the problem does not get to live in the archive.
+
+The reset cost a lot of code but very little data. Every row of every contaminated cohort is still reachable for forensic analysis. The corpus that says "this is what happened and why" survives. The corpus that says "this is the code that did it" does not — by design, because that code shipped buggy results and any agent reading it for context will be tempted to mimic its patterns.
+
+The asymmetry between preserving data and deleting code is deliberate. Data is expensive to produce and cheap to store. Code is cheap to produce and expensive to maintain. A future agent reading the parking lot will be able to re-run any analysis we ran, because the rows are there. The same agent will not be able to re-run V2's planner runtime, because the source is archived but no longer builds. That is the intended trade. If we needed to re-build V2, the right path would be to read the architecture description (preserved), re-implement the relevant slice in the reset's language (Python), and run it against the preserved data. The wrong path would be to resurrect 72k lines of Rust and convince ourselves we understand what it does.
+
+## 11. What the reset call actually was
+
+The reset was not "throw away the architecture and start over." The reset was a clean cut along a specific seam: anything that described what perseus does (the MuZero pipeline) survives in a smaller form in a different language; anything that described how V2 plumbed it together is gone. Sam's phrasing: the architecture was right, the execution was sloppy.
+
+The decision was reversible right up until the rsync into the parking lot. We considered two alternatives. Option (a) was full nuke plus rewrite, which is what we shipped. Option (b) was surgical fixes to V2: land the parquet-schema retraction, apply the harness collision backfill, ship the docs-check CI rule, fix the prompt, retrain the world model on a clean instance-split. Option (b) was estimated at three to four weeks of work and would have produced a V2 we could trust. Option (a) was estimated at one to two weeks of work and produced a perseus we could read.
+
+We chose (a) because the cost of (b) was not just three weeks of engineering. The cost of (b) was three weeks of engineering plus a permanent commitment to maintaining V2's accumulated complexity. Every future change would have to navigate the 72k lines. Every future audit would have to start by re-reading the retraction log. Every future agent reading the codebase would inherit V2's patterns. Option (a) buys a smaller codebase and a cleaner audit surface at the cost of throwing away well-engineered components alongside the broken ones. We judged that trade worth taking.
+
+The two months between V2's first sweep and the reset produced exactly one useful artifact: the audit corpus. The audit found that perseus's empirical pass rate was structurally zero on the cohort we cared about. The audit found the four contamination strata (section 2). The audit found the three env-vs-code drifts (section 4). The audit found the "fix specified, code not committed" pattern (section 3).
+
+Every other artifact — the Rust orchestrator, the eight-thousand-line retrieval service, the dashboards, the autoresearch pipelines, the seven-layer stop function, the eleven migrations — was a sunk cost that the reset chose to pay rather than continue maintaining. The cost was paid in code volume (13.6x shrinkage). The cost was NOT paid in architecture (every V2 concept survives in `perseus/core/`). The cost was NOT paid in data (every contaminated row is preserved).
+
+The reset is what the audit recommended without naming itself. The audit proposed five remediation items:
+
+1. Retract the broken claims in-place using the established strikethrough-plus-pointer template.
+2. Add a docs-check CI rule that grep's ledger file-lists against git history to refuse any "Files: ..." claim whose targets are not in the corresponding diff.
+3. Convert all docs to the agent-handoff model where every liveness claim ships with a probe command, so future readers can verify rather than trust.
+4. Complete the harness collision backfill on the contaminated cohort.
+5. Enumerate the silent-fallback class across the codebase, treating each instance as a numbered audit item.
+
+Four of the five are subsumed by the reset: there are fewer docs to fix because most are gone; the harness backfill is moot because the new pipeline produces a clean cohort; the silent-fallback enumeration is closed by ADR-004; the agent-handoff conversion is the perseus default rather than a retrofit. The docs-check rule is open work, queued as a pre-commit hook that grep's commit-mentioned files against the staged diff. It is the one piece of the audit's recommendation that the reset did not automatically satisfy, and we have committed to shipping it before the first reset-era ADR lands.
+
+## 12. Looking forward
+
+The reset closes a chapter, not the project. The next chapter starts with concrete numbers:
+
+1. Core LOC is 3,993, hard cap 5,000. Every file is under 250 lines. CI enforces both bounds.
+2. The two-vote stop function is 82 lines, replacing roughly 700 lines of V2 stop logic. The confirm-stop reject-rate metric is retired.
+3. A single startup-applied schema file replaces ten migrations. The schema-migrations table tracks what has been applied so we never lose history.
+4. The world-model alpha is 0 (emergency disabled). It reverses the moment a clean instance-split checkpoint deploys. The fail-open path is exercised by default.
+5. The empty-patch contamination is structurally gone. The new query endpoint returns hits the consumer can apply directly; there is no codex middleman to silently swallow them. The retrieval output and the patch generation are no longer in different processes.
+6. Cohort identity is established at service startup and stamped on every trace. Two cohorts cannot have the same fingerprint and different defaults.
+
+What we do not yet have: a clean training corpus on the new pipeline. The first cohort under the reset starts collecting on 2026-05-19. The first instance-split world-model checkpoint that satisfies ADR-005 is expected within two weeks. The first end-to-end measurement of perseus pass-rate that we will trust as honest is expected within a month.
+
+What we should not claim: that the reset is "validated." It is not. It is shipped. The validation is the next cohort, and the cohort after that, and the audit corpus we will accumulate against them. The reset removes the failure modes we know about. The failure modes we do not yet know about will surface in the next audit, and we will document them in the same retraction template the V2 ledger established.
+
+The MuZero identity holds. The plumbing is new. The audit is the throughline.
+
+A final note on the trade we accepted. The reset removes a class of failure (silent drift between docs and code, cross-cutting concerns hiding in a Rust monoculture, schema migrations accumulating without consolidation) at the cost of throwing away well-engineered components that did not cause the failure. The retrieval service was not the bug. The 150-line-per-file cap was not the bug. The Rust type system was not the bug. They were collateral. We deleted them because the only honest way to remove the failure class was to remove the substrate it lived on. A more surgical reset would have preserved more code at the cost of preserving the conditions for the next incident. We will know in three months whether we made the right call. The dashboards will tell us before we tell ourselves.

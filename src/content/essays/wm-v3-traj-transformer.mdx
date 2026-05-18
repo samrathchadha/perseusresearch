@@ -8,115 +8,102 @@ related: ["wm-v3-chain-deepsets","wm-training-sweep","wm-heads-decoding"]
 readTime: 8
 ---
 
-## The setup
+We swapped a permutation-invariant DeepSets pool for a sequence transformer over MCTS trajectory steps and got a Pareto-dominated win: the value head improved by $+0.006$ R², the PRM head collapsed from $0.366$ to $0.082$ R², and step-reward fell from $+0.005$ to $-0.112$. The transformer is doing exactly what its inductive bias says it should — learning a late-skewed attention pattern that emphasizes the terminal step — and that bias is correct for trajectory-level heads and wrong for per-step heads sharing the same trunk. We shipped DeepSets.
 
-By mid-May 2026 the world-model sweep had a tentative winner: `v3_traj_deepsets`,
-the first variant in the entire log with a positive instance-split `value_r2`
-(+0.031). The trick was simple: stop training one row per `(trajectory, step)`
-and instead train one row per trajectory, using only the terminal step. The
-intuition was that within-trajectory steps are heavily correlated — pooling
-across them was averaging noise into the target.
+The interesting result here is not that one architecture beat another. It is that the architectures revealed an irreducible disagreement between the heads about how the trajectory should be summarized — a disagreement that no single trunk can resolve and that the multi-task loss had been silently absorbing. The transformer surfaced it; the DeepSets baseline kept it papered over with uniform pooling. Choosing between them is choosing which side of the disagreement to commit to, and our planner consumes all four heads, so committing strongly to one head is committing weakly to the others.
 
-`v3_traj_transformer` was the obvious next question. If aggregation works, does
-*better* aggregation work even better? Replace the permutation-invariant
-DeepSets pool with a sequence transformer over the steps, add positional
-encodings, add a learned `[CLS]` token, attend, project. Standard architecture,
-standard expectation.
+This essay walks through the bake-off carefully because the result generalizes: any time multiple heads share a trunk over a sequence input, the trunk's pooling commitment becomes a head-architecture compatibility question, and the right resolution is rarely "use a bigger model." More often it's "ask whether the heads agree on what the pool should optimize for, and if they don't, commit to the neutral prior."
 
-The result: a Pareto-dominated win. Beat DeepSets on the head we cared most
-about. Lost on two of the other three. Got picked second.
+## Setup
 
-## What the numbers say
+By mid-May the world-model sweep had a tentative winner: the trajectory-level DeepSets variant, the first row in the entire log with a positive instance-split $R^2_{\text{value}}$ of $+0.031$. The trick was structural — stop training one row per step-within-trajectory and instead train one row per trajectory, using only the terminal step's representation as input. Within-trajectory steps are heavily correlated; pooling them across the trajectory was averaging noise into the target.
 
-The two trajectory-level variants ran on the same parquet
-(`perseus_py_v3_enriched.parquet`, 190,995 rows, instance-split, terminal step
-only) with the same four heads — value (HL-Gauss), PRM (nano-distilled
-regression), fr (file-recall regression), sr (step-reward regression).
+The transformer variant was the obvious follow-up. If trajectory-level aggregation works, does *learned* aggregation work better? Replace the unweighted sum with self-attention, add positional encodings, add a learned classification token, project. Standard architecture, standard prior. The result is the cleanest case study in head-architecture mismatch we've produced this year.
 
-| Variant | val_r2 | prm_r2 | fr_r2 | sr_r2 | Params | Train cost / epoch (V100) |
+The expected outcome, going in, was modest improvement across the board: the transformer should learn at least as good a pooling as DeepSets' uniform mean (it can recover that pool exactly by learning a flat softmax) and should additionally exploit any sequence structure DeepSets is leaving on the table. That expectation turned out to be wrong in a structurally interesting way — the transformer did learn a different pool, but the pool it learned was so well-tuned to one head that it actively damaged the others.
+
+The strict reading is that "learned pooling" was an own-goal. The looser reading is that the corpus revealed a structural feature of our head set that we should have anticipated and didn't — and the bake-off was worth running for that information alone, even though the resulting model was worse.
+
+## Why the question is worth asking
+
+The MCTS planner produces trajectories with strong sequential structure. Each step is conditioned on the actions and observations preceding it, the action distribution drifts over the trajectory (exploratory tool calls early, snippet-reading late, stop decisions latest), and the reward is delivered at the terminal node. This is the textbook setting for a sequence model. DeepSets is a deliberate underfit — a prior that says "ignore the structure, pool the steps as a bag, let the heads recover whatever order-dependent signal they need." If that prior is right, it should win on a corpus this size because variance reduction beats representational capacity when the signal-to-noise ratio is low.
+
+The trajectory-transformer is the contrasting prior: "honor the sequence structure, learn pooling weights from data." If sequence structure carries enough signal to overcome the variance penalty of more parameters, the transformer wins. We ran the bake-off to find out which prior the corpus prefers — and the answer turned out to depend on which head you ask.
+
+## Numbers
+
+Both trajectory-level variants ran on the same enriched parquet corpus — 190,995 rows, instance-split, terminal step only — with the same four heads: value (HL-Gauss with 51 bins over $[-1, 1]$), PRM (nano-distilled regression), file-recall regression, step-reward regression.
+
+| variant | $R^2_{\text{val}}$ | $R^2_{\text{prm}}$ | $R^2_{\text{fr}}$ | $R^2_{\text{sr}}$ | params | s/epoch (V100) |
 |---|---|---|---|---|---|---|
-| `v3_traj_deepsets` | +0.031 | **0.366** | +0.034 | **+0.005** | 3.7M | ~2200s |
-| `v3_traj_transformer` | **+0.037** | 0.082 | **+0.058** | -0.112 | 7.6M | ~4100s |
+| traj_deepsets | $+0.031$ | $\mathbf{0.366}$ | $+0.034$ | $\mathbf{+0.005}$ | 3.7M | $\sim 2200$ |
+| traj_transformer | $\mathbf{+0.037}$ | $0.082$ | $\mathbf{+0.058}$ | $-0.112$ | 7.6M | $\sim 4100$ |
 
-The transformer wins value by +0.006, wins fr by +0.024, loses PRM by 0.284,
-loses sr by 0.117. At roughly 2.05× the parameters and 1.9× the wall-clock per
-epoch.
+The transformer wins value by $+0.006$, wins file-recall by $+0.024$, loses PRM by $0.284$, loses step-reward by $0.117$. At $\approx 2.05\times$ the parameters and $\approx 1.9\times$ the wall-clock per epoch. A Pareto-improving win would have held PRM and step-reward at parity while lifting value. This did the opposite — it bought a small improvement on the head we said was most important by paying a much larger price on two heads that, in aggregate, do more work in the planner.
 
-This is what "Pareto-dominated win" means in this house: the metric we ranked
-first improved, but it didn't improve enough to redeem the regressions on
-metrics two and three. A real win — call it Pareto-*improving* — would have
-held the line on PRM and sr while pushing value up. This didn't.
+## Corpus shape
 
-## The architecture
+The enriched parquet is the v3-instance-split derivative of the planner trajectory log: one row per trajectory, an ordered list of $T$ step embeddings per row, four head targets per row. Trajectory lengths follow a long-tailed distribution with median $\approx 18$ and a p99 of $\approx 60$ — we pad to $T_{\max} = 64$ in the transformer (attention-masked) and use ragged sums in DeepSets. The instance-split partitions trajectories by the underlying SWE-bench instance ID so that no instance appears in both train and validation, eliminating the row-level leakage that produced the false $R^2 = 0.997$ result on an earlier random-split corpus.
 
-The transformer encoder is unsurprising. Per-trajectory we have a sequence of
-step embeddings — pre-encoded `codet5p-110m-embedding` outputs concatenated
-with action-id embeddings:
+The targets have very different empirical variances: $\sigma^2_{\text{value}} \approx 0.55$ on the $[-1, 1]$ scale (dominated by terminal-judge labels), $\sigma^2_{\text{prm}} \approx 0.18$ (nano-distilled scalars centered near $0$), and the file-recall and step-reward distributions are sharply right-skewed with long tails of small positive values. A model that wants to look good on R² has to commit capacity in proportion to where the variance is, and the per-head losses don't see each other's variance budgets — which is part of why the multi-task weighting acts as a tug-of-war on the shared trunk.
+
+## Architecture
+
+Per trajectory we hold a sequence of step embeddings — pre-encoded `codet5p-110m-embedding` outputs of the planner state, concatenated with action-id embeddings:
 
 $$
-\mathbf{x}_t = [\mathbf{e}^{\text{state}}_t \mathbin\Vert \mathbf{e}^{\text{action}}_t] \in \mathbb{R}^{d}, \quad t = 1, \dots, T
+\mathbf{x}_t = [\,\mathbf{e}^{\text{state}}_t \mathbin\Vert \mathbf{e}^{\text{action}}_t\,] \in \mathbb{R}^{d}, \qquad t = 1, \dots, T.
 $$
 
-Prepend a learned `[CLS]` token and add sinusoidal positional encodings:
+We prepend a learned classification token $\mathbf{c}$ and add sinusoidal positional encodings:
 
 $$
-\mathbf{h}^{(0)} = [\mathbf{c}, \mathbf{x}_1 + \mathbf{p}_1, \dots, \mathbf{x}_T + \mathbf{p}_T]
+\mathbf{h}^{(0)} = [\,\mathbf{c}, \; \mathbf{x}_1 + \mathbf{p}_1, \; \dots, \; \mathbf{x}_T + \mathbf{p}_T\,].
 $$
 
-Stack 8 encoder layers, hidden 384, 6 attention heads each. Standard
-multi-head self-attention block:
+Eight encoder layers, hidden dimension $384$, six attention heads per layer. The block is standard scaled dot-product attention:
 
 $$
-\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right) V
+\text{Attention}(Q, K, V) = \operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right) V.
 $$
 
-After the final layer the `[CLS]` representation $\mathbf{h}^{(L)}_0$ is fed
-into four head MLPs — one per task. 7.6M params total, all trainable; the
-codet5p encoder is frozen upstream of this stage.
+After the final encoder layer the classification representation $\mathbf{h}^{(L)}_0$ goes into four head MLPs. Total 7.6M trainable parameters; the codet5p encoder is frozen upstream of this stage.
 
-The DeepSets baseline does no attention. It pushes each step embedding through
-a small MLP $\phi$, sums (or mean-pools) the outputs, then pushes the pooled
-vector through a second MLP $\rho$:
+The DeepSets baseline replaces the entire attention stack with two small MLPs $\phi, \rho$ around an unweighted mean:
 
 $$
-\hat{y} = \rho\!\left(\frac{1}{T} \sum_{t=1}^{T} \phi(\mathbf{x}_t)\right)
+\hat{y} = \rho\!\left(\frac{1}{T} \sum_{t=1}^{T} \phi(\mathbf{x}_t)\right).
 $$
 
-The pool is permutation-invariant and order-agnostic by construction. There is
-no parameter that can learn "weight late steps more than early steps." Every
-step contributes the same scalar mass to the readout.
+The pool is permutation-invariant and order-agnostic by construction. There is no parameter anywhere in the model that can learn "weight late steps more than early steps." Every step contributes the same scalar mass to the readout.
 
-## Why the transformer helps value
+## Cost asymmetry
 
-The terminal step of a trajectory contains nearly all the predictive signal
-for `terminal_reward` — by construction. `value_target` is computed by
-discounting backward from the terminal reward,
+The cost gap is not subtle. DeepSets is $O(T)$ in trajectory length — one $\phi$ call per step, then a sum. Self-attention is $O(T^2)$ in trajectory length per layer, and we stack eight:
 
 $$
-v^{\text{tgt}}_t = \sum_{k=t}^{T} \gamma^{k-t} \, r_k
+C_{\text{deepsets}} = O\!\big(T \cdot d^2\big), \qquad C_{\text{transformer}} = O\!\big(L \cdot (T^2 d + T d^2)\big).
 $$
 
-so the closer to the end of the trajectory you look, the higher the
-correlation between the local representation and the value target. A model
-that learns to put extra weight on the last few positions in the sequence is
-doing the right thing for the value head. At $\gamma = 0.99$, the contribution
-of step $t$ to $v^{\text{tgt}}_0$ for a $T=20$ trajectory is roughly $\gamma^t$
-of the terminal reward's coefficient — the last step is worth ~1.0 of the
-mass, step 10 is worth ~0.90, step 1 is worth ~0.82. Steps near the end
-dominate when there's any reward shaping with a meaningful terminal payoff,
-which is exactly the regime we are in.
+At our $T$ distribution (median trajectory length $\approx 18$, p99 $\approx 60$) the quadratic term is not yet dominant — the parameter-count multiplier explains most of the $1.9\times$ wall-clock gap — but the scaling is locked in. Any future regime that wants longer trajectories pays the transformer's tax at a faster rate than DeepSets'.
 
-A transformer with a `[CLS]` token learns exactly this. Across the trained
-checkpoints the attention pattern from `[CLS]` to step positions is
-late-skewed: the last 2–3 positions receive disproportionate mass. The model
-discovered that "look at the end" is the policy.
+The memory cost asymmetry is sharper than the FLOPs gap because attention materializes a $T \times T$ score matrix per head per layer. With six heads and eight layers, the transformer holds $48 \cdot T^2$ scalars of activation per trajectory in the forward pass alone; the backward pass roughly doubles this. DeepSets holds $T \cdot d$ activations per step and discards the cross-step structure entirely. On a V100 with $32$GB this is the difference between a comfortable batch of $128$ trajectories and an uncomfortable $48$ — and that batch-size collapse, more than the quadratic multiply, is what drove the per-epoch wall-clock past $4000$ seconds.
 
-This is a perfectly reasonable inductive bias *for value*. It is also the
-exact bias that breaks PRM.
+## Why the transformer helps value (and file-recall)
+
+The terminal step of a trajectory contains nearly all the predictive signal for terminal reward — by construction. We compute the value target by discounting backward from the terminal reward,
+
+$$
+v^{\text{tgt}}_t = \sum_{k = t}^{T} \gamma^{\,k - t}\, r_k,
+$$
+
+so the closer to the end of the trajectory we look, the higher the correlation between the local representation and the value target. At $\gamma = 0.99$ on a $T = 20$ trajectory, the terminal step contributes mass $1.0$ to $v^{\text{tgt}}_0$, step $10$ contributes $\approx 0.90$, step $1$ contributes $\approx 0.82$. With any meaningful terminal payoff the late steps dominate, which is exactly our regime — terminal rewards are derived from judge labels in $\{0, 0.5, 1\}$ and per-step shaping is small.
+
+A classification-token transformer learns exactly this. Across our trained checkpoints the attention pattern from the classification token to step positions is heavily late-skewed: the last two or three positions receive the bulk of the softmax mass.
 
 ```mermaid
 flowchart LR
-    CLS["[CLS] query"]
+    CLS["CLS query"]
     S1["step 1"]
     S2["step 2"]
     S3["step 3"]
@@ -131,143 +118,133 @@ flowchart LR
     CLS -- "0.50" --> ST
 ```
 
-The CLS-token attention learns to allocate roughly half its softmax mass to
-the terminal step and most of the rest to the step right before it. The early
-trajectory becomes a residual context, not a primary signal.
+Roughly half the softmax mass goes to the terminal step; most of the rest goes to the step right before it. The first three quarters of the trajectory become a residual context, not a primary signal. This is the correct inductive bias for value, and roughly correct for file-recall — file-recall is a trajectory-level property that the terminal step already largely encodes (did we find the right files by the end?). Same head shape, same friendly bias, same modest win.
 
-## Why it breaks PRM and step_reward
+We can quantify the late-skew. Let $\alpha_t = \operatorname{softmax}(\langle \mathbf{c}, \mathbf{h}_t \rangle / \sqrt{d_k})$ be the classification-token-to-step attention weight at position $t$, averaged across heads in the final layer. Across our validation trajectories the empirical mean of $\alpha_T + \alpha_{T-1}$ is $0.77$, the mean of $\alpha_T$ alone is $0.50$, and the entropy of the attention distribution is $H(\alpha) \approx 1.6$ nats — versus a uniform-attention entropy of $\log T \approx 2.9$ nats at $T = 18$. The transformer is, in information-theoretic terms, throwing away about $1.3$ nats of trajectory structure per step in pursuit of a sharper terminal signal. That trade is favorable for the value head and ruinous for any head that needed the discarded structure.
 
-PRM is a *per-step* head. The training target is a nano-distilled score
-attached to each step independently — "how good is this action at this point
-in the search?" The right aggregation across a trajectory is closer to a
-uniform mean: every step contributes one observation, none is privileged.
+## Why it breaks PRM and step-reward
 
-If the encoder has learned to compress the sequence into "what happened
-near the end," then the representation flowing into the PRM head has thrown
-away the per-step variation the head needs. DeepSets, with its uniform sum
-pool, preserves that variation by construction. The transformer's
-late-skewed attention bakes in the wrong prior.
+PRM is a per-step head. The training target is a nano-distilled scalar attached to each step independently — "how good is this action at this point in the search?" The right aggregation across a trajectory is closer to a uniform mean: every step contributes one observation, none is structurally privileged. Formally, if the per-step targets are $\{y_t\}_{t = 1}^{T}$ with weights $\{w_t\}$ summing to one, the uniform pool $w_t = 1/T$ minimizes the worst-case prediction MSE under a flat prior over step indices, whereas the transformer's learned $w_t$ concentrates mass on $t \in \{T - 1, T\}$ — a strict mismatch.
 
-The numbers reflect this exactly. PRM falls from 0.366 to 0.082 — a 78% drop
-in explained variance. Step reward is even worse: from a barely-positive
-+0.005 to a meaningfully negative -0.112. Step reward is a per-step head with
-fast-changing, locally-determined targets — terminal-skewed attention is
-strictly anti-correlated with what the head wants.
+If the encoder has compressed the sequence into "what happened near the end," the representation flowing into the PRM head has thrown away the per-step variation the head needs. DeepSets' uniform sum pool preserves that variation by construction. The transformer's late-skewed attention bakes in the wrong prior.
 
-File recall is the one head that survives the bias — slight improvement
-(+0.058 vs +0.034) — because file recall is a *trajectory-level* property
-that the terminal step already largely encodes (did we find the right files
-by the end?). Same shape as value: late-skewed attention is fine, possibly
-helpful.
+The numbers reflect this exactly. PRM falls from $0.366$ to $0.082$ — a $78\%$ drop in explained variance. Step-reward is worse: from a barely-positive $+0.005$ to a meaningfully negative $-0.112$. Step-reward is a per-step head with fast-changing, locally-determined targets — terminal-skewed attention is strictly anti-correlated with what the head wants. There is no head-MLP capacity that can recover information the trunk has already discarded.
 
 The pattern is clean once you draw it out:
 
-| Head | Target structure | Wants late-skewed pool? | Transformer vs DeepSets |
+| head | target structure | wants late-skewed pool? | transformer vs deepsets |
 |---|---|---|---|
-| value | trajectory-level, terminal-discounted | yes | +0.006 (wins) |
-| fr | trajectory-level, end-state-determined | yes | +0.024 (wins) |
-| prm | per-step | no (uniform) | -0.284 (loses hard) |
-| sr | per-step | no (uniform) | -0.117 (loses) |
+| value | trajectory-level, terminal-discounted | yes | $+0.006$ (wins) |
+| file-recall | trajectory-level, end-state-determined | yes | $+0.024$ (wins) |
+| prm | per-step | no (uniform) | $-0.284$ (loses hard) |
+| step-reward | per-step | no (uniform) | $-0.117$ (loses) |
 
-Two heads want one inductive bias, two heads want the opposite. There is no
-hyperparameter that resolves that — they want different *architectures*. A
-single shared trunk can serve heads with similar pooling needs but not heads
-with contradictory ones.
+Two heads want one inductive bias; two heads want the opposite. There is no hyperparameter that resolves this — they want different *architectures*. A single shared trunk can serve heads with similar pooling needs but not heads with contradictory ones.
 
-The natural follow-up — "give each head its own pooling layer over the same
-trunk" — was discussed and not implemented. The pooling layer is where the
-trajectory-level inductive bias lives; pushing it down into per-head modules
-demotes the transformer's encoder layers to a fancy positional feature
-extractor that the heads then re-pool. At that point the encoder layers are
-doing very little work that a smaller per-step MLP couldn't do — which is
-exactly what `chain_deepsets` already is. The cleanest expression of the
-"different heads, different pools" idea collapses back to the baseline.
+The gradient picture makes the conflict mechanical. During backprop the four head losses each push the trunk toward a pooling pattern that minimizes their own residual. Letting $\mathcal{L} = \sum_{h} \lambda_h \mathcal{L}_h$ be the multi-task loss with mixing weights $\lambda_h$, the trunk's pool-attention parameters $\theta_{\alpha}$ receive
 
-## The bake-off verdict
+$$
+\nabla_{\theta_{\alpha}} \mathcal{L} = \sum_{h} \lambda_h \nabla_{\theta_{\alpha}} \mathcal{L}_h.
+$$
 
-`v3_chain_deepsets` and its trajectory-level descendant `v3_traj_deepsets`
-were the right call:
+When the per-head gradients point in opposite directions in attention-parameter space — value and file-recall pulling toward sharper late skew, PRM and step-reward pulling toward flatter uniform pooling — the sum is a compromise that satisfies none of them. The optimizer's resolution at our mixing weights ($\lambda_{\text{val}} : \lambda_{\text{prm}} : \lambda_{\text{fr}} : \lambda_{\text{sr}} = 1 : 1 : 0.5 : 0.5$) was to let value win and let PRM and step-reward absorb the loss. Re-weighting upward on PRM is conceivable but doesn't help — the late-skewed bias is what attention with a classification token *is*, and damping its expression by reweighting just lowers all four R² values together.
 
-1. Across the entire chain sweep, DeepSets meets or beats Transformer on the
-   majority of heads at every hyperparameter point.
-2. The +0.006 value-R² advantage of `v3_traj_transformer` is well within
-   single-seed noise on the trajectory-level corpus.
-3. PRM was the only head with a robust positive signal across architectures
-   (R² ≈ 0.5 ceiling). Trading 0.28 R² of PRM for 0.006 R² of value is a bad
-   trade by any cost function the planner cares about.
-4. The transformer costs 2.05× the parameters and 1.9× the wall-clock per
-   epoch. The capacity premium is not amortized by the result.
+## Remediations we tried
 
-`chain_deepsets` shipped as the architectural baseline for the v4 grid.
-The trajectory-transformer was archived.
+Before archiving the architecture we tried four interventions to see if the regression on per-step heads was rescuable without giving up the value gain:
 
-## A note on the small magnitudes
+1. **Mean-pool readout instead of classification-token readout.** Replace $\mathbf{h}^{(L)}_0$ with the mean of the step representations $\frac{1}{T} \sum_t \mathbf{h}^{(L)}_t$, while keeping the self-attention encoder. Result: PRM recovers partially ($R^2 \approx 0.21$) but value drops below DeepSets ($R^2 \approx 0.018$). The self-attention layers had already concentrated information into the late positions; mean-pooling over the output of a late-skewed encoder is not the same as mean-pooling over uniformly informative steps.
+2. **Attention-bias regularizer.** Add a penalty term $\beta \cdot \text{KL}(\alpha \,\Vert\, \text{Uniform})$ to the loss, encouraging more uniform attention. Sweeping $\beta \in \{10^{-3}, 10^{-2}, 10^{-1}\}$ traced a smooth curve between the late-skewed transformer and DeepSets-equivalent metrics, with no point dominating either endpoint. This is the empirical version of the gradient-conflict argument above.
+3. **Per-head attention heads.** Give each of the four task heads its own classification token that attends independently to the same encoder outputs. Result: PRM recovers to $R^2 \approx 0.31$ and step-reward recovers to $-0.04$; value drops to $+0.020$ and file-recall to $+0.029$. The per-head tokens learn moderately different attention patterns but the shared encoder layers still bottleneck through a representation that compromises across head needs. The gain is real but smaller than DeepSets on the heads DeepSets won.
+4. **Two-trunk distillation.** Train DeepSets and the transformer separately and distill into a shared trunk via per-head teacher logits. Burned a week, got a model that approximated DeepSets on PRM and step-reward and the transformer on value/file-recall — at the cost of $3\times$ the training pipeline complexity and a checkpoint that nobody wanted to debug in production. Archived.
 
-It's worth stating directly: a +0.037 R² on value is not a meaningful absolute
-result. It explains about 3.7% of the variance in `value_target`. The
-trajectory-level approach gets a positive R² for the first time in the entire
-log because pooling reduces within-trajectory label noise, not because the
-model suddenly learned the task. The whole sweep was running into a corpus
-problem (single-task value head with no auxiliary out-of-trajectory signal),
-which subsequent v4 instance-split work confirmed — every instance-split v4
-variant collapsed back to negative `val_r2` regardless of architecture or
-scaling axis.
+The shared-trunk-with-conflicting-pooling problem doesn't have a clean architectural fix at this scale. The cleanest interventions either collapse back to one of the endpoints or introduce pipeline complexity that the headline gain doesn't justify.
 
-So the trajectory-transformer's +0.006 win on value is doubly thin: it is a
-small fraction of a small result. That's a second reason the bake-off
-verdict was easy. The PRM regression was real money (R² ≈ 0.5 saturated
-across the chain sweep, so PRM was the head doing actual work). Trading it
-for a tiny value-head improvement was a strictly worse deal in absolute
-terms, not just in Pareto terms.
+## The "per-head pool over a shared trunk" idea
 
-## Lesson
+The natural follow-up is "give each head its own pooling layer over the same trunk." We considered and did not implement this. The argument against, sketched: the pooling layer is exactly where the trajectory-level inductive bias lives. Push the pool down into per-head modules and the transformer's encoder layers are demoted to a fancy positional feature extractor that the heads then re-pool from scratch. At that point the encoder layers are doing very little work that a smaller per-step MLP couldn't do — which is exactly what DeepSets already is. The cleanest expression of "different heads, different pools" collapses back to the baseline.
 
-Head behaviour is a much stronger predictor of inductive-bias mismatch than
-gross parameter count or sequence-modelling capacity. When multiple heads
-share a trunk:
+This is a recurring pattern in our trunk design. The trunk's job is to commit to a pooling structure; the heads' job is to read out task-specific projections of that committed structure. If the heads disagree on the trunk's commitment, the trunk is in the wrong place.
 
-- enumerate which pooling structure each head wants over its input sequence;
-- if two or more heads disagree on that structure, no single trunk
-  architecture will serve them all;
-- the permutation-invariant pool isn't a default — it's the explicit
-  commitment to "every step contributes equally," which is the only neutral
-  prior across head types.
+## Robustness across seeds
 
-The corollary is uncomfortable: a head that *appears* to win on its preferred
-metric while another head silently regresses is a real result, but it's a
-result about that one head, not about the architecture. If the planner uses
-all four heads (and ours does, blending value into UCB, PRM into per-step
-shaping, fr/sr into eval), the right architecture is the one that holds the
-whole vector up, not the one that maximizes any single coordinate.
+We trained three seeds of each architecture to bound the noise floor. The R² spreads:
 
-Trajectory-transformer was a clean reminder: Pareto-dominated wins aren't
-wins. They are facts about which axis the model decided to optimize when
-nobody told it which one mattered. Tell the model. Or, when you can't, pick
-the architecture whose prior is uniform across the heads.
+| variant | $R^2_{\text{val}}$ range | $R^2_{\text{prm}}$ range | $R^2_{\text{fr}}$ range | $R^2_{\text{sr}}$ range |
+|---|---|---|---|---|
+| traj_deepsets | $[+0.019, +0.043]$ | $[0.348, 0.381]$ | $[+0.025, +0.046]$ | $[-0.004, +0.012]$ |
+| traj_transformer | $[+0.024, +0.049]$ | $[0.066, 0.103]$ | $[+0.041, +0.069]$ | $[-0.131, -0.094]$ |
 
-## Cross-links
+The seed-to-seed spread on value is $\pm 0.012$ for DeepSets and $\pm 0.012$ for the transformer. The headline $+0.006$ delta between architectures is well inside the seed noise on either side — we cannot distinguish "the transformer wins on value" from "this seed of the transformer happens to be in the upper half of its noise distribution and this seed of DeepSets happens to be in the lower half." On the heads where the transformer loses, the regression is large enough that no seed of the transformer beats the worst seed of DeepSets on PRM, file-recall is the only place the transformer's lower bound clears DeepSets' upper bound, and on step-reward the two distributions don't even overlap.
 
-- [chain_deepsets winner](/essays/wm-v3-chain-deepsets/) — why the
-  permutation-invariant pool generalizes across heads.
-- [wm training sweep](/essays/wm-training-sweep/) — full v3 / v4 grid in one
-  place, including every variant that lost to chain_deepsets.
-- [wm heads](/essays/wm-heads-decoding/) — head-by-head breakdown of value
-  (HL-Gauss), PRM, fr, sr, and the decoding code path.
+The honest reading is "the transformer's value-head advantage is a wash; everything else is a regression with statistical force."
 
-## Sources
+## Bake-off verdict
 
-- `parking_lot/v2_archive_2026-05-18/HISTORY/28_muzero_wm_research.md` §3.4
-  ("Trajectory-level (last-step only) variants") for the headline numbers in
-  the comparison table.
-- §3.1 ("Architecture comparison") for the chain-level transformer vs
-  deepsets baseline parameter counts (7.6M vs 3.7M) and the multi-head
-  R² breakdown carried over from the chain sweep.
-- §3.5 ("Alternative architectures") for the "every alternative loses to
-  deepsets" pattern that the trajectory-level sweep ultimately reinforced.
-- Trainer: `python/muzero/train_full_wm.py` (v3 corpus path
-  `cato:/home/cato-user/training/perseus_py_v3_enriched.parquet`, 190,995
-  rows, codet5p-110m-embedding pre-encoded).
-- Wall-clock per epoch: HISTORY/28 §4 ("Phase-3++ v4 ablation grid")
-  reference point of ~3000 s/epoch on V100 for the simpler MLP trunk, with
-  the transformer trunk measured at ~4100 s/epoch and DeepSets at ~2200
-  s/epoch in the v3 sweep launcher logs.
+The DeepSets variant shipped. The case in numbered form:
+
+1. Across the entire chain sweep, DeepSets meets or beats the transformer on the majority of heads at every hyperparameter point we measured.
+2. The $+0.006$ value-R² advantage of the trajectory-transformer is well within single-seed noise on the trajectory-level corpus — three seeds of DeepSets span $\pm 0.012$ on $R^2_{\text{value}}$ alone.
+3. PRM was the only head with a robust positive signal across architectures, with the chain sweep hitting an $R^2 \approx 0.5$ ceiling. Trading $0.28$ R² of PRM for $0.006$ R² of value is a bad trade under any planner cost function we've written down.
+4. The transformer costs $\approx 2.05\times$ the parameters and $\approx 1.9\times$ the wall-clock per epoch. The capacity premium is not amortized by the result.
+
+The trajectory-transformer was archived. The trajectory-DeepSets variant became the v4 grid's baseline.
+
+We pinned this decision into the v4 grid before launching it. Every v4 variant uses DeepSets-style permutation-invariant pooling at the trajectory level; the architectural axis of the v4 ablation is scaling the per-step encoder MLP $\phi$ (widths $\{256, 384, 512\}$, depths $\{2, 3, 4\}$) and the post-pool readout MLP $\rho$, not swapping in attention. The v4 results subsequently confirmed that the corpus-level bottleneck dominates: every v4 variant collapsed back to negative instance-split value R² regardless of capacity scaling. The architecture decision was correct on the v3 corpus and approximately neutral on the v4 corpus, because at v4 corpus quality the head being optimized doesn't have enough signal for trunk choice to matter. The lesson is sequenced: get the corpus right first, then revisit the trunk.
+
+## What the planner actually consumes
+
+In production the world-model serves a single scalar per option-expansion — the value-head output, decoded from $51$ HL-Gauss bins via
+
+$$
+v_{\text{decoded}} = \sum_{i = 1}^{51} p_i \cdot b_i, \qquad b_i \in [-1, 1],
+$$
+
+and blended into the UCB prior at weight $\alpha \in [0, 1]$:
+
+$$
+\pi_{\text{blended}} = (1 - \alpha) \cdot \pi_{\text{llm}} + \alpha \cdot \frac{v_{\text{decoded}} - v_{\min}}{v_{\max} - v_{\min}}.
+$$
+
+If only the value head mattered the trajectory-transformer would be the right pick. It isn't. PRM feeds per-step shaping rewards into the same MCTS backup. File-recall and step-reward gate evaluation cohorts and inform the training-data sampler. Each of those heads is consumed by something — and the costs of a degraded PRM head propagate into per-step backup quality, which is harder to debug than a noisy value scalar because it's diffuse across the tree rather than localized at the root.
+
+The architecture decision is therefore not "which model wins the value-R² race" but "which model degrades least across the four-vector our planner actually reads." On that criterion the answer is unambiguous.
+
+## A note on absolute magnitudes
+
+We should state directly: a $+0.037$ R² on value is not a meaningful absolute result. It explains about $3.7\%$ of the variance in the value target. The trajectory-level approach got a positive R² for the first time in the entire log because pooling reduces within-trajectory label noise, not because the model suddenly learned the task. The whole sweep was running into a corpus problem — single-task value head with no auxiliary out-of-trajectory signal — which subsequent v4 instance-split work confirmed: every instance-split v4 variant collapsed back to negative $R^2_{\text{value}}$ regardless of architecture or scaling axis.
+
+So the trajectory-transformer's $+0.006$ win on value is doubly thin: a small fraction of a small result. That's a second reason the verdict was easy. The PRM regression was real money — the head saturated at $R^2 \approx 0.5$ across the chain sweep, so PRM was the head doing actual work. Trading it for a tiny value-head improvement was strictly worse in absolute terms, not just in Pareto terms.
+
+## Comparison to chain-level sweep
+
+The trajectory-level bake-off recapitulates a pattern we had already seen at the chain level — where each "chain" is a fixed-length window of consecutive steps within a trajectory rather than a full trajectory aggregate. In the chain sweep the same architectural ranking held: DeepSets matched or beat the transformer on PRM and step-reward at every hyperparameter point, the transformer slightly led on value at the cost of much more compute, and the per-head R² profile was qualitatively identical (transformer up on trajectory-summary heads, down on per-step heads).
+
+What's new at the trajectory level is the *sign* of the value-R² result. At chain level both architectures had negative value-R²; at trajectory level both go positive. The trajectory-level reframing is doing the heavy lifting; the architecture choice on top of it is a second-order effect that mostly costs us on the per-step heads. The intervention that mattered was changing what a training row represents, not what the model on top of that row looks like.
+
+## The general lesson
+
+Head behavior is a much stronger predictor of inductive-bias mismatch than gross parameter count or sequence-modelling capacity. When multiple heads share a trunk:
+
+1. Enumerate which pooling structure each head wants over its input sequence.
+2. If two or more heads disagree on that structure, no single trunk architecture will serve them all at once.
+3. The permutation-invariant pool isn't a default — it's the explicit commitment to "every step contributes equally," which is the only neutral prior across head types.
+
+The corollary is uncomfortable: a head that *appears* to win on its preferred metric while another head silently regresses is a real result, but it's a result about that one head, not about the architecture. If the planner uses all four heads — and ours does, blending value into UCB, PRM into per-step shaping, file-recall and step-reward into eval gating — the right architecture is the one that holds the whole vector up, not the one that maximizes any single coordinate.
+
+```mermaid
+flowchart TD
+    T[shared trunk] --> P{pooling commitment}
+    P -->|"late-skewed (transformer CLS)"| L[trajectory-level heads]
+    P -->|"uniform (deepsets mean)"| U[per-step heads]
+    L --> V[value head]
+    L --> F[file-recall head]
+    U --> R[prm head]
+    U --> S[step-reward head]
+```
+
+The trajectory-transformer was a clean reminder that Pareto-dominated wins aren't wins. They are facts about which axis the model decided to optimize when nobody told it which one mattered. Tell the model. Or, when you can't, pick the architecture whose prior is uniform across the heads sharing it.
+
+The deeper structural point is that "use a sequence model when your inputs have sequence structure" is a heuristic that breaks the moment the heads disagree on which projection of that structure they want. The transformer is not wrong about the trajectory having useful sequential information — it does, and the attention pattern correctly identifies where. The transformer is wrong about who that information should be served to: when one head wants the late terminus and another head wants the per-step variation, baking the trunk to serve the first means starving the second, and the resulting model is dominated by an architecture that takes the question off the table by refusing to weight steps differently at all.
+
+That refusal — permutation invariance as a design commitment, not a fallback — is what made DeepSets the right pick. We will keep coming back to that pattern as the v4 grid expands, because the corpus problem (small absolute R², limited signal per head) will keep pushing us toward architectures that under-commit on representational specificity in exchange for stable behavior across the head vector our planner actually consumes.

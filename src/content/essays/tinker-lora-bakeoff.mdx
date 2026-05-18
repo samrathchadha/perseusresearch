@@ -3,413 +3,368 @@ title: "Tinker LoRA bake-off: r128 / bigseq / superclean / r256_short"
 date: 2026-05-18
 status: published
 tier: planner
-summary: "Four variants probing rank × seq-length × data-quality × rank-cap. bigseq won on val_loss (0.932) but never deployed. r256_short rejected at Tinker's rank-128 API cap. r128 mid-pack. superclean matched r128 at half compute. Eight rules for sweeps without graduation pipelines."
+summary: "Four variants probing rank x seq-length x data-quality x rank-cap. bigseq won on val_loss (0.932) but never deployed. r256_short rejected at Tinker's rank-128 API cap. r128 mid-pack. superclean matched r128 at half compute. Eight rules for sweeps without graduation pipelines."
 related: ["llama-32-1b-tinker-planner","tinker-3-epoch-ultra","planner-base-bakeoff"]
 readTime: 10
 ---
 
-## The shape of the experiment
+## Thesis
 
-By the afternoon of 2026-05-16 the Llama-3.2-1B planner distillation pipeline
-had a working trainer (`train_ultra.py`), a curated corpus (180,720 rows of
-gpt-5-nano teacher trajectories at `cato:/home/cato-user/distill_corpus/plan.jsonl`),
-and exactly one shipped checkpoint behind the production planner endpoint.
-That checkpoint — the boring reference point `llama32-1b-epoch3-v3` — had
-landed at val_loss 1.098 with the default recipe: rank=64 LoRA, base_lr=2e-4,
-batch=16, seq=4096, 178,848 rows kept after curation, ~10,892 steps. It was
-good enough to deploy and was being served at port 19320 of the cato pool.
+A four-variant LoRA sweep on Llama-3.2-1B planner distillation produced one
+clean winner (bigseq, val_loss 0.932, a 0.166-nat drop over the production
+baseline), one platform-rejected variant (r256_short, killed at submit by
+Tinker's rank-128 cap), one compute-efficient near-tie (superclean, matched
+r128 at half the steps), and one mid-pack rank-doubler (r128). The winner
+never reached production. The mid-pack variant did. We name eight rules
+that explain why and that bind the next sweep, the load-bearing one being:
+a sweep without an automated graduation pipeline is a candidate generator,
+not a deployment mechanism, and its winners rot on disk.
 
-The question on the table was not "can we beat the baseline?" — it was
-"*which axis* moves the loss most when we push it?" The recipe has four
-levers worth pulling independently:
+## The lever space
 
-1. **LoRA rank** — capacity in the adapter. r=64 is the `train_ultra.py`
-   default; can more rank fit the corpus better?
-2. **Sequence length** — `max_seq_len`. Longer windows mean each training
-   example sees more of the planner's branching context, and the bin-packer
-   wastes fewer tokens on padding between short examples.
-3. **Data quality** — `min_file_recall` and `min_terminal_reward` thresholds
-   in the curation filter. Tighter filters drop noisier rows. Less data,
-   cleaner signal.
-4. **Data scale** — `max_rows` cap on the corpus. Holding rank and seq
-   constant, what does halving (or quartering) the corpus do?
+The deployed planner reference was llama32-1b-epoch3-v3 at val_loss 1.098,
+trained at rank 64, base_lr 2e-4, batch 16, seq 4096, 178,848 curated rows
+of gpt-5-nano teacher trajectories, around 10,892 steps. That recipe was
+sufficient to ship and was being served at port 19320 of the cato pool.
+The question we asked on 2026-05-16 was not "can we beat the baseline?" but
+"which axis moves val_loss most when we push it?"
 
-The right way to answer these is to vary exactly one axis per variant.
-A single launcher script (`launch_variants_2026-05-16.sh`) kicked off four
-parallel Tinker SFT runs against the same base model
-(`meta-llama/Llama-3.2-1B`) with `--shard-total 1` each, named for the axis
-they probed:
+The recipe has four independent levers. We enumerate them as a numbered
+finding list because a sweep designed to confound axes produces a result
+table that nobody can read.
 
-- **`v3_r128`** — rank 64→128, everything else held at the baseline. The
-  *capacity* probe.
-- **`v3_bigseq`** — seq 4096→8192, rank held at 64. The *context* probe.
-- **`v3_superclean`** — `fr ≥ 0.8, tr ≥ 0.5` (vs baseline `fr ≥ 0.5, tr ≥ -1.0`).
-  88,918 of 180,720 rows survive. The *data-quality* probe.
-- **`v3_r256_short`** — rank 64→256 with a smaller corpus
-  (`max_rows=50000`). The high-capacity-small-data corner. The *rank-cap*
-  probe, though that's not what we intended it to probe.
+1. **LoRA rank** controls adapter capacity. The default in the trainer is
+   $r=64$. The question: does more rank fit the corpus better?
+2. **Sequence length** controls how much of the planner's branching
+   context each training example sees, and indirectly controls how
+   efficiently the bin-packer fills the batch.
+3. **Data quality** is set by two curation thresholds: minimum file recall
+   and minimum terminal reward. Tighter thresholds drop noisier rows.
+   Fewer rows, denser signal per row.
+4. **Data scale** caps total row count. With rank and seq held constant,
+   what does halving the corpus cost in val_loss?
 
-Three of the four trained to completion. The fourth never started.
+We launched four parallel Tinker SFT runs from a single launcher script
+against the same base model, each varying one of these axes. The variants
+took their names from the axis they probed: r128 (capacity), bigseq
+(context), superclean (data quality), r256_short (the
+high-capacity-small-data corner, though it ended up probing the platform's
+rank cap instead). Three trained to completion. The fourth never started.
 
-## Figure 1: what the loss curves did
+## The sweep matrix
 
-<Figure src="tinker-lora-bakeoff-val-curves.png" alt="val loss curves" caption="Tinker LoRA 4-parallel bake-off: val_loss trajectories over training steps. bigseq descends to 0.932 (lowest). r256_short shown dashed at the Tinker rank-cap rejection point. Sequence length matters more than rank at this scale." n={1} />
+| Variant       | Rank | Seq  | Rows kept | Steps | val_loss (final) | Status        |
+|---------------|------|------|-----------|-------|------------------|---------------|
+| baseline (epoch3-v3) | 64   | 4096 | 178,848   | 10,892 | 1.098            | live :19320   |
+| r128          | 128  | 4096 | 178,848   | 10,892 | 1.122            | live :19305   |
+| bigseq        | 64   | 8192 | 178,848   | 9,386  | **0.932**        | merged, idle  |
+| superclean    | 64   | 4096 | 88,918    | 5,416  | 1.120            | not exported  |
+| r256_short    | 256  | 4096 | 50,000    | --     | --               | API rejected  |
+| r128_short (mitigation) | 128  | 4096 | 50,000    | 3,046  | 1.283            | not exported  |
 
-The four curves disagree on essentially every parameter that matters —
-final loss, slope, plateau step, training duration — and the disagreements
-line up with the axes the variants were probing. The shape of the figure
-is the answer to the experiment.
+Every row varies exactly one axis from the baseline. The result attribution
+is clean because the design is clean. We will return to the deployment
+column because it is the load-bearing column.
+
+<Figure src="tinker-lora-bakeoff-val-curves.png" alt="val loss curves" caption="Four-parallel Tinker LoRA bake-off val_loss trajectories. bigseq (seq=8192) descends to 0.932, the lowest of the sweep. r256_short shown dashed at the rank-cap rejection point. Sequence length dominates rank at this scale." n={1} />
 
 ## v3_r128: capacity at constant data
 
-The capacity-baseline variant. Doubled the LoRA rank from 64 to 128, kept
-everything else identical to the deployed baseline.
+We doubled LoRA rank from 64 to 128 and held everything else at the
+baseline recipe (with one exception: a more cautious base_lr of $10^{-4}$
+instead of $2 \times 10^{-4}$, a choice we will return to).
 
-- Tinker run id: `c0743d5c-f93e-562d-a05e-9ae56935f94f`
-- Config: lora_rank=128, base_lr=1e-4, batch_size=16, max_seq_len=4096,
-  max_rows=200000, min_file_recall=0.5, min_terminal_reward=-1.0
-- Rows kept: 178,848 of 180,720
-- Steps: ~10,892
-- Loss: train 1.601 → noisy 0.52–0.96 band by s10800; val 1.469 (s100) →
-  **1.122 @ s10800**, plateau around step 7–8k
-- Exported, merged, deployed at `:19305`
-
-LoRA's parameter count under standard targeting (all attention projections
-plus MLP gates) is:
+Under standard LoRA targeting on the four attention projections per block,
+the trainable parameter count is
 
 $$
 \Delta\theta = 2 \cdot r \cdot d \cdot L \cdot H
 $$
 
-where $r$ is the LoRA rank, $d$ is the hidden width, $L$ is the number of
-transformer blocks, and $H$ counts the targeted projection matrices per
-block (Q/K/V/O plus gate/up/down in Llama-3 ≈ 7, but the dominant
-attention-only baseline is 4). For Llama-3.2-1B with $d=2048$, $L=22$,
-$H=4$:
+where $r$ is the LoRA rank, $d=2048$ is the Llama-3.2-1B hidden width,
+$L=22$ is the number of transformer blocks, and $H=4$ counts the targeted
+projections. Substituting,
 
 $$
-r=64: \quad \Delta\theta = 2 \cdot 64 \cdot 2048 \cdot 22 \cdot 4 \approx 8.4\text{M params}
+r=64: \quad \Delta\theta \approx 2 \cdot 64 \cdot 2048 \cdot 22 \cdot 4 \approx 8.4 \text{M}
 $$
 
 $$
-r=128: \quad \Delta\theta = 2 \cdot 128 \cdot 2048 \cdot 22 \cdot 4 \approx 16.8\text{M params}
+r=128: \quad \Delta\theta \approx 2 \cdot 128 \cdot 2048 \cdot 22 \cdot 4 \approx 16.8 \text{M}
 $$
 
-Twice the parameters. The val loss moved from 1.098 (baseline rank-64) to
-1.122 — *worse* by 0.024 nats. The capacity probe came back negative.
+Twice the parameters. Val loss moved from 1.098 to 1.122, *worse* by 0.024
+nats. The capacity probe came back negative. We see three plausible
+readings, listed in descending order of how seriously we take them.
 
-There are at least three plausible readings:
+1. **The corpus is past the rank-64 knee.** The base model has 1.2B
+   parameters and the curated corpus has roughly 700M tokens pre-pack
+   and around 50M after bin-packing. At this ratio, additional adapter
+   capacity is not constrained by the data; it just has more room to
+   memorize noise.
+2. **The LR was undertuned for the larger adapter.** Doubling rank
+   roughly halves the effective per-parameter step size at the same
+   base_lr. We dropped base_lr by 2x to be cautious, which probably
+   underfit r=128 rather than overfitting it.
+3. **The difference is noise.** A 0.024-nat gap on a single seed at this
+   corpus size is well inside the variance we have measured on adjacent
+   runs.
 
-1. The base model is small (1.2B params) and the SFT corpus is small (~700M
-   tokens after curation, ~50M after bin-packing). r=64 is already past the
-   knee — the extra capacity at r=128 isn't constrained by the data.
-2. The LR schedule wasn't retuned for the larger adapter. r=128's effective
-   step size in the LoRA subspace is different from r=64's at the same
-   base_lr; we used 1e-4 vs the baseline's 2e-4 to be cautious, which may
-   have under-fit the larger rank.
-3. There's no real difference. 1.098 and 1.122 are well inside single-seed
-   noise on a 180k-row corpus.
-
-We didn't run the LR sweep to disambiguate. r128 was deployed at `:19305`
-to serve as the rank-axis reference for downstream eval, not promoted.
+We did not run the LR sweep to disambiguate. The variant was deployed at
+port 19305 to serve as the rank-axis A/B reference, not promoted to the
+production endpoint.
 
 ## v3_bigseq: the variant that won
 
-Doubled the context window from 4096 to 8192 tokens. Kept rank at 64,
-batch at 16, base_lr at 2e-4 (the baseline value, not the cautious r128
-1e-4). This was the variant nobody on the team predicted would win.
+We doubled the context window from 4096 to 8192 tokens. Rank stayed at 64.
+The base_lr stayed at the baseline $2 \times 10^{-4}$. Nothing else
+changed.
 
-- Tinker run id: `62666feb-3950-5f05-950b-75ae3108b287`
-- Config: lora_rank=64, base_lr=2e-4, batch_size=16, **max_seq_len=8192**,
-  max_rows=200000
-- Rows kept: 178,848 of 180,720
-- Steps: ~9,386
-- Loss: train 1.17 (s100) → ~0.79 band by s9300; val **1.272 → 0.932** —
-  **lowest val loss of the sweep**, plateau by s8000
-- Exported, merged, **not deployed**
+Final val_loss: 0.932, a 0.166-nat improvement over the production
+baseline and the lowest of the sweep by a comfortable margin. The variant
+was exported and merged. It was not deployed.
 
-0.932 vs the production baseline's 1.098 is a 0.166-nat drop in val loss
-— a meaningful, well-outside-noise improvement. And it came from the one
-axis nobody was excited about.
+The mechanism is bin-packing fill rate. The trainer first-fit packs
+multiple short examples into each window before dispatching the batch.
+Let $S$ be the sequence-length cap, $\{\ell_i\}$ the row lengths, and
+$\rho$ the fill rate, the fraction of in-window tokens that are real (not
+padding or truncation). The planner-trajectory corpus is heavily
+right-skewed: most rows are 1-3k tokens (one planner step with branch
+context and a single tool call), but a long tail runs past 5k (deep trees
+with accumulated evidence).
 
-The mechanism is bin-packing fill rate. `train_ultra.py` first-fit packs
-multiple short examples into each `max_seq_len` window before dispatching
-the batch. The planner-trajectory corpus has a heavily right-skewed
-length distribution: most rows are 1–3k tokens (a single planner step
-with branch context and a tool call) but a long tail runs 5–10k+ (deeper
-trees with accumulated evidence). At `max_seq_len=4096`:
+At $S=4096$, short rows pack 1-3 per window for $\rho \approx 0.6-0.75$,
+medium rows pack exactly one for $\rho \approx 0.75-0.95$, and long rows
+are *truncated*: the planner's late-context evidence is silently dropped
+before the loss ever sees it. At $S=8192$, short rows pack 3-6 per window
+for $\rho \approx 0.8-0.9$, medium rows pack two, and long rows fit whole.
 
-- short rows (1–3k) pack 1–3 per window; fill rate ~60–75% before the
-  pad token
-- medium rows (3–4k) pack exactly 1; fill rate ~75–95%
-- long rows (>4k) get **truncated** — the planner's late-context evidence
-  is silently dropped before the loss ever sees it
+Two effects compound. The packed batch carries more information per
+gradient step, because more distinct trajectories survive into the same
+wall-clock. And the long-tail rows, which are exactly the planner steps
+where the model has to integrate evidence across multiple tool calls
+(the behavior we are trying to distill), now contribute a full gradient
+instead of a truncated one.
 
-At `max_seq_len=8192`:
+The cost is wall-clock per step (longer attention, quadratic in $S$)
+and GPU memory. Neither mattered: bigseq finished in the same Tinker SFT
+envelope as its siblings, 9,386 steps in roughly the same wall-clock
+budget as the others' 5-10k.
 
-- short rows pack 3–6 per window; fill rate ~80–90%
-- medium rows pack 2; fill rate ~85–95%
-- long rows fit whole; the long-tail of rich multi-step examples now
-  contributes a full gradient instead of a truncated one
-
-Two effects compound. First, the packed batch carries more *information per
-gradient step* — the model sees more distinct planner trajectories in the
-same wall-clock. Second, the long-tail examples — which are
-disproportionately the planner steps where the model has to integrate
-evidence across multiple tool calls, exactly the behavior we're trying
-to distill — now train at all instead of being chopped.
-
-bigseq's loss curve descends faster early (1.272 at s100 vs 1.469 for
-r128 at the same step) because each step is denser; it plateaus lower
-(0.932 vs 1.122) because the targets that survive training are richer.
-The cost is wall-clock per step (longer attention) and GPU memory
-(quadratic in seq length), neither of which mattered: it still finished
-in the same Tinker SFT envelope as its siblings.
-
-This is the variant that should have been deployed. It wasn't.
+This is the variant that should have been deployed.
 
 ## v3_superclean: data quality at compute parity
 
-The strictest curation filter actually run. Held rank at 64, base_lr at
-2e-4, max_seq_len at 4096 — the baseline recipe. Pushed
-`min_file_recall` from 0.5 to 0.8 and `min_terminal_reward` from -1.0 to
-0.5.
+We held rank at 64, base_lr at $2 \times 10^{-4}$, seq at 4096 (the baseline
+recipe end-to-end) and pushed minimum file recall from 0.5 to 0.8 and
+minimum terminal reward from $-1.0$ to $0.5$. 88,918 of 180,720 rows
+survived. The trainer ran for around 5,416 steps, roughly half the
+baseline.
 
-- Tinker run id: `9bb4378c-163d-5f56-ad90-358595e375b5`
-- Config: lora_rank=64, base_lr=2e-4, batch_size=16, max_seq_len=4096,
-  max_rows=200000, **min_file_recall=0.8, min_terminal_reward=0.5**
-- Rows kept: **88,918 of 180,720** (~half the baseline)
-- Steps: ~5,416 (~half the baseline)
-- Loss: train 1.24 → ~0.80 band; val 1.351 (s100) → **1.120 @ s5400**
-- **Not exported, not merged, not deployed**
+Final val_loss: 1.120, statistically indistinguishable from r128's 1.122
+at half the compute. The data-quality filter doubled the effective signal
+per row: each surviving row was, in expectation, a closer imitation of a
+planner trajectory that actually succeeded at the downstream task. The
+91,802 rows the filter dropped were carrying noise the model had been
+spending capacity on.
 
-The headline: superclean matched r128 (1.120 vs 1.122) at *half* the
-compute. The data-quality filter doubled the effective signal per row —
-each row that passed the tighter threshold was, in expectation, a closer
-imitation of a planner trajectory that actually succeeded at the
-downstream task.
+This is the cleanest result of the four variants. Half the rows, half the
+steps, matched val_loss. It says: at this corpus size, the bottleneck is
+*signal density per row*, not raw row count. If we had not had bigseq, we
+would have shipped superclean as the next production planner. We did have
+bigseq, and superclean's 1.120 was dominated. The export pipeline never
+fired for it. The merged directory was never produced. The deploy gate
+never opened.
 
-Half the rows × half the steps × matched val loss is the cleanest result
-of the four variants. It says: at this corpus size, the bottleneck is
-*signal density per row*, not raw row count. The 91,802 rows dropped by
-the tighter filter were carrying noise that the model was wasting
-capacity on.
-
-So why wasn't superclean deployed? Because bigseq existed. By the time
-the sweep finished — superclean done at 13:26, bigseq done at 23:00 the
-same day — bigseq's 0.932 was on the table and superclean's 1.120 was
-clearly dominated. The export pipeline never fired for superclean; the
-merged dir was never produced; the deploy gate never opened.
-
-This is the lesson the next two sections are about. Producing a better
+This is the lesson the deployment-gap section is about. Producing a better
 result is not the same as shipping a better result.
 
 ## v3_r256_short: the variant the platform refused to run
 
-The intended fourth corner of the sweep — high LoRA rank (256) on a small
-corpus (50k rows) — was a deliberate test of the
-high-capacity-small-data regime. The question: when data is the
-bottleneck, does extra adapter capacity hurt (overfit) or help (memorize
-the small set well)?
+The intended fourth corner of the sweep was a deliberate test of the
+high-capacity-small-data regime: rank 256, 50,000 rows. The question:
+when data is the bottleneck, does extra adapter capacity overfit or
+memorize the small set well?
 
-We never got an answer. At submission time Tinker returned:
+We never got an answer. At submission time Tinker returned a 400 with the
+message that lora_config rank 256 exceeds the maximum LoRA rank 128 for
+the Llama-3.2-1B base model. The cap is not surfaced prominently on the
+model card; we discovered it by hitting it. The launcher logged the
+rejection, left an empty directory on cato, and continued.
 
-```
-tinker.BadRequestError: 400 — lora_config.rank 256 exceeds max LoRA rank
-128 for model meta-llama/Llama-3.2-1B
-```
+The mitigation we ran was r128_short: rank capped at the maximum allowed
+128, other variables held the same as the rejected variant. The 50,000-row
+corpus produced val_loss 1.283, the worst of the sweep, and the result is
+legible as the data-scaling reference: cut the corpus 4x and lose 0.16
+nats. This is the symmetric magnitude (with opposite sign) of bigseq's
+gain. The corpus contains signal that we were truncating; cutting the
+corpus loses signal that we were keeping.
 
-The Tinker API caps LoRA rank at 128 for the Llama-3.2-1B base. The cap
-is not documented prominently on the model card; we discovered it by
-hitting it. The launcher logged the rejection, left an empty
-`v3_r256_short/` dir on cato, and continued.
-
-The mitigation was to re-launch as `v3_r128_short` — rank kept at the
-maximum allowed (128), the other variables held the same:
-
-- Tinker run id: `27cfe245-d439-5dfc-9c31-74663c0487c4`
-- Config: lora_rank=128, base_lr=8e-5, batch_size=16, max_seq_len=4096,
-  **max_rows=50000**, min_file_recall=0.5, min_terminal_reward=-1.0
-- Rows kept: 50,000
-- Steps: ~3,046
-- Loss: train 1.41 (s100) → ~0.90 band; val 1.517 (s100) → **1.283 @ s3000** —
-  worst val of the sweep
-- Not exported
-
-r128_short was the data-scaling reference point: same rank as r128, but
-~28% of the rows. Val loss 1.283 vs r128's 1.122 = +0.161 nats *worse*
-from cutting the corpus. The data axis matters; cut corpus 4× and lose
-0.16 nats. (Compare bigseq, which gained 0.166 nats on the same baseline
-purely by doubling seq length on the *same* corpus. Symmetrical
-magnitude, opposite direction — the corpus contains signal we'd been
-truncating, and cutting the corpus loses signal we'd been keeping.)
-
-But the original question — "what does r=256 do?" — is still
-unanswered. The platform's rank cap is a real constraint on the sweep
-design space, not an inconvenience to route around. Designing a variant
-the platform won't run produces a hole in the experimental matrix that
-nothing else fills.
+The original question, what does $r=256$ do on this corpus, is permanently
+unanswered for this experimental matrix. The platform's rank cap is a
+real constraint on the design space, not an inconvenience to route around.
 
 ## The deployment gap
 
-Of the four runs that finished, bigseq had the best val_loss by a wide
-margin. r128 was deployed (mid-pack). superclean was the
-compute-efficient result. bigseq, the *winner*, is still sitting on cato
-at `cato:/home/cato-user/tinker_merged/v3_bigseq_step9000/` — 2.4 GB,
-LoRA fused into the base, ready for `vllm serve` — with no listener.
+The structural failure of the sweep was not a training failure. Every
+variant that the platform accepted trained to a sensible final loss. The
+failure was the path from "merged artifact exists on disk" to "production
+traffic hits the new endpoint." We diagram the gap.
 
-The verdict line in the run catalog says, accurately:
+```mermaid
+flowchart LR
+    A[sweep launched] --> B[four variants train]
+    B --> C{val_loss<br/>computed}
+    C --> D[r128: exported, merged, deployed :19305]
+    C --> E[bigseq: exported, merged, idle]
+    C --> F[superclean: not exported]
+    C --> G[r128_short: not exported]
+    C --> H[r256_short: API rejected]
+    D --> I[serving traffic]
+    E --> J[ready to deploy]
+    F --> K[shelf]
+    G --> K
+    H --> L[never existed]
+    J -.human step.-> I
+    style E fill:#fbb
+    style J fill:#fbb
+```
 
-> Deployed?: **no live vllm serve** — merged dir exists, no listener.
-> Ready to deploy.
+The dashed edge is the load-bearing one. It is the path from "ready to
+deploy" to "serving traffic," and it has no automation. It is a human
+remembering to do it, behind an unwritten queue, after the planner-recall
+eval that we never actually ran confirms the val_loss improvement
+translates to downstream lift.
 
-"Ready to deploy" is what we say when the technical artifact exists but
-the social mechanism to ship it doesn't. The pipeline from "sweep
-finishes" to "winner serves production traffic" had no automation. The
-human step — read the metrics, pick the winner, run `deploy.sh`,
-patch `PERSEUS_LLM_TREE_ENDPOINTS` — was waiting on a planner-recall
-eval to confirm the val_loss improvement translated to downstream lift.
+The verdict line in the run catalog for bigseq says "no live vllm serve,
+merged dir exists, no listener, ready to deploy." "Ready to deploy" is
+what we say when the technical artifact exists but the social mechanism
+to ship it does not. The pipeline from "sweep finishes" to "winner serves
+production traffic" had no automation. Other work intervened. The bigseq
+merge sat. The production planner kept serving the boring reference point
+at val_loss 1.098, and r128 sat alongside it at val_loss 1.122 as the
+rank-axis A/B reference. Neither of them was the best variant the sweep
+produced.
 
-The eval didn't run. Other work intervened. The bigseq merge sat. The
-production planner kept serving the boring reference point at `:19320`
-(val_loss 1.098), and r128 sat alongside it at `:19305` (val_loss 1.122)
-serving as the rank-axis comparison — neither of them the best variant
-the sweep produced.
+This is the same pattern that surfaces in every sweep-without-graduation
+story we have seen. The sweep optimizes the metric. The pipeline ships
+the artifact. When the second does not exist, the first turns into a
+shelf of winning checkpoints that nobody uses.
 
-This is the same pattern that surfaces in every
-"sweep-without-a-graduation-pipeline" story. The sweep optimizes the
-metric. The pipeline ships the artifact. When the second doesn't exist,
-the first turns into a shelf of winning checkpoints that nobody uses.
+## State machine for a variant's life
+
+The four observed end states are reachable from a single start state via
+a small number of transitions. We render them as a state machine because
+the unreachable transitions are as interesting as the reachable ones.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Submitted
+    Submitted --> Rejected: platform 400
+    Submitted --> Training
+    Training --> Failed: trainer error
+    Training --> Trained: val_loss recorded
+    Trained --> Exported: human triggers export
+    Exported --> Merged: human triggers merge
+    Merged --> Deployed: human triggers deploy
+    Merged --> Idle: nobody triggers anything
+    Deployed --> [*]
+    Idle --> [*]: shelf
+    Rejected --> [*]: hole in matrix
+```
+
+Three transitions out of Merged are reachable. Only one of them ends at
+Deployed. The other two end at Idle and Shelf. In a sweep with no
+graduation pipeline, the prior over end states is set by which humans
+were paying attention on which day. That is the failure mode the eight
+rules below are about eliminating.
 
 ## Eight rules
 
-These are written down here because the next sweep is already being
-designed and the failure modes above are forgettable.
+We write these down because the next sweep is already being designed and
+the failure modes above are forgettable.
 
-**1. State the gate before launching the sweep.**
+1. **State the gate before launching the sweep.** "Whoever posts the
+   lowest val_loss ships" is a gate. "If anyone beats the baseline by
+   0.05 nats, ship them" is a gate. "Hold a meeting after all four finish
+   and decide" is *not* a gate; it is an intention, and intentions do not
+   survive the next week's interruptions. bigseq beat the baseline by
+   0.166 nats. No gate fired because no gate was set.
+2. **Sweep produces options; pipeline ships winners.** These are two
+   separate engineering artifacts. The first is a launcher script plus a
+   metrics table. The second is an automated job that watches the metrics
+   table, applies the gate, and runs the deploy. We had the first. We did
+   not have the second. The deploy step was a human action behind an
+   unwritten queue.
+3. **One axis per variant.** The four variants disagreed on exactly one
+   input each (rank, seq, filter, rows). That is why the attribution is
+   clean: bigseq's win is attributable to seq length because nothing else
+   about it differs from the baseline. If we had moved two axes per
+   variant, the result table would be a Latin square of confounders. One
+   axis per variant is the discipline that makes the post-hoc reading
+   legible.
+4. **The platform's rank cap is real.** A rank-256 variant on
+   Llama-3.2-1B is not a variant; it is a 400 response. Before designing
+   a sweep, enumerate every variant against the platform's declared
+   capabilities, including the actual submit endpoint's input validation.
+   The hole r256_short leaves is permanent in this matrix.
+5. **Bin-packing fill rate matters for context-length comparisons.**
+   bigseq's win is not "longer context magically improves loss." It is
+   "longer context *given the corpus's length distribution* changes how
+   much of each row contributes to the gradient." A sweep that varies
+   seq length without measuring fill rate is implicitly varying
+   information per step without controlling for it. The right cross-tab
+   for a seq-length sweep is val_loss against fill rate and truncation
+   rate jointly, not val_loss against seq length alone.
+6. **"Ready to deploy" is a dangerous phrase.** It is a phrase that lets
+   a sweep be marked done without the artifact reaching production. Once
+   an artifact is at the merged-safetensors stage, the cost of one more
+   step (a deploy script plus a health check) is trivial compared to the
+   cost of letting it rot. Either ship it or delete it. The middle state,
+   exists and is idle, is the expensive state.
+7. **Finish order is not quality order.** The four variants finished in
+   the order superclean, r128_short, r128, bigseq. The first to finish
+   was the worst of the four. The last to finish was the best. A gate
+   that fired on the first variant to cross a threshold would have
+   shipped the worst variant. Order of completion is not order of
+   quality; the gate has to be on the metric, not on the wall clock.
+8. **Any sweep without graduation produces shelf-warmers.** This is the
+   rule that subsumes the other seven. A sweep is a candidate generator.
+   Without an automatic, gate-based, time-bounded promotion mechanism,
+   candidates accumulate and the median candidate that *ships* is the
+   one whose existence happened to coincide with a human remembering to
+   deploy it. The val_loss improvements that come out of the sweep are
+   real; the production-line improvements are random. bigseq is the
+   proof.
 
-"Whoever posts the lowest val_loss ships" is a gate. "If anyone beats
-the baseline by 0.05 nats, ship them" is a gate. "Hold a meeting after
-all four finish and decide" is *not* a gate — it's an intention, and
-intentions don't survive the next week's interruptions. bigseq beat the
-baseline by 0.166 nats. No gate fired because no gate was set.
+## What we know and what we do not
 
-**2. Sweep produces options; pipeline ships winners.**
+We know that on this corpus, with this base model, at this scale, seq
+length dominates rank: bigseq's 0.166-nat win came from doubling $S$ on
+the same rank-64 adapter, while r128's rank doubling moved val_loss in
+the wrong direction. We know data quality is roughly compute-equivalent
+to raw data scale at this corpus size: superclean matched r128 with half
+the rows and half the steps. We know cutting the corpus 4x costs roughly
+0.16 nats, symmetric in magnitude with bigseq's gain.
 
-These are two separate engineering artifacts. The first is a launcher
-script + a metrics table. The second is an automated job that watches
-the metrics table, applies the gate, and runs the deploy. We had the
-first. We didn't have the second. The deploy step was a human action
-behind an unwritten queue.
-
-**3. Axes not hyperparams (each variant probes ONE axis).**
-
-The four variants disagreed on exactly one input each (rank, seq, filter,
-rows). That's why the result attribution is clean: bigseq's win is
-attributable to seq length because nothing else about it differs from
-the baseline. If we'd moved two axes per variant, the result table would
-be a Latin square of confounders. One axis per variant is the discipline
-that makes the post-hoc reading legible.
-
-**4. The platform's rank cap is real (r256_short never ran).**
-
-A rank-256 variant on Llama-3.2-1B isn't a variant; it's a 400 response.
-Before designing a sweep, enumerate every variant against the platform's
-declared capabilities — model card, API docs, the actual `submit`
-endpoint's input validation. The hole left by `r256_short` is permanent
-in this experimental matrix; we don't know what 256-rank capacity does
-to this corpus, and won't unless the platform raises the cap or we
-move to a different base model.
-
-**5. Bin-packing fill rate matters for context-length comparisons.**
-
-bigseq's win is not "longer context magically improves loss." It's
-"longer context *given the corpus's length distribution* changes how
-much of each row contributes to the gradient." A sweep that varies seq
-length without measuring fill rate is implicitly varying *information
-per step* without controlling for it. The right cross-tab for a
-seq-length sweep is val_loss × fill_rate × truncation_rate, not val_loss
-× seq_length alone.
-
-**6. "Ready to deploy" is a dangerous phrase.**
-
-It's a phrase that lets a sweep be marked "done" without the artifact
-reaching production. Once an artifact is at the merged-safetensors
-stage, the cost of one more step (`deploy.sh && curl health`) is
-trivial compared to the cost of letting it rot. Either ship it or
-delete it. The middle state — exists, ready, nobody using — is the
-expensive state.
-
-**7. Tie-breaker for finish order.**
-
-The four variants finished in the order superclean (13:26) →
-r128_short (12:18) → r128 (22:55) → bigseq (23:00). The first variant to
-finish — r128_short — was the worst of the four. The last to finish was
-the best. If the deployment pipeline had been "ship the first variant
-that crosses a threshold," we'd have shipped the worst variant. Order
-of completion is not order of quality; the gate has to be on the metric,
-not on the wall clock.
-
-**8. Generalizes: any sweep without graduation produces shelf-warmers.**
-
-This is the rule that subsumes the other seven. A sweep is a generator
-of candidates. Without an automatic, gate-based, time-bounded promotion
-mechanism, the candidates accumulate and the median candidate that
-*ships* is the one whose existence happened to coincide with a human
-remembering to deploy it. The metric improvements that come out of the
-sweep are real; the production-line improvements that come out of the
-sweep are random. bigseq is the proof.
+We do not know what $r=256$ does on this corpus, because the platform
+rejects it. We do not know whether the r128 regression is a real capacity
+issue or an LR mistuning artifact, because we did not run the LR sweep.
+We do not know whether bigseq's val_loss win translates to downstream
+planner-recall lift on the multi-bench cohort, because the eval that
+would have told us never ran. The third of these is the most expensive
+unknown, and it is unknown for the same reason bigseq is not deployed.
 
 ## Where this leaves the planner
 
-The production planner is still serving `llama32-1b-epoch3-v3` at port
-19320. `v3_r128` is live at 19305 as the rank-axis A/B reference. The
-two losing variants (`v3_superclean`, `v3_r128_short`) were never
-exported. `v3_bigseq` — best of sweep, 0.166 nats below the production
-baseline — is fused, merged, and idle on cato. `v3_r256_short` never
+The production planner is still serving the epoch3-v3 checkpoint at port
+19320 at val_loss 1.098. The r128 variant is live at port 19305 as the
+rank-axis A/B reference. superclean and r128_short were never exported.
+bigseq is fused, merged, and idle on cato at val_loss 0.932, the
+unambiguous winner of the sweep, with no listener. r256_short never
 existed.
 
-The next sweep is a v4 grid that does pick up bigseq's seq=8192 as the
+The next sweep is a v4 grid that picks up bigseq's $S=8192$ as the
 default and shifts the axes to LR schedule, curation threshold pairs,
-and a longer cosine warmup. The graduation pipeline is the open work.
-
-## Cross-links
-
-- [llama 3.2 1B Tinker planner](/essays/llama-32-1b-tinker-planner/) —
-  the base recipe (rank 64, lr 2e-4, seq 4096) and the trainer evolution
-  from `train.py` → `train_fast.py` → `train_ultra.py`.
-- [tinker 3-epoch ultra](/essays/tinker-3-epoch-ultra/) — the production
-  baseline (val_loss 1.098) the sweep was measured against and why the
-  rank-64 default lasted as long as it did.
-- [planner base bake-off](/essays/planner-base-bakeoff/) — the
-  upstream question (which base model is worth distilling into?) whose
-  answer (Llama-3.2-1B at this scale) is the precondition for this
-  sweep.
-
-## Sources
-
-- `parking_lot/v2_archive_2026-05-18/HISTORY/09_tinker_runs.md` — full
-  run catalog, per-variant Tinker URIs, config rows, loss curves, and
-  the export / merge / deploy state on cato as of 2026-05-17. Source of
-  the summary table reproduced above.
-- `cato:/home/cato-user/tinker_runs/manifest_2026-05-16.json` — the
-  four-variant launch manifest with hypothesis text, per-variant pid,
-  and `kept_rows_after_curation`. Definitive launch artifact for the
-  2026-05-16 sweep.
-- `parking_lot/v2_archive_2026-05-18/HISTORY/14_wm_training.md` — for
-  the wider context of how the planner distillation pipeline sat
-  alongside the world-model training track (separate corpora, shared
-  compute pool on cato).
-- `parking_lot/v2_archive_2026-05-18/HISTORY/29_planner_training_research.md`
-  — for the upstream design rationale on why Llama-3.2-1B was picked as
-  the planner base and what the corpus curation thresholds
-  (`min_file_recall`, `min_terminal_reward`) actually measure against
-  the multi-bench cohort.
-- Trainer: `tinker_train/train_ultra.py` (curation by file_recall /
-  terminal_reward, first-fit bin packing, batch=16, pipeline depth 12,
-  sharding via `--shard-idx N --shard-total K`).
-- Launcher: `tinker_train/launch_variants_2026-05-16.sh` — the
-  one-shot script that started the four variants in parallel on cato.
-- Corpus: `cato:/home/cato-user/distill_corpus/plan_full.jsonl`
-  (8.6 GB, 180,720 rows of gpt-5-nano teacher trajectories captured
-  against the multi-bench cohort).
+and a longer cosine warmup. The graduation pipeline is the load-bearing
+open work; without it, the next sweep produces another shelf.

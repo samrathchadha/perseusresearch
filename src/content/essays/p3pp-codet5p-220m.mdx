@@ -4,391 +4,211 @@ date: 2026-05-18
 status: published
 tier: wm
 summary: "Single scalar-MSE head on a 220M codet5p backbone produced R² = −744 on the multi-bench eval set. Negative R² means: worse than predicting the constant mean. Scalar regression cannot represent bimodal-with-outliers sparse-reward distributions. HL-Gauss with 51 bins rescued it."
-related: ["wm-heads-decoding","wm-training-sweep","single-task-vs-multi-task"]
+related: ["wm-heads-decoding","wm-training-sweep","single-task-vs-multi-task","pipeline-integrity-audit","cohort-contamination-class"]
 readTime: 9
 ---
 
 import Figure from "../../components/Figure.astro";
 
-> tl;dr: We bumped the WM backbone from codet5p-110m to codet5p-220m and trained
-> one epoch with a single scalar value head under MSE. Train R² landed at
-> −744; held-out R² at −740. Negative R² is not "bad fit" — it is anti-fit,
-> worse than predicting the mean. The fault was not the backbone. It was the
-> output representation: scalar MSE cannot fit bimodal-with-outliers targets,
-> and the 2026-04-23→2026-05-11 contamination had made the target distribution
-> exactly that. HL-Gauss with 51 categorical bins, same backbone, same corpus,
-> took it from −744 to roughly 0 — and to a positive +0.112 once the corpus
-> was decontaminated. This essay is the autopsy.
+We trained one epoch of a 220M codet5p backbone with a single scalar value head under MSE and got $R^2 = -744$. The fault was not the backbone, the optimiser, the learning rate, or the data volume. It was the output representation. A scalar regressor under squared error cannot fit a bimodal-with-outliers target distribution, and the export window we trained on had produced exactly that. Replacing the scalar head with a 51-bin HL-Gauss categorical head on the same backbone and same parquet moved $R^2$ by roughly three orders of magnitude. This essay is the autopsy of one of the most spectacular metric failures in the world-model line and the textbook contraindication it surfaced.
 
-## 1 · The configuration that exploded
+The headline takeaway is not "scalar MSE is bad" — it works fine on unimodal continuous targets — but rather that the choice of output representation is a load-bearing modelling decision that must match the data-generating distribution. Capacity is the wrong knob to turn first. Mis-specification at the head is the right place to look.
 
-`p3pp_codet5p_220m` was launched 2026-05-14 from
-`python/muzero/main_phase3pp.py`. The configuration was deliberately mundane.
-We had been training Phase-2 WMs with codet5p-110m-embedding (256-d, frozen
-encoder, MLP trunk + heads) and wanted to test whether doubling the backbone
-to codet5p-220m moved the value-R² needle.
+## 1. The configuration that exploded
 
-Specifics:
+The run was launched 2026-05-14 from the Phase-3++ trainer entrypoint. The configuration was deliberately mundane: we had been training Phase-2 world models with a 110M codet5p embedding backbone (frozen encoder, MLP trunk plus per-task heads) and we wanted to test whether doubling the backbone to 220M moved the value-$R^2$ needle. The trunk carried the same 8-head distillation stack we had been using: value, reward, policy, stop, file_recall, symbol_recall, prm, action. The value head was a single scalar trained under MSE against the export parquet's `value_target` column. One epoch on the 1.33 GB augmented vt2 parquet (489,437 rows) on a single V100.
 
-- **Backbone**: `Salesforce/codet5p-220m` (encoder, frozen).
-- **Trunk**: 8-head distillation stack — value, reward, policy, stop,
-  file_recall, symbol_recall, prm, action.
-- **Value head**: single scalar output, **MSE objective** against
-  `value_target` from the export parquet.
-- **Schedule**: one epoch over `sweep-augmented-vt2-final-fix.parquet`
-  (1.33 GB, 489,437 rows). Single V100.
-- **Corpus state**: pre-2026-05-11 — the audit had not yet landed. Every row
-  read `terminal_reward = 0.0` because
-  `pick_terminal_reward(RewardSource::Judge)` was reading the always-NULL
-  legacy `result` column. The per-step shaping (`+0.1` file_hit, `+0.3`
-  patch_produced, `−0.1` empty_tool_result, `−0.2` give_up, γ=0.95)
-  still wrote real numbers into intermediate `value_target` fields, so the
-  loss surface was non-trivial even with zero terminals.
+The corpus state mattered. The run predated the 2026-05-11 audit by three days, which means every row read $r_T = 0$ at the terminal step: the terminal-reward extractor was reading the always-NULL legacy result column instead of `judge_label`. The per-step shaping survived — file-hit at $+0.1$, patch-produced at $+0.3$, empty-tool-result at $-0.1$, give-up at $-0.2$, all γ-discounted at $0.95$ — so the supervision was not literally zero, but the terminal signal was structurally absent.
 
-Result, both train and val:
+This had a non-obvious second-order effect on the shape of $v^{\text{tgt}}$ at the trajectory end. With $r_T = 0$ and the discounted sum running backward from the terminal step, $v^{\text{tgt}}_{T-1} = \gamma \cdot 0 + r_{T-1}$ and the only contribution at the last few steps is the rare patch-produced bonus or the typical empty-tool penalty. So a successful trajectory and a failed trajectory differ in their final-step targets by at most $0.3$ rather than $1.0$ or $2.0$ — most of the discriminative signal that should have been at the terminus collapsed to a small per-step shift. The model is being asked to distinguish success from failure on the basis of a signal the export pipeline had stripped.
+
+The metrics:
 
 | split | $R^2$ |
 |---|---|
-| train | −744 |
-| val | −740 |
+| train | $-744$ |
+| val | $-740$ |
 
-When `metrics.jsonl` first wrote `r2: -744.6` the natural assumption was a
-sign bug somewhere downstream. A unit re-check on `1 - SS_res/SS_tot`
-against numpy confirmed the number: the model was producing predictions
-whose squared error against the targets was 744× the variance of the
-targets themselves.
+When the metrics log first wrote $-744.6$ we assumed a sign bug downstream. Re-checking $1 - SS_{\text{res}} / SS_{\text{tot}}$ against numpy confirmed it: the model's squared error against the targets was $745\times$ the variance of the targets themselves.
 
-## 2 · What R² = −744 actually means
+## 2. What R² = −744 actually means
 
 The coefficient of determination is
 
 $$
-R^2 = 1 - \frac{\sum_i (y_i - \hat y_i)^2}{\sum_i (y_i - \bar y)^2} = 1 - \frac{\mathrm{SS}_{\text{res}}}{\mathrm{SS}_{\text{tot}}}.
+R^2 = 1 - \frac{\sum_i (y_i - \hat y_i)^2}{\sum_i (y_i - \bar y)^2} = 1 - \frac{SS_{\text{res}}}{SS_{\text{tot}}}.
 $$
 
-Three reference points pin the scale:
+Three reference points fix the scale. $R^2 = 1$ is a perfect fit, $SS_{\text{res}} = 0$. $R^2 = 0$ is the constant-mean baseline: a model that predicts $\bar y$ for every input gets exactly this score, so $R^2 = 0$ means the model has learned zero structure beyond the marginal mean of the target. $R^2 &lt; 0$ means the model is worse than that flat baseline — its predictions are, on average, anti-correlated with the targets relative to the trivial constant predictor.
 
-- $R^2 = 1$ — perfect predictions, $\mathrm{SS}_{\text{res}} = 0$.
-- $R^2 = 0$ — predictions whose squared error against $y$ exactly matches
-  predictions of the constant $\bar y$. Equivalently: the model has learned
-  zero structure beyond the marginal mean.
-- $R^2 < 0$ — the model is worse than the constant-mean baseline. The model
-  is anti-correlated with truth on average.
-
-For $R^2 = -744$ specifically:
+For $R^2 = -744$:
 
 $$
-\frac{\mathrm{SS}_{\text{res}}}{\mathrm{SS}_{\text{tot}}} = 745.
+\frac{SS_{\text{res}}}{SS_{\text{tot}}} = 745.
 $$
 
-If you replaced the entire neural network with the single scalar
-$\bar y = \mathbb{E}[\text{value\_target}]$, the squared-error loss would
-drop by **a factor of 745**. The model is not slightly off. It is
-systematically pushing predictions in the wrong direction with respect to
-the variance of the targets.
+If we replaced the entire 220M neural network with the single scalar $\bar y = \mathbb{E}[\text{value\_target}]$, the squared-error loss would drop by a factor of 745. The model was not slightly off. It was systematically pushing predictions in the wrong direction at large magnitude relative to the variance of the targets.
 
-Why this is not just "high loss":
+This matters because high MSE alone does not produce highly negative $R^2$. A random-initialised output layer on a target with range $[-2, +1]$ might land at $SS_{\text{res}} / N \approx 10$ — bad, but with $SS_{\text{tot}}$ of comparable size, $R^2$ would sit near zero. To get $R^2 \approx -744$ the residuals must be enormously larger than the target variance. Something is systematically miscalibrated about the head's output magnitude or sign.
 
-A scalar MSE loss is bounded below by 0 but unbounded above. A model with a
-random-init output layer can land at, say, $\mathrm{SS}_{\text{res}} / N$
-≈ 10 on $y \in [-2, +1]$ — high MSE, but $R^2$ might still be near 0
-because $\mathrm{SS}_{\text{tot}}$ is comparable. To get $R^2 \approx -744$
-the residuals have to be **enormously larger than the target variance**.
-The model is producing systematic high-magnitude outputs that miss in the
-same direction.
-
-## 3 · Why it exploded: two-part failure
-
-### 3.1 The target distribution was bimodal-with-outliers
-
-The 2026-04-23 → 2026-05-11 export window had two simultaneous bugs that
-shaped `value_target`:
-
-1. `terminal_reward = 0.0` on every row (the
-   `pick_terminal_reward(Judge)` NULL-read).
-2. Many invocations omitted `--dataset` so `gold_files` was empty too,
-   meaning per-step `file_recall` was zero and `value_target` was driven
-   entirely by the small per-step shaping.
-
-`value_target` is the γ-discounted sum:
+A cleaner way to feel the scale: write the variance of the target as $\sigma_y^2 = SS_{\text{tot}} / N$ and the per-example mean squared error as $\overline{\text{MSE}} = SS_{\text{res}} / N$. Then
 
 $$
-v^{\text{tgt}}_t = \sum_{k=0}^{T-t} \gamma^k r_{t+k}.
+R^2 = 1 - \frac{\overline{\text{MSE}}}{\sigma_y^2}, \qquad R^2 = -744 \;\Longleftrightarrow\; \overline{\text{MSE}} = 745 \,\sigma_y^2.
 $$
 
-With `terminal_reward=0` and `file_hit=0`, the only non-trivial reward
-component was `empty_tool_result = −0.1` and the occasional
-`patch_produced = +0.3`. The empirical distribution from that window was a
-sharp spike near 0 (most steps had neither penalty nor bonus), a long
-negative tail from accumulated `empty_tool_result` shaping out to about
-−2.0, and a small positive shoulder near +0.285 from rare `patch_produced`
-events at the trajectory end (per the now-retracted 2026-05-05 Claude.md
-entry; the actual observed range was `[-2.0, +0.285]`).
+If the target's empirical standard deviation $\sigma_y$ on the contaminated parquet was on the order of $0.4$ (a reasonable estimate for a distribution concentrated near zero with a tail to $-2$), then the per-example RMSE was on the order of $\sigma_y \sqrt{745} \approx 10.9$. The head was emitting predictions roughly thirty target-standard-deviations away from the truth, every step, in a consistent direction. That is not a learning-rate problem.
 
-In the rare exports where `--dataset` had been passed and `gold_files` was
-populated, the picture was even more bimodal: occasional steps where a
-file matched gold added jumps of `+0.1 / (1-γ) = +2.0` to the discounted
-return; everything else stayed near zero. So depending on the export run,
-the WM was seeing one of two distributions, both of which were:
+## 3. Why it exploded: target shape meets objective
 
-- **Spike-at-zero** (most rows).
-- **Heavy-tailed negative** (long sessions of empty tool calls).
-- **Sparse positive outliers** (file hits and patch events).
+The failure has two factors and they compound. The target distribution was bimodal with outliers. The objective could not represent multimodality. Either alone is recoverable. Together they are catastrophic.
 
-Neither a clean Gaussian nor a unimodal distribution. Multimodal with
-outliers, dominated by zero.
+### 3.1 The target was bimodal-with-outliers
+
+Two simultaneous export bugs shaped `value_target` during the 2026-04-23 to 2026-05-11 window. The terminal-reward extractor returned 0 for every trajectory because it was matching on the wrong column. Most invocations omitted the dataset flag, so the gold-file set was empty and per-step file-recall was zero. What survived was the small constant shaping.
+
+The value target is the γ-discounted return
+
+$$
+v^{\text{tgt}}_t = \sum_{k=0}^{T-t} \gamma^k r_{t+k}, \quad \gamma = 0.95.
+$$
+
+With $r_T = 0$ and $r^{\text{file\_hit}}_t = 0$, the only non-trivial reward components were the per-step empty-tool penalty at $-0.1$ and the rare patch-produced bonus at $+0.3$. The empirical distribution from this window had a sharp spike near zero (most steps had neither penalty nor bonus), a long negative tail down to about $-2.0$ from accumulated empty-tool shaping in long sessions, and a small positive shoulder near $+0.285$ from rare patch events at the trajectory end.
+
+In rare exports where the dataset flag was passed and gold_files was populated, the picture was even more bimodal: occasional file-hits added geometric-sum bumps of $+0.1 / (1 - \gamma) = +2.0$ to the discounted return, while everything else stayed near zero. Either way the distribution was three things at once: spike at zero, heavy negative tail, sparse positive outliers. Not Gaussian. Not unimodal. Multimodal with outliers, dominated by zero.
+
+The cleanest mathematical way to see why this breaks MSE is to look at the conditional posterior $p(v \mid s)$. For sparse-reward search trajectories the posterior factors approximately as
+
+$$
+p(v \mid s) \;\approx\; \alpha(s) \,\delta_0 + (1 - \alpha(s)) \, q(v \mid s)
+$$
+
+where $\alpha(s)$ is the probability that the trajectory carries no informative reward signal at all, $\delta_0$ is a point mass at zero, and $q(v \mid s)$ is the non-trivial component that itself has at least two modes (negative empty-tool sessions, positive patch sessions). A mixture of a point mass with a multimodal continuous component has a mean that lies in a region of vanishing density. That mean is exactly what scalar MSE will train its head to predict.
 
 ### 3.2 Scalar MSE has no representational room for multimodality
 
-A scalar regression head emits a single number $\hat v_\theta(s)$. Under
-MSE, its training objective is
+A scalar regression head emits one number $\hat v_\theta(s)$. Under MSE its training objective is
 
 $$
-\mathcal{L}(\theta) = \mathbb{E}_{(s, v) \sim \mathcal{D}}\left[(\hat v_\theta(s) - v)^2\right].
+\mathcal{L}(\theta) = \mathbb{E}_{(s,v) \sim \mathcal{D}}\bigl[(\hat v_\theta(s) - v)^2\bigr].
 $$
 
-The minimiser of $\mathbb{E}[(c - V)^2]$ in $c$ is $\mathbb{E}[V]$ — the
-mean. So MSE pulls the scalar output toward $\bar y$ over the dataset.
+For any fixed input distribution, the minimiser of $\mathbb{E}[(c - V)^2]$ over the constant $c$ is $c^\star = \mathbb{E}[V]$. So MSE pulls each prediction toward the conditional mean $\mathbb{E}[V \mid s]$. This is fine when $p(v \mid s)$ is unimodal and the conditional mean sits in a region of nonzero density. It is catastrophic when $p(v \mid s)$ is bimodal: the conditional mean sits in a low-density region between the modes, and any prediction there is wrong about both modes in opposite directions. The gradient is pointing the model at a value it will never observe.
 
-That is fine when $\bar y$ is a meaningful summary of the posterior
-$p(v \mid s)$. It is catastrophic when $p(v \mid s)$ is bimodal: the mean
-sits in a region of low density, between the modes, and any prediction
-between the modes is wrong about both. For a bimodal-with-outliers target
-distribution, the gradient signal points the model toward a value that is
-*never observed*.
+Capacity then amplifies the mis-specification. With 220M parameters the model has enough representational room to find a deep local minimum where the output is large in magnitude but in the wrong direction relative to the target's mass-weighted location. Empirically the head collapsed into the negative tail, which is the region with the largest fraction of probability mass once you fold in the long empty-tool sessions. From there the squared-error contribution to every spike-at-zero row was huge, and the squared-error contribution to every positive-shoulder row was even larger.
 
-Worse, the codet5p-220m backbone has 220M parameters. With enough capacity
-to memorise per-row residual shapes, the optimiser found a local
-configuration where the model output amplified the worst-case predictions
-of a near-degenerate mean estimator. It collapsed to a high-magnitude
-constant-ish output that landed in the *negative* tail of the target
-distribution — exactly the region where most of the mass sat.
-
-The two failures compound: a target distribution scalar MSE cannot
-represent, and a backbone with enough capacity to fit the wrong fixed
-point hard.
-
-## 4 · The fix: HL-Gauss replaced scalar MSE
-
-The repair was not architectural. It was a change to the **output
-representation** of the value head: instead of a single scalar trained
-under MSE, emit a softmax distribution over 51 discrete bins covering
-$[V_{\min}, V_{\max}]$, and train against a Gaussian-smoothed one-hot
-encoding of the target. The decode reconstructs a scalar as the
-expectation under the predicted distribution.
-
-The bin centres $c_1 < c_2 < \dots < c_{51}$ tile $[V_{\min}, V_{\max}]$.
-For target $v$, the supervision is the discretised Gaussian
+Concretely, the squared-error decomposition over the three mass regions makes the trap visible. Let $\pi_0, \pi_-, \pi_+$ be the mass at zero, in the negative tail, and in the positive shoulder, with conditional means $\mu_- &lt; 0 &lt; \mu_+$. A constant prediction $c$ has expected squared error
 
 $$
-p^\star_i(v) \propto \exp\!\left(-\frac{(c_i - v)^2}{2\sigma^2}\right),
+\mathbb{E}[(c - v)^2] = \pi_0 c^2 + \pi_-\bigl((c - \mu_-)^2 + \sigma_-^2\bigr) + \pi_+\bigl((c - \mu_+)^2 + \sigma_+^2\bigr).
 $$
 
-normalised so $\sum_i p^\star_i = 1$. The loss is cross-entropy:
+The minimiser over $c$ is the mass-weighted mean $\bar v = \pi_- \mu_- + \pi_+ \mu_+$. Because $\pi_0$ is large and $\bar v$ sits between $\mu_-$ and $0$, the optimal $c$ is a number nothing in the data actually looks like. The 220M head, given that gradient, found something even more pathological — it overshot $\bar v$ into the deeper part of the negative tail, presumably because the negative-tail rows have larger leverage on the loss per row. Once there, large positive-shoulder rows generated massive single-example residuals and dragged $SS_{\text{res}}$ up further.
+
+```mermaid
+flowchart LR
+  A["target v: spike at 0, neg tail, pos outliers"] --> B["scalar head v̂"]
+  B --> C{loss = (v̂ − v)²}
+  C --> D["grad pulls v̂ → E[v]"]
+  D --> E["E[v] in low-density region"]
+  E --> F["SS_res ≫ SS_tot, R² = −744"]
+  A --> G["HL-Gauss head π_θ over 51 bins"]
+  G --> H["loss = CE(π_θ, p*(v))"]
+  H --> I["π_θ can place mass on multiple modes"]
+  I --> J["bounded loss ≤ log 51 ≈ 3.93"]
+  J --> K["decode v̂ = Σ π_i c_i, R² ≈ 0"]
+```
+
+The diagram tracks the two paths. On the scalar-MSE path the gradient pulls the head toward the mean of a distribution that has no mass at its mean, and the unbounded squared loss lets the residuals scale without limit. On the HL-Gauss path the head expresses a full categorical, the cross-entropy loss is bounded above by $\log 51 \approx 3.93$, and the decoded scalar is a derived quantity rather than a tortured compromise.
+
+## 4. The fix: HL-Gauss replaced scalar MSE
+
+The repair was a change to the output representation of the value head, not to the backbone, the data, the optimiser, or the loss surface around it. Instead of one scalar trained under MSE, the head emits a softmax distribution over 51 discrete bins covering $[V_{\min}, V_{\max}]$ and is trained against a Gaussian-smoothed one-hot encoding of the target. The decoded scalar is the expectation under the predicted distribution.
+
+The bin centres $c_1 &lt; c_2 &lt; \dots &lt; c_{51}$ tile the support uniformly. For a scalar target $v$, the supervision is the discretised Gaussian
 
 $$
-\mathcal{L}_{\text{HL-Gauss}}(\theta) = \mathbb{E}_{(s, v)} \left[ -\sum_i p^\star_i(v) \log \pi_{\theta, i}(s) \right].
+p^\star_i(v) \;\propto\; \exp\!\left(-\frac{(c_i - v)^2}{2\sigma^2}\right),
 $$
 
-At inference, the scalar value is the expectation under the categorical:
+normalised so $\sum_i p^\star_i = 1$. The smoothing width $\sigma$ is set to roughly twice the bin spacing so adjacent bins share gradient signal. The training loss is cross-entropy
+
+$$
+\mathcal{L}_{\text{HL-Gauss}}(\theta) = \mathbb{E}_{(s, v)}\!\left[-\sum_i p^\star_i(v) \log \pi_{\theta, i}(s)\right]
+$$
+
+and at inference the scalar value is
 
 $$
 \hat v(s) = \sum_i \pi_{\theta, i}(s) \, c_i.
 $$
 
-```mermaid
-flowchart LR
-  A["target v ∈ [VMIN, VMAX]"] --> B[Gaussian smoothing σ across 51 bin centres]
-  B --> C[soft labels p*_i]
-  C --> D[cross-entropy loss]
-  D --> E[softmax head π_θ]
-  E --> F["decode v̂ = Σ π_i · c_i"]
-```
+Two things change at once. The representation now expresses multimodality natively: a two-mode posterior is just two peaks in $\pi_\theta$. The expectation $\sum_i \pi_i c_i$ still decodes a single scalar but the *uncertainty* is preserved in the distribution itself, so downstream consumers can read the spread, the entropy, or the mode separately. And the per-example loss is bounded above by $\log 51 \approx 3.93$, so a maximally wrong prediction contributes a finite constant rather than an unbounded squared residual. The model cannot blow up $R^2$ by overshooting.
 
-Two things change at once. First, the representation can express
-bimodality natively — a two-mode posterior just means two peaks in
-$\pi_\theta$, and the expectation $\sum_i \pi_i c_i$ still decodes a
-single scalar but the *uncertainty* is preserved in the distribution
-itself. Second, the loss is bounded — cross-entropy on a 51-way softmax
-has a worst case of $\log 51 \approx 3.93$, so a wrong prediction
-contributes a constant, not an unbounded squared residual. The model
-cannot blow up R² by overshooting.
+There is also a calibration property that the scalar head silently lacks. The cross-entropy objective with soft labels is a proper scoring rule for the underlying conditional distribution: the population minimiser of the loss is $\pi_{\theta,i}(s) = p^\star_i(\mathbb{E}[V \mid s])$ in the limit $\sigma \to 0$, and more generally is the smoothed conditional. So at the optimum the decoded $\hat v(s)$ is not just any scalar — it is the expectation under a calibrated posterior, with the head's softmax mass acting as a self-consistent uncertainty estimate. Downstream policy-improvement steps that care about variance (PUCT exploration bonuses, risk-sensitive control, ensemble disagreement) get a free signal that the scalar-MSE head would have collapsed into a single number.
 
-Same backbone (codet5p-220m, then later codet5p-110m). Same parquet. Same
-optimiser. New head:
+We held everything else constant. Same backbone (220M codet5p, then 110M for the v4 line). Same parquet. Same optimiser, schedule, batch size. The scalar-MSE configuration produced $R^2 = -744$. The HL-Gauss configuration on the wide range $[-10, +2]$, chosen wide because the contaminated `value_target` was running negative, produced no catastrophic runs at all — Phase-2 variants hovered near $R^2 = 0$, Phase-3 chains landed between $-0.27$ and $-0.5$ (mediocre, but in band). After the 2026-05-11 audit decontaminated the terminal-reward path, the v4 line with HL-Gauss on the tightened range $[-1, +1]$ produced the first genuinely positive $R^2$ on instance-split data: $\text{PRM-}R^2 \approx 0.54$ on the best chain variants. The random-row split reached $0.997$ but is leaky and not load-bearing for this argument.
 
-- `p3pp_codet5p_220m` with scalar MSE: $R^2 = -744$.
-- Phase-2 variants with HL-Gauss 51-bin on $[V_{\min}, V_{\max}] = [-10, +2]$
-  (chosen wide because `value_target` was running negative under
-  contamination): no checkpoint exposed catastrophic R² again. They were
-  still mediocre — best Phase-2 instance-split R² hovered around 0,
-  Phase-3 chain best around `-0.27` to `-0.5` per HISTORY/28 §3.1 — but
-  none of them imploded.
-- Once the 2026-05-11 audit landed and decontaminated `terminal_reward`,
-  the v4 line with HL-Gauss on the tightened range $[-1, +1]$ achieved
-  positive R² for the first time: `v3_chain_ds_fr_focus` and
-  `chain_ds_prm_heavyreg` reached PRM-R² ≈ 0.54; the v4 random-row split
-  reached 0.997 (leakage — see [wm-training-sweep](/essays/wm-training-sweep/)).
+The choice of bin range matters and was non-trivial in our case. The bins are a hard prior on the support of $v$ — any mass outside $[V_{\min}, V_{\max}]$ is clipped to the boundary bin, so the head literally cannot decode values outside the range. Under the contaminated parquet $v$ ran down to roughly $-9.6$ and up to roughly $+1.2$, so a $[-1, +1]$ range would have piled half the mass into the bottom bin and learned nothing about the negative tail. The wide $[-10, +2]$ range gave the head room to learn the shape of the tail honestly. Once the audit decontaminated the labels and $v$ collapsed to $[-1, +1]$, the wide range became a precision problem — bin width was now $12/51 \approx 0.235$, roughly half the new target's standard deviation — and the v4 line tightened the support accordingly. Bin range is a hyperparameter that has to track the actual data, not a doctrinal constant.
 
-<Figure src="p3pp-codet5p-220m-r2-vs-hl-gauss.png" alt="Scalar MSE -744 vs HL-Gauss recovery" caption="Same backbone, same corpus. Scalar MSE head: R² = −744 (clipped axis, red). HL-Gauss 51-bin softmax head: R² near zero (gray). The fix changed nothing about the data or backbone — only the output representation." n={1} />
+The same head architecture, with bin range matched to the empirical support, walks from $-744$ through near-zero (under contamination) and out to positive $R^2$ (post-audit), purely as a function of fixing the representation and the labels. Nothing about the backbone changed across that arc.
 
-The figure makes the lesson concrete: nothing else changed. Same
-checkpoint provenance, same training data, same backbone parameter count,
-same optimizer state. The output head representation alone moved R² by
-roughly three orders of magnitude in absolute terms.
+<Figure src="p3pp-codet5p-220m-r2-vs-hl-gauss.png" alt="Scalar MSE -744 vs HL-Gauss recovery" caption="Same backbone (220M codet5p), same corpus, same optimiser. Scalar MSE head: R² = −744 (clipped axis, red). HL-Gauss 51-bin softmax head: R² near zero (gray). The output head representation alone moves R² by roughly three orders of magnitude." n={1} />
 
-## 5 · "More parameters helps" was wrong here
+## 5. "More parameters helps" was wrong here
 
-The naive read of the failure is that 220M was "too big". That is
-backwards. 220M parameters did not cause the explosion — they
-**amplified** it.
+The first instinct on seeing a $-744$ is to say the model was too big. That is backwards. The 220M parameters did not cause the catastrophe — they amplified it. Capacity is a multiplier on whatever signal the loss surface already contains, and that includes mis-specified gradient direction. With scalar MSE on a bimodal target the gradient points the head at a no-density region between the modes. A small model arrives at that region slowly and stays close to random. A large model arrives faster and lands harder.
 
-The mental model is: capacity is a multiplier on whatever signal,
-including noise and mis-specified gradient direction, the loss surface
-already contains. With scalar MSE on a bimodal target, the gradient
-points the model toward a no-density region between the modes. A small
-model arrives at that no-density region slowly and stays close to
-random; a large model arrives at it faster and lands harder.
+Our prior had been the opposite. The Phase-2 110M runs with the same scalar-MSE bug, on the same contaminated parquet, produced merely-bad $R^2$ — bad enough to fail the gate but not eye-catching enough to trigger an audit. The 220M bump made the failure catastrophic enough to read off the dashboard line at a glance, and that is what kicked off the audit chain in the first place. The $-744$ number was so far out of band that someone had to look.
 
-Empirically: the smaller Phase-2 variants on codet5p-110m with the same
-scalar-MSE bug, had they been run, would have produced merely-bad R²,
-maybe in the −10 to −50 range — bad enough to fail the training gate but
-not eye-catching enough to trigger an audit. The codet5p-220m bump made
-the bug catastrophic enough that the metric line in the dashboard
-screamed at us. That is, in fact, why the audit chain got started:
-the −744 number was so out of band that someone had to look.
+The generalised lesson: capacity is the wrong knob to turn when the loss is mis-specified. Doubling $N \to 2N$ does not soften a mis-specified objective; it sharpens it. The right move is to ask whether the objective and the output representation match the data-generating process. In this case the objective assumed Gaussian residuals around a unimodal posterior, and the data was bimodal sparse-reward. The mismatch is a textbook contraindication for scalar regression and we walked into it.
 
-The generalised lesson: **capacity is not the right knob to adjust when
-loss is mis-specified.** If a model with $N$ parameters is producing
-nonsensical predictions, doubling to $2N$ does not soften the failure —
-it sharpens it. The right move is to ask whether the objective and the
-output representation match the data-generating process. In our case:
+## 6. Two first-principles points
 
-- Objective: MSE assumes Gaussian residuals around a unimodal posterior.
-- Data: bimodal-with-outliers sparse-reward distribution.
+Two clarifications that pin down why this works.
 
-The mismatch is not subtle. It is a textbook contraindication for scalar
-regression, and we walked into it.
+**Why $R^2 = 0$ is the right zero-point for a constant-output model.** If $\hat v(s) \equiv c$ for all $s$, then $SS_{\text{res}} = \sum_i (y_i - c)^2$, minimised at $c = \bar y$, giving $SS_{\text{res}} = SS_{\text{tot}}$ and $R^2 = 0$. A model that outputs the marginal mean is the flat baseline. Anything better has $R^2 &gt; 0$; anything systematically worse has $R^2 &lt; 0$. The $-744$ is a quantitative statement about how much worse than the trivial constant predictor the scalar-MSE model became.
 
-## 6 · How the data and objective failed together
+**Why HL-Gauss decode recovers a useful scalar even when the head expresses multimodality.** For a bimodal posterior with modes at $a$ and $b$ with equal mass, the expectation decodes as $\hat v = \sum_i \pi_i c_i \approx (a + b)/2$. The point estimate is the same scalar a perfect MSE-trained model would predict. But the model is no longer punished for preferring that midpoint at training time. Under scalar MSE the loss penalises the midpoint quadratically against both modes — there is no configuration of the head that makes the loss small. Under HL-Gauss the loss penalises the *distribution* against the smoothed one-hot truth, and the model can place mass at both peaks and still get a small cross-entropy. The midpoint scalar is then a clean derived quantity, computed from a calibrated categorical posterior, not a compromise dictated by gradient pressure.
 
-Two more first-principles points to nail down.
+**Why the smoothing width $\sigma$ matters.** Setting $\sigma$ too small turns HL-Gauss into hard one-hot encoding, which has the same problem as discrete cross-entropy on a regression target: adjacent bins share no gradient signal, and the head must rediscover the ordinal structure of the support from scratch. Setting $\sigma$ too large flattens $p^\star$ across bins and erases the spatial information in the target — at the limit $\sigma \to \infty$ the soft label is uniform and the loss is independent of $v$. The standard rule we use is $\sigma \approx 2 \Delta$ where $\Delta$ is the bin spacing, which spreads each target across roughly five bins. This is enough to share gradients across the local neighbourhood while still leaving target structure visible.
 
-**Why $R^2 = 0$ is the right zero-point for a constant-output model.** If
-$\hat v(s) \equiv c$ for all $s$:
+## 7. A sanity-check experiment we should have run first
 
-$$
-\mathrm{SS}_{\text{res}} = \sum_i (y_i - c)^2.
-$$
+In retrospect there was a five-minute experiment that would have caught this before the 220M epoch consumed a V100 day. Compute the empirical distribution of `value_target` over a small sample of the parquet, fit a single Gaussian to it via maximum likelihood, and evaluate the log-likelihood of the empirical distribution under that fit relative to a non-parametric kernel density estimate. The ratio is a one-number diagnostic for "how much does unimodal Gaussian regression leave on the table". If the log-likelihood gap exceeds a small constant (say $0.5$ nats), scalar MSE is contraindicated.
 
-Minimised at $c = \bar y$, giving
-$\mathrm{SS}_{\text{res}} = \mathrm{SS}_{\text{tot}}$, hence $R^2 = 0$.
-A model that outputs the mean is a flat baseline. Anything better than
-that has $R^2 > 0$; anything *systematically worse* has $R^2 < 0$. The
-−744 figure is a quantitative statement about how much worse than the
-trivial baseline the scalar-MSE model became.
+A cheaper version: bin the targets into 50 buckets, plot the histogram. If you see one mode, scalar MSE is fine. If you see two modes, or a spike with a tail, switch to a distributional head. This is a thirty-second check that costs less than the import time of the training script. We did not run it.
 
-**Why HL-Gauss decode recovers a useful scalar even when the head is
-expressing multimodality.** For a bimodal posterior with modes at $a$
-and $b$ and equal mass:
+The deeper failure mode here is procedural rather than mathematical. We had a working training pipeline, a working evaluation harness, and a default modelling choice (scalar MSE) that had been carried forward from earlier versions where it had been adequate. When we changed the data — by extending the parquet generation, by adding shaping rewards, by introducing the terminal-reward bug — we did not re-validate the modelling choice against the new data. The pipeline kept running and the metrics screamed. We should have noticed earlier. Specifically, when shaping rewards were introduced into the export, the target distribution went from approximately Gaussian (in early Phase-1 runs) to bimodal-with-outliers, and that transition should have triggered a head-architecture review. It did not, because nobody owned "the value-head representation is correct for this data" as a check.
 
-$$
-\hat v = \sum_i \pi_i c_i \approx \tfrac{a + b}{2}.
-$$
+## 8. Where HL-Gauss sits in the design space
 
-The point estimate is the mean of the modes — the same scalar a perfect
-MSE model would predict. **But the model is no longer punished for
-preferring that midpoint.** Under scalar MSE, the loss penalises the
-midpoint quadratically against both modes; under HL-Gauss, the loss
-penalises *the distribution* against the (smoothed) one-hot truth, and
-the model can place mass at both peaks and still get a low loss. The
-midpoint scalar is then a clean derived quantity, not a tortured
-compromise.
+HL-Gauss is one of several distributional value heads. The relevant alternatives, and why we landed on this one:
 
-## 7 · What it taught us
+1. **Two-hot encoding.** Place mass on the two bin centres bracketing the target, with weights linear in distance. Equivalent to HL-Gauss with $\sigma \to 0$ and triangular kernel rather than Gaussian. Cheaper, but supplies no gradient signal to bins more than one step away from the target, which hurts when the target moves substantially between training steps.
 
-Three load-bearing lessons, each generalised beyond this one run.
+2. **C51 / categorical DQN.** Fixed atom locations with full categorical distribution, trained against a projected Bellman target. The same representational idea, but with bootstrapped targets rather than supervised targets — the projection operator and the moving-target dynamics are unnecessary complexity for our supervised distillation setting where the targets are precomputed in the parquet.
 
-**1. Use a representation that admits multimodality whenever rewards are
-sparse or bimodal.** Sparse-reward RL traces are pathologically
-multimodal: most steps have zero reward, a few have large positive or
-negative spikes. Scalar regression on such distributions will at best
-collapse to the mean and at worst (as here) blow up. HL-Gauss is one
-solution; two-hot encoding, quantile regression, and discrete
-distributional value heads (C51, IQN) are others. The literature has
-known this since DistRL (Bellemare 2017, Dabney 2018). We had to
-re-learn it the expensive way.
+3. **Quantile regression / IQN.** Predict quantile levels of the value distribution directly, with the quantile Huber loss. Strictly more expressive than fixed-bin categorical (no support assumption), but the loss is no longer a proper scoring rule for the density, and reconstruction of the mean requires integrating quantiles. Better for distributions with unknown or shifting support; worse for our use-case where the support is empirically bounded and the downstream consumer is a scalar value used in PUCT.
 
-**2. Audit the target distribution before tuning the model.** The R² =
-−744 was *first* a symptom of a target distribution that the loss could
-not represent and *second* of contamination that made the distribution
-worse. Even with clean labels, scalar MSE on the eventual `value_target`
-range $[-1, +1]$ with frequent zeros would have been weak. With
-contaminated labels (the 2026-04-23 → 2026-05-11 NULL-result bug, see
-[pipeline integrity audit](/essays/pipeline-integrity-audit/)), the
-target distribution was so degenerate that *any* model trained on it
-would have been off by construction. The lesson: print the histogram of
-your targets before tuning a single hyperparameter. We did not.
+4. **Mixture density networks.** Predict the parameters of a Gaussian mixture directly. Theoretically the most general scalar-to-distribution head, but training stability is poor with sparse rewards — components collapse, variances explode, and the loss has spurious local minima. We tried this earlier in the Phase-2 sweep and abandoned it.
 
-**3. Capacity amplifies whatever's already going to happen.** Doubling
-the backbone size from 110M to 220M did not cure the bug; it surfaced
-it. This applies in both directions — when an architecture is working,
-capacity helps; when it is mis-specified, capacity amplifies the
-failure. The fix is never "more parameters". The fix is to identify the
-mis-specification and remove it, and only then scale capacity.
+HL-Gauss is the right default for our setting because the support is empirically bounded, the targets are precomputed (no bootstrapped projection), and the downstream consumer wants both a calibrated scalar and an entropy signal. Cross-entropy on Gaussian-smoothed soft labels is a proper scoring rule, bounded loss, and admits a simple expectation decode. The cost is the hard support assumption — we have to pick $[V_{\min}, V_{\max}]$ correctly and re-tune it when the data distribution shifts, which is exactly the lesson the contamination episode taught.
 
-## Where this lives now
+## 9. Three load-bearing lessons
 
-Post-reset (2026-05-18 V2→perseus reset):
+1. **Use a representation that admits multimodality whenever rewards are sparse or bimodal.** Sparse-reward RL traces are pathologically multimodal: most steps have zero reward, a few have large positive or negative spikes. Scalar regression on such distributions will at best collapse to the mean and at worst (as here) blow up. HL-Gauss is one solution; two-hot encoding, quantile regression, and discrete distributional value heads in the C51 / IQN family are others. The literature has known this since the 2017 distributional-RL work; we re-learned it the expensive way.
 
-- The `p3pp_codet5p_220m` checkpoint is **archived** under
-  `parking_lot/v2_archive_2026-05-18/`. It will never be served. The
-  training entrypoint `python/muzero/main_phase3pp.py` is retained in
-  the archive for historical reproducibility.
-- The HL-Gauss value head is **canonical** in `perseus/core/`. The
-  trainer is `python/muzero/train_full_wm.py` (the v4 line); the
-  served checkpoint is `wm_v4_random_split` on cato:19100 via
-  `wm-serve/wm_serve_full.py` with `WM_FULL_CKPT` pointing at
-  `/home/cato-user/training/perseus-v3pp/wm_v4_random_split/wm_best.pt`.
-- The `VMIN=-10, VMAX=+2` "wide" HL-Gauss range used during the
-  contamination window is **deprecated**. Current production uses
-  `VMIN=-1, VMAX=+1` per the v4 line documented in
-  [wm heads decoding](/essays/wm-heads-decoding/).
-- The MSE-scalar-head pattern is **banned in `perseus/core/`**. New
-  value heads must use a distributional representation. This is
-  enforced in code review, not in `perseus/lab/`.
+2. **Audit the target distribution before tuning the model.** The $R^2 = -744$ was first a symptom of a target distribution the loss could not represent, and second of contamination that made the distribution worse. Even with clean labels, scalar MSE on the eventual range $[-1, +1]$ with frequent zeros at the terminal step would have been weak. With contaminated labels, the target was so degenerate that any model trained on it would have been off by construction. Print the histogram of your targets before you tune a single hyperparameter — we did not, and we paid for it.
 
-## Cross-references
+3. **Capacity amplifies whatever is already going to happen.** Doubling the backbone from 110M to 220M did not cure the bug; it surfaced it. This applies in both directions. When an architecture is correctly specified for the data, capacity helps. When it is mis-specified, capacity amplifies the failure. The fix is never "more parameters". The fix is to identify the mis-specification and remove it, then scale capacity.
 
-- [wm heads decoding](/essays/wm-heads-decoding/) — the canonical
-  decoder for HL-Gauss value, tanh judge, signed step_reward, softmax
-  policy heads.
-- [wm training sweep](/essays/wm-training-sweep/) — Stage-0 → Phase-2 →
-  Phase-3 → v4 ablation arc, in order; `p3pp_codet5p_220m` is one node
-  on that timeline.
-- [cohort contamination class](/essays/cohort-contamination-class/) —
-  the three poisoning episodes (T6 collision, T7 backfill,
-  harness_invocation_failed) that made the target distribution toxic
-  in the first place.
-- [pipeline integrity audit](/essays/pipeline-integrity-audit/) — the
-  2026-05-11 T1–T9 landings that decontaminated `terminal_reward` and
-  unlocked positive R² for the v4 line.
+## 10. The audit chain this kicked off
 
-## Sources
+The $-744$ number was load-bearing for the broader audit chain because it was so far out of band that it forced a re-examination of the entire export pipeline. The shallow fix — swap the head — would have closed the immediate metric symptom while leaving the contamination invisible. We had to ask why the targets looked the way they did, which led to the terminal-reward extractor reading the wrong column, which led to the broader pipeline integrity audit landing nine separate fixes on 2026-05-11: the typed `judge_label` column on the multi-bench row, the judge-source reward extraction, the muzero-export default flip from file-recall to judge, the visit-distribution parser fix for the object-list shape, the stratified-sample dedup, the harness-collision pre-check, the backfill script for already-contaminated rows, and the read-only judge audit script.
 
-- `parking_lot/v2_archive_2026-05-18/HISTORY/28_muzero_wm_research.md`
-  §3.1 (Phase-3 chain architecture comparison), §3.2 (Wide HL-Gauss /
-  value-target experiments), §5.2 (Phase-3++ `p3pp_*` table — the
-  $-745$/$-744$/$-740$ row), §6 (parquet schema evolution and the
-  contamination window), §7 (the 2026-05-11 audit).
-- `parking_lot/v2_archive_2026-05-18/HISTORY/14_wm_training.md` lines
-  120–157 (Phase-2++, Phase-3++, v3 chain lineage including the
-  `p3pp_codet5p_220m` entry).
-- `parking_lot/v2_archive_2026-05-18/Claude.md` "Last Updated"
-  2026-05-11 entry (the T1–T9 landings); the 2026-05-05 entry that was
-  retracted by it (claimed but un-landed `pick_terminal_reward` fix);
-  the 2026-05-18 entry (doc-vs-code retraction pass).
-- `python/muzero/main_phase3pp.py` (trainer that produced the
-  catastrophic run); `python/muzero/heads.py` and
-  `python/muzero/two_hot.py` (HL-Gauss encode/decode); reward
-  shaping defaults at `src/muzero/rewards.rs`.
+If the head had silently degraded to $R^2 = -10$ instead of $-744$, we would have written it off as "Phase-3++ underperforms, try a smaller LR" and the contaminated parquet would have shipped into another generation of training runs. The catastrophic failure was diagnostic. There is a generalisable point here: metrics that fail loudly are more useful than metrics that fail quietly, and capacity-amplified mis-specification is one of the few ways the failure mode of a supervised regression head shows up as a loud number rather than a soft underperform.
+
+## 11. Where this lives now
+
+The 220M scalar-MSE checkpoint is archived under the v2-archive parking lot and will never be served. The Phase-3++ trainer entrypoint that produced it is retained in the archive for reproducibility only. The HL-Gauss value head is canonical in `perseus/core/`; the served checkpoint is the v4 random-split run on the cato 19100 endpoint via the full-WM serve binary. The wide HL-Gauss range $[-10, +2]$ that we used during the contamination window is deprecated; current production uses $[-1, +1]$ on decontaminated targets. The scalar-MSE pattern is banned in `perseus/core/` going forward — new value heads must use a distributional representation, and this is enforced in code review, not in the lab tree.
