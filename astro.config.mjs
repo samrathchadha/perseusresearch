@@ -5,6 +5,22 @@ import rehypeKatex from "rehype-katex";
 import rehypeMermaid from "rehype-mermaid";
 import rehypeUnshikiMermaid from "./src/lib/rehype-unshiki-mermaid.mjs";
 
+// Vercel's build image is Amazon Linux and Playwright's downloaded
+// Chromium (Ubuntu-built) is missing system libs like libnspr4.so.
+// On Linux we use @sparticuz/chromium, a serverless-bundled binary
+// that ships its own deps. On macOS we use Playwright's default.
+const launchOptions =
+  process.platform === "linux"
+    ? await (async () => {
+        const { default: chromium } = await import("@sparticuz/chromium");
+        return {
+          args: chromium.args,
+          executablePath: await chromium.executablePath(),
+          headless: true,
+        };
+      })()
+    : { headless: true };
+
 const shikiConfig = {
   theme: "github-light",
   wrap: true,
@@ -26,6 +42,7 @@ const rehypePlugins = [
       // at build time via Playwright/Chromium. No client-side mermaid JS;
       // diagrams ship in the HTML, search-indexable, FOUC-free.
       strategy: "inline-svg",
+      launchOptions,
       mermaidConfig: {
         theme: "neutral",
         themeVariables: {
