@@ -407,22 +407,22 @@ operationalizable:
 
 ```mermaid
 flowchart TD
-  A[New WM ckpt available] --> B{Split strategy?}
-  B -->|row-random| C[Treat as leakage probe; α stays at current value]
-  B -->|instance-split| D{val_r2 on held-out instances?}
-  D -->|negative or near-zero| E[α = 0; WM contributes nothing]
-  D -->|positive small (0.05-0.2)| F[α = 0.2-0.3; conservative blend]
-  D -->|positive medium (0.2-0.5)| G[α = 0.4-0.6; balanced blend]
-  D -->|positive large (>0.5)| H[α up to 0.8; WM-dominant blend]
-  C --> I[Calibration probe\nNOT a deploy signal]
-  E --> J[Fingerprint and deploy]
+  A["New WM ckpt available"] --> B{"Split strategy?"}
+  B -->|"row-random"| C["Treat as leakage probe; α stays at current value"]
+  B -->|"instance-split"| D{"val_r2 on held-out instances?"}
+  D -->|"negative or near-zero"| E["α = 0; WM contributes nothing"]
+  D -->|"positive small (0.05-0.2)"| F["α = 0.2-0.3; conservative blend"]
+  D -->|"positive medium (0.2-0.5)"| G["α = 0.4-0.6; balanced blend"]
+  D -->|"positive large (>0.5)"| H["α up to 0.8; WM-dominant blend"]
+  C --> I["Calibration probe\nNOT a deploy signal"]
+  E --> J["Fingerprint and deploy"]
   F --> J
   G --> J
   H --> J
-  J --> K[Monitor for one week]
-  K --> L{wm_call telemetry healthy?\nvisit distribution diverse?\ndownstream eval delta?}
-  L -->|yes| M[Hold α]
-  L -->|no| N[Drop α toward 0; investigate]
+  J --> K["Monitor for one week"]
+  K --> L{"wm_call telemetry healthy?\nvisit distribution diverse?\ndownstream eval delta?"}
+  L -->|"yes"| M["Hold α"]
+  L -->|"no"| N["Drop α toward 0; investigate"]
 ```
 
 Two non-negotiables in this flow:

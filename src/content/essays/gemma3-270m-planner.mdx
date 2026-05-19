@@ -81,17 +81,17 @@ The single-shot success vs multi-turn failure was the symptom that mattered. Bot
 
 ```mermaid
 flowchart TD
-  A[planner state at turn N] --> B[serialize messages]
-  B --> C{context length}
-  C -->|"<= 2k tokens"| D[gemma3-270m emits real path"]
-  C -->|"> 2k tokens"| E[gemma3-270m emits placeholder]
-  E --> F["args: {path: \"...\"}"]
-  F --> G[parse.rs: VALID JSON]
-  G --> H[tool dispatch: open_file]
-  H --> I[fs::read crashes — path is literally '...']
-  I --> J[planner state at turn N+1 with failure_tail]
+  A["planner state at turn N"] --> B["serialize messages"]
+  B --> C{"context length"}
+  C -->|"<= 2k tokens"| D["gemma3-270m emits real path"]
+  C -->|"> 2k tokens"| E["gemma3-270m emits placeholder"]
+  E --> F["args: {path: '...'}"]
+  F --> G["parse.rs: VALID JSON"]
+  G --> H["tool dispatch: open_file"]
+  H --> I["fs::read crashes — path is literally '...'"]
+  I --> J["planner state at turn N+1 with failure_tail"]
   J --> B
-  D --> K[tool runs, evidence flows back, planner advances]
+  D --> K["tool runs, evidence flows back, planner advances"]
   K --> A
 ```
 

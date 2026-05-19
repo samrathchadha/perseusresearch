@@ -61,16 +61,16 @@ That's the architectural baseline. Now to the heads.
 
 ```mermaid
 flowchart LR
-  S[state_text] --> E[codet5p encoder frozen 256-d]
-  E --> D[DeepSets / MLP trunk pool]
-  D --> V[value MLP -> logits 51]
-  D --> J[judge MLP -> tanh scalar]
-  D --> R[step_reward MLP -> signed scalar]
-  D --> P[policy MLP -> logits 17]
-  V --> VD[HL-Gauss decode v_hat]
-  J --> JD[tanh-bounded j]
-  R --> RD[signed r]
-  P --> PD[softmax pi 17 tools]
+  S["state_text"] --> E["codet5p encoder frozen 256-d"]
+  E --> D["DeepSets / MLP trunk pool"]
+  D --> V["value MLP -> logits 51"]
+  D --> J["judge MLP -> tanh scalar"]
+  D --> R["step_reward MLP -> signed scalar"]
+  D --> P["policy MLP -> logits 17"]
+  V --> VD["HL-Gauss decode v_hat"]
+  J --> JD["tanh-bounded j"]
+  R --> RD["signed r"]
+  P --> PD["softmax pi 17 tools"]
 ```
 
 ---

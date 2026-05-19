@@ -166,14 +166,14 @@ The flow:
 
 ```mermaid
 flowchart LR
-  Q[query] --> E[codet5p-110m embed]
-  Q --> T[_fts_query tokenize]
-  E --> D[dense_search top-3K]
-  T --> S[sparse_search top-3K]
-  D --> R[_rrf k=60]
+  Q["query"] --> E["codet5p-110m embed"]
+  Q --> T["_fts_query tokenize"]
+  E --> D["dense_search top-3K"]
+  T --> S["sparse_search top-3K"]
+  D --> R["_rrf k=60"]
   S --> R
-  R --> K[top-K fused]
-  K --> H[Hit list to planner]
+  R --> K["top-K fused"]
+  K --> H["Hit list to planner"]
 ```
 
 Both retrievals run sequentially in the current implementation —

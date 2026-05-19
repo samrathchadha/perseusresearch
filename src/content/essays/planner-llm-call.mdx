@@ -503,16 +503,16 @@ input distributions.
 
 ```mermaid
 flowchart LR
-  S[SearchState] --> P[_build_user_prompt]
-  P --> M[ChatCompletion]
-  SYS[_SYSTEM static] --> M
-  SCH[_SCHEMA strict] --> M
-  M --> R[raw response text]
-  R --> J[_parse]
-  J --> O[PlannerResponse]
-  O --> EXP[MCTS node expansion]
-  EXP --> WM[WM probe per option]
-  WM --> PRI[blended prior]
+  S["SearchState"] --> P["_build_user_prompt"]
+  P --> M["ChatCompletion"]
+  SYS["_SYSTEM static"] --> M
+  SCH["_SCHEMA strict"] --> M
+  M --> R["raw response text"]
+  R --> J["_parse"]
+  J --> O["PlannerResponse"]
+  O --> EXP["MCTS node expansion"]
+  EXP --> WM["WM probe per option"]
+  WM --> PRI["blended prior"]
   PRI --> S
 ```
 

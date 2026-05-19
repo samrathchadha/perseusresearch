@@ -306,14 +306,14 @@ old phantom-zero. Same downstream gating in
 
 ```mermaid
 flowchart TD
-    A[multi_bench_runs row] --> B[mswebench_runtime::run_batch]
-    B --> C{T6 collision guard}
-    C -->|"unique (org, repo, pr-n) in batch"| D[harness invocation]
+    A["multi_bench_runs row"] --> B["mswebench_runtime::run_batch"]
+    B --> C{"T6 collision guard"}
+    C -->|"unique (org, repo, pr-n) in batch"| D["harness invocation"]
     C -->|"collides with peer"| E["tag harness_collided\njudge_label = NULL\nSKIP harness"]
-    D --> F{harness exit code}
-    F -->|"0, final_report.json present"| G[parse verdict\nset judge_label]
+    D --> F{"harness exit code"}
+    F -->|"0, final_report.json present"| G["parse verdict\nset judge_label"]
     F -->|"non-zero or report missing"| H["tag harness_invocation_failed\njudge_label = NULL"]
-    G --> I[row 1 final state]
+    G --> I["row 1 final state"]
     E --> I
     H --> I
 ```

@@ -190,14 +190,14 @@ codet5p-110m as a **frozen feature extractor**.
 
 ```mermaid
 flowchart LR
-    Q[query / state text] --> CT5[codet5p-110m-embedding\nfrozen, 256-d output]
-    CT5 -->|retrieval path| COS[cosine similarity\nagainst chunk vectors]
-    CT5 -->|WM trunk path| DS[DeepSets pool\nover chunks]
-    DS --> V[value head]
-    DS --> J[judge head]
-    DS --> R[step_reward head]
-    DS --> P[policy head]
-    COS --> HITS[top-k hits]
+    Q["query / state text"] --> CT5["codet5p-110m-embedding\nfrozen, 256-d output"]
+    CT5 -->|"retrieval path"| COS["cosine similarity\nagainst chunk vectors"]
+    CT5 -->|"WM trunk path"| DS["DeepSets pool\nover chunks"]
+    DS --> V["value head"]
+    DS --> J["judge head"]
+    DS --> R["step_reward head"]
+    DS --> P["policy head"]
+    COS --> HITS["top-k hits"]
 ```
 
 The asymmetry between the two paths is sharp:

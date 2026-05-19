@@ -404,20 +404,20 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Start([decide_stop entered]) --> GU{planner.status == GIVE_UP?}
-    GU -->|yes| C1[Case 1: STOP, stem_terminator=True, reason='planner give_up']
-    GU -->|no| PS{planner.status == STOP?}
+    Start(["decide_stop entered"]) --> GU{"planner.status == GIVE_UP?"}
+    GU -->|"yes"| C1["Case 1: STOP, stem_terminator=True, reason='planner give_up'"]
+    GU -->|"no"| PS{"planner.status == STOP?"}
 
-    PS -->|yes| WMS1{WM votes stop?}
-    PS -->|no| WMS2{WM votes stop AND visits >= 16?}
+    PS -->|"yes"| WMS1{"WM votes stop?"}
+    PS -->|"no"| WMS2{"WM votes stop AND visits >= 16?"}
 
-    WMS1 -->|yes| C2[Case 2: STOP, reason='agreed']
-    WMS1 -->|no| C3[Case 3: CONTINUE, append counter-hypotheses to failed_tail, reason='wm rejected planner stop']
+    WMS1 -->|"yes"| C2["Case 2: STOP, reason='agreed'"]
+    WMS1 -->|"no"| C3["Case 3: CONTINUE, append counter-hypotheses to failed_tail, reason='wm rejected planner stop'"]
 
-    WMS2 -->|yes| C4[Case 4: STOP, reason='wm voted stop unilaterally']
-    WMS2 -->|no| Cont[Default: CONTINUE, reason='continue']
+    WMS2 -->|"yes"| C4["Case 4: STOP, reason='wm voted stop unilaterally'"]
+    WMS2 -->|"no"| Cont["Default: CONTINUE, reason='continue'"]
 
-    C1 --> End([return StopDecision])
+    C1 --> End(["return StopDecision"])
     C2 --> End
     C3 --> End
     C4 --> End

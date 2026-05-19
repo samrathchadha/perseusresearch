@@ -708,37 +708,37 @@ The full pipeline, end to end. Two parallel chains: terminal credit
 
 ```mermaid
 flowchart TD
-    A[multi_bench_runs row] --> B{harness invoked?}
-    B -- yes --> C[python -m multi_swe_bench.harness.run_evaluation]
-    B -- no --> Z[judge_source = harness_unsupported]
-    C --> D[final_report.json verdict]
-    D --> E{F2P all pass AND P2P preserved?}
-    E -- yes --> F[judge_label = 1.0]
-    E -- partial --> G[judge_label = 0.5]
-    E -- no --> H[judge_label = 0.0]
+    A["multi_bench_runs row"] --> B{"harness invoked?"}
+    B -- "yes" --> C["python -m multi_swe_bench.harness.run_evaluation"]
+    B -- "no" --> Z["judge_source = harness_unsupported"]
+    C --> D["final_report.json verdict"]
+    D --> E{"F2P all pass AND P2P preserved?"}
+    E -- "yes" --> F["judge_label = 1.0"]
+    E -- "partial" --> G["judge_label = 0.5"]
+    E -- "no" --> H["judge_label = 0.0"]
 
-    F --> I[set_judge_label to Postgres]
+    F --> I["set_judge_label to Postgres"]
     G --> I
     H --> I
-    Z --> J[judge_label = NULL, terminal_reward = 0]
+    Z --> J["judge_label = NULL, terminal_reward = 0"]
 
-    I --> K[R = 2*judge_label - 1]
-    K --> L[terminal_reward gamma^T-t * R]
-    L --> M[v_tgt_t = discount sum + terminal]
+    I --> K["R = 2*judge_label - 1"]
+    K --> L["terminal_reward gamma^T-t * R"]
+    L --> M["v_tgt_t = discount sum + terminal"]
 
-    N[per-step shaping] --> O[+0.1*new_gold_hits -0.05*empty_tool]
-    O --> P[r_t per-step]
+    N["per-step shaping"] --> O["+0.1*new_gold_hits -0.05*empty_tool"]
+    O --> P["r_t per-step"]
     P --> M
 
-    M --> Q[value head: HL-Gauss 51-bin]
-    P --> R2[step_reward head]
-    I --> S[judge_value head]
+    M --> Q["value head: HL-Gauss 51-bin"]
+    P --> R2["step_reward head"]
+    I --> S["judge_value head"]
 
-    Q --> T[wm_v4_random_split checkpoint]
+    Q --> T["wm_v4_random_split checkpoint"]
     R2 --> T
     S --> T
-    T --> U[wm-serve at cato 19100]
-    U --> V[MCTS UCB prior blend alpha=0.3]
+    T --> U["wm-serve at cato 19100"]
+    U --> V["MCTS UCB prior blend alpha=0.3"]
 ```
 
 The collision guard (§4) and the source-mask gate (§4.4) both cut

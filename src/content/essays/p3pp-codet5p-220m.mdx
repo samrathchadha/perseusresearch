@@ -198,10 +198,10 @@ $$
 
 ```mermaid
 flowchart LR
-  A["target v ∈ [VMIN, VMAX]"] --> B[Gaussian smoothing σ across 51 bin centres]
-  B --> C[soft labels p*_i]
-  C --> D[cross-entropy loss]
-  D --> E[softmax head π_θ]
+  A["target v ∈ [VMIN, VMAX]"] --> B["Gaussian smoothing σ across 51 bin centres"]
+  B --> C["soft labels p*_i"]
+  C --> D["cross-entropy loss"]
+  D --> E["softmax head π_θ"]
   E --> F["decode v̂ = Σ π_i · c_i"]
 ```
 

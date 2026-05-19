@@ -38,60 +38,60 @@ Thirty surfaces. They group into nine functional buckets.
 ```mermaid
 graph TB
     subgraph Gates["Gates (release-readiness)"]
-        G1[#1 gate5 5-case suite + 3-cycle streak]
-        G2[#3 retrieval non-regression gate]
-        G3[#15 gate streak counter]
-        G4[#17 gate_stabilize.sh - superseded]
-        G5[#21 default 2-case synthetic suite]
+        G1["#1 gate5 5-case suite + 3-cycle streak"]
+        G2["#3 retrieval non-regression gate"]
+        G3["#15 gate streak counter"]
+        G4["#17 gate_stabilize.sh - superseded"]
+        G5["#21 default 2-case synthetic suite"]
     end
 
     subgraph Smoke["Smoke / preflight (deploy-time)"]
-        S1[#18 full_system_smoke.sh]
-        S2[#19 sweep_preflight.sh]
-        S3[#20 canary.sh + promote_canary.sh]
-        S4[#2 stability_local 120-min]
+        S1["#18 full_system_smoke.sh"]
+        S2["#19 sweep_preflight.sh"]
+        S3["#20 canary.sh + promote_canary.sh"]
+        S4["#2 stability_local 120-min"]
     end
 
     subgraph MultiB["Multi-bench (real fix-rate)"]
-        M1[#4 5-model x 2-cond x 1632 sweep]
-        M2[#5 retrieval-only multi-bench]
-        M3[#6 multi-bench-ralph rolling resume]
+        M1["#4 5-model x 2-cond x 1632 sweep"]
+        M2["#5 retrieval-only multi-bench"]
+        M3["#6 multi-bench-ralph rolling resume"]
     end
 
     subgraph Judge["Judge (post-hoc verdict)"]
-        J1[#7 stratified-500 docker bootstrap]
-        J2[#8 mswebench harness]
-        J3[#28 judge_audit.py separated denominators]
+        J1["#7 stratified-500 docker bootstrap"]
+        J2["#8 mswebench harness"]
+        J3["#28 judge_audit.py separated denominators"]
     end
 
     subgraph Recall["Recall@k vs fix_patch gold"]
-        R1[#9 planner_recall_eval v1]
-        R2[#10 planner_recall_eval v2]
-        R3[#22 swe_mb 5-case ripgrep suite]
+        R1["#9 planner_recall_eval v1"]
+        R2["#10 planner_recall_eval v2"]
+        R3["#22 swe_mb 5-case ripgrep suite"]
     end
 
     subgraph Autoresearch["Autoresearch (prompt MCTS)"]
-        A1[#23 v1 restart-per-candidate]
-        A2[#24 v3/v4 plan_system_override]
+        A1["#23 v1 restart-per-candidate"]
+        A2["#24 v3/v4 plan_system_override"]
     end
 
     subgraph Inference["Inference benchmarking"]
-        I1[#11 perseus_inference_bench.py]
-        I2[#12 cato_inference_sweep.sh]
-        I3[#29 perseus_10x_benchmark.py]
+        I1["#11 perseus_inference_bench.py"]
+        I2["#12 cato_inference_sweep.sh"]
+        I3["#29 perseus_10x_benchmark.py"]
     end
 
     subgraph WM["WM leaderboard / ship loop"]
-        W1[#25 WM knob sweeps v1-v6]
-        W2[#26 auto_eval_wm 5-head R2]
-        W3[#27 auto_ship_wm threshold loop]
+        W1["#25 WM knob sweeps v1-v6"]
+        W2["#26 auto_eval_wm 5-head R2"]
+        W3["#27 auto_ship_wm threshold loop"]
     end
 
     subgraph Continuous["Continuous loops"]
-        C1[#13 eval_runner.sh loop]
-        C2[#14 perseus doctor classifier]
-        C3[#16 tinker variant rotation 30m]
-        C4[#30 eval_watch.sh per-eval]
+        C1["#13 eval_runner.sh loop"]
+        C2["#14 perseus doctor classifier"]
+        C3["#16 tinker variant rotation 30m"]
+        C4["#30 eval_watch.sh per-eval"]
     end
 ```
 
