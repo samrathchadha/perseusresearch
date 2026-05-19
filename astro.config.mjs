@@ -3,6 +3,7 @@ import mdx from "@astrojs/mdx";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeMermaid from "rehype-mermaid";
+import rehypeUnshikiMermaid from "./src/lib/rehype-unshiki-mermaid.mjs";
 
 const shikiConfig = {
   theme: "github-light",
@@ -10,8 +11,14 @@ const shikiConfig = {
 };
 
 const remarkPlugins = [remarkMath];
+// rehypeUnshikiMermaid MUST come before rehypeMermaid: Astro's Shiki
+// transformer turns ```mermaid fences into <pre class="astro-code"
+// data-language="mermaid"> by the time user rehype plugins run. The
+// unshiki step rewrites those back to the <pre><code class="language-mermaid">
+// shape that rehype-mermaid scans for.
 const rehypePlugins = [
   [rehypeKatex, { output: "mathml" }],
+  rehypeUnshikiMermaid,
   [
     rehypeMermaid,
     {
