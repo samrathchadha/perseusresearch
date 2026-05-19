@@ -13,8 +13,20 @@ const launchOptions =
   process.platform === "linux"
     ? await (async () => {
         const { default: chromium } = await import("@sparticuz/chromium");
+        // sparticuz defaults are tuned for AWS Lambda one-shot runs.
+        // For a multi-diagram build we drop the flags that fuse the whole
+        // browser into one process — a single page crash there kills every
+        // subsequent render, which is what happened on the first Vercel
+        // attempt (browser closed mid-stream around the 14th essay).
+        const lambdaOnly = new Set([
+          "--single-process",
+          "--in-process-gpu",
+          "--no-zygote",
+        ]);
+        const args = chromium.args.filter((a) => !lambdaOnly.has(a));
+        args.push("--disable-dev-shm-usage");
         return {
-          args: chromium.args,
+          args,
           executablePath: await chromium.executablePath(),
           headless: true,
         };
