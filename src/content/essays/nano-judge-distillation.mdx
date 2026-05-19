@@ -36,7 +36,7 @@ $$
 C_\text{gpt-5.5} \;=\; \tfrac{6.00 \cdot 8000}{10^6} + \tfrac{18.00 \cdot 600}{10^6} \;=\; \$0.0588.
 $$
 
-60,565 rows: $\approx \$3{,}561$. Stress-testing with 12k input and
+60,565 rows: $\approx \$3,561$. Stress-testing with 12k input and
 800 output (the long-tail of multi-file patches) gets to the
 **~\$7.4k** envelope cited by `verifier-sizing-rationale.md` line
 51. That number is the "too expensive for the marginal label-noise
@@ -71,8 +71,8 @@ being the *only* option that hits the §2 latency constraint.
 
 | Labeler | Per-row | 60,565-row total | Wall time | Setup |
 |---|---|---|---|---|
-| gpt-5.5-high (8k/600) | \$0.0588 | ~\$3{,}561 | ~hours | trivial |
-| gpt-5.5-high (12k/800) | \$0.0864 | ~\$5{,}232 | ~hours | trivial |
+| gpt-5.5-high (8k/600) | \$0.0588 | ~\$3,561 | ~hours | trivial |
+| gpt-5.5-high (12k/800) | \$0.0864 | ~\$5,232 | ~hours | trivial |
 | Self-hosted 7B, $N=8$ | $0.013-0.07 | \$2-4k GPU-hr | weekend on 40×H100 | seed_state API + migration 011 + new binary |
 | **gpt-5.4-nano-medium** | **\$0.00065** | **\$39.59** | **82 min** | one Python script |
 
@@ -93,7 +93,7 @@ Training scale:
 - 60,565 trajectories in the v2 corpus
 - ~50 MCTS expansions per trajectory (median; tail to 200 on
   multi-file bugs)
-- One judge query per expansion: $60{,}565 \cdot 50 \approx
+- One judge query per expansion: $60,565 \cdot 50 \approx
   3.03 \times 10^6$ judge calls per training epoch
 - 10 epochs: $3.03 \times 10^7$ calls
 
@@ -103,7 +103,7 @@ through the network. nano-medium's measured API round-trip is
 training-time cost is then:
 
 $$
-T_\text{train,api} \;=\; 3 \times 10^7 \cdot 0.12 \mathrm{s} \;\approx\; 3.6 \times 10^6 \mathrm{s} \;\approx\; 1{,}000 \mathrm{hours} \;\approx\; 42 \mathrm{days}.
+T_\text{train,api} \;=\; 3 \times 10^7 \cdot 0.12 \mathrm{s} \;\approx\; 3.6 \times 10^6 \mathrm{s} \;\approx\; 1,000 \mathrm{hours} \;\approx\; 42 \mathrm{days}.
 $$
 
 Six weeks of wall-clock for a single training run is operationally

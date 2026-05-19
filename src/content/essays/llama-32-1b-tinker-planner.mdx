@@ -148,8 +148,8 @@ $BA$ moves; the base $W$ stays frozen.
 
 For Llama-3.2-1B with `hidden_size=2048` and rank `r=64`, each
 target projection (`q_proj`, `k_proj`, `v_proj`, `o_proj`) trains
-$2 \cdot 2048 \cdot 64 = 262{,}144$ params instead of the full
-$2048^2 = 4.2{,}M$ — a **16× reduction in trainable parameters per
+$2 \cdot 2048 \cdot 64 = 262,144$ params instead of the full
+$2048^2 = 4.2,M$ — a **16× reduction in trainable parameters per
 projection**. Across 16 decoder layers × 4 projections × 16× saving,
 the rank-64 adapter is ~33M trainable params vs the full 1.24B base.
 

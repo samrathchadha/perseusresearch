@@ -92,11 +92,11 @@ a clean signal.
 ### 2.2 The cohort it would have labelled
 
 We scoped it as $\sim 50$ planner-call steps per trajectory $\times$
-$\sim 3{,}250$ terminal-labelled trajectories $\times$ $N=8$ rollouts
+$\sim 3,250$ terminal-labelled trajectories $\times$ $N=8$ rollouts
 $=$ **1.3M continuations**. With every-fifth-step stratification and
-trajectory subsample $D=32$, drops to $\sim 260{,}000$. At $\sim 30$
-seconds per rollout on the cato 7B pool that is $\sim 10{,}000$
-GPU-hours raw, $\sim 2{,}000$ GPU-hours stratified. A weekend on the
+trajectory subsample $D=32$, drops to $\sim 260,000$. At $\sim 30$
+seconds per rollout on the cato 7B pool that is $\sim 10,000$
+GPU-hours raw, $\sim 2,000$ GPU-hours stratified. A weekend on the
 GCP 40$\times$H100 fleet (decommissioned 2026-05-01).
 
 ### 2.3 Why it never shipped
@@ -216,7 +216,7 @@ case (no testable signal).
 ### 3.5 Cohort
 
 `multi_bench_runs.dataset = 'swe_bench_multilingual'` is the SWE-bench
-slice. Per `two-tier-bootstrap.md`, $\sim 2{,}852$ rows. Live count
+slice. Per `two-tier-bootstrap.md`, $\sim 2,852$ rows. Live count
 from `33_multibench_detail.md` reads **2,830** queued + **2,694**
 labelled `swebench_harness` rows post-T7 backfill, so the doc number
 matches reality within rounding.
